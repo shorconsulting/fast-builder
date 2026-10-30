@@ -20,6 +20,7 @@ import fb  # noqa: E402
 
 CLAUDE_SHIM = """#!/bin/sh
 echo "$PWD :: $*" >> "$FB_SHIM_LOG"
+echo '{"result": "200"}'
 exit 0
 """
 
@@ -697,6 +698,17 @@ class Listener(World):
         self.fb("bravo", "listen", "--once")
         self.assertEqual(self.calls(), [])
         self.assertTrue(any("no cloud routine" in m["body"] for m in self.j("alpha", "inbox", "--run", "hph-10-30-26", "--who", "human")))
+
+    def test_a_clean_exit_is_not_a_wake(self):
+        """The bug the real cloud test found: another login's routine answers 404 and claude still exits 0."""
+        with open(self.shim, "w") as handle:
+            handle.write("#!/bin/sh\necho '{\"result\": \"404\"}'\nexit 0\n")
+        self.register("bravo")
+        self.publish(accounts=2)
+        self.fb("bravo", "listen", "--once")
+        got = [m["body"] for m in self.j("alpha", "inbox", "--run", "hph-10-30-26", "--who", "human")]
+        self.assertTrue(any("did not start (404)" in b and "claude auth status" in b for b in got), got)
+        self.assertNotEqual(self.fb("bravo", "routine-check", "--routine-id", "trig_1", check=False).returncode, 0)
 
     def test_a_failed_wake_tells_a_person(self):
         with open(self.shim, "w") as handle:

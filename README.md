@@ -62,7 +62,8 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 ## Limits
 
 - Local listeners run while the Mac is on and that Mac user is logged in.
-- Each account needs a routine for instant cloud starts, and that routine's GitHub connection must reach the repo.
+- Each account needs a routine for instant cloud starts, created under the same login as that Mac user's `claude` CLI,
+  and its GitHub connection must reach the repo. `routine-check` proves the first.
 - Claude usage limits are per account. A lane that runs dry goes quiet, and is freed after 45 minutes.
 - The guard hook sees Claude's tools, and `check-diff` catches a shell edit at push time. It is a guardrail for
   well-meaning builders, not a sandbox: a determined shell command can get past it.

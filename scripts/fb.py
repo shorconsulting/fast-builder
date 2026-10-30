@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1385,16 +1385,33 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     return proc.pid
 
 
+def ask_routine_api(trigger, action):
+    """Call the routine API through a headless Haiku, and return the HTTP status it saw. Exit 0 proves nothing here: a
+    routine on another login answers 404 and claude still exits cleanly, so only a stated 200 counts."""
+    if not TRIGGER_RE.match(trigger):
+        raise FbError("bad routine id")
+    prompt = ("Use the RemoteTrigger tool once, with action %s and trigger_id %s. Then reply with only the three-digit HTTP "
+              "status on the first line of the tool's result, or the word error if the tool failed." % (action, trigger))
+    args = [CLAUDE, "-p", prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4", "--output-format", "json"]
+    os.makedirs(HOME_DIR, exist_ok=True)
+    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
+    if proc.returncode != 0:
+        raise FbError("could not reach routine %s: %s" % (trigger, (proc.stderr or proc.stdout).strip()[:200]))
+    try:
+        return str(json.loads(proc.stdout).get("result", "")).strip()
+    except ValueError:
+        return proc.stdout.strip()[:40]
+
+
 def wake_routine(trigger):
     """Start this account's listener routine now. `claude --cloud` needs a real terminal and can stop at interactive
     dialogs, so a daemon cannot use it. The routine claims a lane itself, in the cloud. About half a cent of Haiku."""
-    if not TRIGGER_RE.match(trigger):
-        raise FbError("bad routine id")
-    prompt = "Use the RemoteTrigger tool once, with action run and trigger_id %s. Then reply with the word done." % trigger
-    args = [CLAUDE, "-p", prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4"]
-    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
-    if proc.returncode != 0:
-        raise FbError("could not wake routine %s: %s" % (trigger, (proc.stderr or proc.stdout).strip()[:200]))
+    status = ask_routine_api(trigger, "run")
+    if status != "200":
+        raise FbError("routine %s did not start (%s)%s" % (trigger, status, ROUTINE_HELP if status == "404" else ""))
+
+
+ROUTINE_HELP = ": this Mac user's claude login is not the account that owns the routine, see claude auth status"
 
 
 def supervise(bus, repo_cfg, account):
@@ -2096,6 +2113,14 @@ def cmd_hook(args):
         pass
 
 
+def cmd_routine_check(args):
+    """Prove this Mac user's headless claude can reach the routine, which is what a daemon's wake depends on."""
+    status = ask_routine_api(args.routine_id, "get")
+    out({"routine": args.routine_id, "reachable": status == "200", "status": status, "help": "" if status == "200" else ROUTINE_HELP.lstrip(": ")})
+    if status != "200":
+        sys.exit(1)
+
+
 def cmd_install_repo(args):
     """Commit-ready files for cloud enforcement: cloud sessions skip user plugins but run the repo's own hooks and
     agents. Writes into this clone only; the caller opens the PR."""
@@ -2284,6 +2309,9 @@ def build_parser():
     p = sub.add_parser("hook", help="called by the plugin's hooks")
     p.set_defaults(func=cmd_hook)
     p.add_argument("event", choices=["guard", "stop", "session-start"])
+
+    p = add("routine-check", cmd_routine_check, help="prove the daemon can reach a routine")
+    p.add_argument("--routine-id", required=True)
 
     add("install-repo", cmd_install_repo, help="write the repo-side hooks that cloud sessions need")
     add("doctor", cmd_doctor, help="check this account's setup")
