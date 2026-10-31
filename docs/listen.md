@@ -67,6 +67,27 @@ environment list can differ, so use its `anthropic_cloud` environment.
 `listen-install` also puts the kit on the bus if it is missing, so run it before the routine's first fire: a routine with
 no `kit/fb.py` to fetch cannot poll, and tells you so every hour.
 
+`listen-install` also writes the routine's id to `listeners/NAME.json` on the bus, so every Mac user listening to this repo
+can find it. That is what makes swapping logins work.
+
+## Swapping logins
+
+A routine belongs to one login, and a Mac user has one `claude` login at a time. If you move a Mac user between accounts,
+set each account up once: sign it in, then run `--both` or `--routine` above with its own `--account NAME`. After that:
+
+- The listener follows the swap by itself. When a run needs a cloud lane it tries this account's routine, then the others
+  on the bus. A routine on another login answers 404 and starts nothing, so the one that answers 200 is the current login.
+  It then listens under that name. Each try costs about half a cent of Haiku.
+- `python3 "$FB" switch` does the same check now, with `get` rather than `run`, so nothing starts. Run it after a swap to
+  put local lanes and `status` under the right name before the next wake. `python3 "$FB" switch NAME` checks that one
+  account and refuses if this login does not own its routine.
+- A login that was never set up has no routine on the bus: the wake posts a blocker saying so, and nothing starts.
+
+An account that has run out of usage cannot wake anything, because the wake itself is a Claude call. Its lanes go quiet and
+are freed after 45 minutes for another account, which starts from the lane's last saved handoff.
+
+## No Mac
+
 On an account with no Mac, skip the daemon and try a GitHub trigger: `action: create_webhook_trigger`, event `issues.opened`
 on this repo, so the tracker issue a kickoff opens wakes it. It has not been proven: it needs an approval that was refused in
 testing. If it is refused, say the wake-up is hourly.

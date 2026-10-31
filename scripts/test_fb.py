@@ -719,6 +719,96 @@ class Listener(World):
         self.assertTrue(any("did not start (404)" in b and "claude auth status" in b for b in got), got)
         self.assertNotEqual(self.fb("bravo", "routine-check", "--routine-id", "trig_1", check=False).returncode, 0)
 
+    def owns_only(self, trigger):
+        """The shim answers as a login that owns one routine: 200 for it, 404 for the rest."""
+        with open(self.shim, "w") as handle:
+            handle.write('#!/bin/sh\necho "$PWD :: $*" >> "$FB_SHIM_LOG"\ncase "$*" in *%s*) echo \'{"result": "200"}\';; *) echo \'{"result": "404"}\';; esac\nexit 0\n' % trigger)
+
+    def config(self, account):
+        return json.load(open(os.path.join(self.env(account)["FB_HOME"], "config.json")))
+
+    def roster(self):
+        """bravo and charlie have each listened once in a live run, so both routines are on the bus."""
+        self.register("bravo", routine="trig_bravo")
+        self.register("charlie", routine="trig_charlie")
+        self.publish(accounts=2)
+        self.fb("bravo", "listen", "--once")
+        self.fb("charlie", "listen", "--once")
+        open(self.shim_log, "w").close()
+
+    def test_a_swapped_login_wakes_its_own_routine_and_listens_as_it(self):
+        self.roster()
+        self.owns_only("trig_charlie")
+        self.fb("bravo", "listen", "--once")
+        tried = [line for line in self.calls() if "action run" in line]
+        self.assertEqual(["trig_bravo" in tried[0], "trig_charlie" in tried[1], len(tried)], [True, True, 2])
+        config = self.config("bravo")
+        self.assertEqual(config["account"], "charlie")
+        self.assertEqual(list(config["repos"].values())[0]["routine_id"], "trig_charlie")
+        self.assertEqual(self.j("alpha", "inbox", "--run", "hph-10-30-26", "--who", "human"), [])
+
+    def test_a_login_with_no_routine_on_the_bus_tells_a_person(self):
+        self.roster()
+        self.owns_only("trig_nobody")
+        self.fb("bravo", "listen", "--once")
+        got = [m["body"] for m in self.j("alpha", "inbox", "--run", "hph-10-30-26", "--who", "human")]
+        self.assertTrue(any("did not start (404)" in b for b in got), got)
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+
+    def test_switch_finds_the_login_or_takes_a_name(self):
+        self.roster()
+        self.owns_only("trig_charlie")
+        self.assertEqual(self.j("bravo", "switch")["account"], "charlie")
+        self.assertEqual(list(self.config("bravo")["repos"].values())[0]["routine_id"], "trig_charlie")
+        self.owns_only("trig_bravo")
+        self.assertEqual(self.j("bravo", "switch", "bravo")["was"], "charlie")
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+
+    def test_switch_refuses_an_account_this_login_is_not(self):
+        self.roster()
+        self.owns_only("trig_bravo")
+        self.assertEqual(self.fb("bravo", "switch", "charlie", check=False).returncode, 1)
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+        self.assertNotEqual(self.fb("bravo", "switch", "delta", check=False).returncode, 0)
+
+    def test_installing_as_a_new_account_drops_the_old_routine(self):
+        self.register("bravo", routine="trig_bravo")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "charlie")
+        self.assertEqual(list(self.config("bravo")["repos"].values())[0]["routine_id"], None)
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "charlie", "--routine-id", "trig_charlie")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "charlie")
+        self.assertEqual(list(self.config("bravo")["repos"].values())[0]["routine_id"], "trig_charlie")
+
+    def test_a_beat_with_no_routine_keeps_the_one_on_the_bus(self):
+        self.register("bravo", routine="trig_bravo")
+        self.publish(accounts=2)
+        self.fb("bravo", "listen", "--once")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "charlie")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "bravo")
+        self.fb("bravo", "listen", "--once")
+        names = [l["account"] for l in self.j("alpha", "status")["listeners"] if l.get("routine") == "trig_bravo"]
+        self.assertEqual(names, ["bravo"])
+
+    def test_junk_in_the_roster_is_never_tried(self):
+        self.roster()
+        phone = os.path.join(self.root, "phone-roster")
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "listeners", "BAD NAME.json"), "w") as handle:
+            json.dump({"routine": "trig_x"}, handle)
+        with open(os.path.join(phone, "listeners", "delta.json"), "w") as handle:
+            json.dump({"routine": "x; rm -rf /"}, handle)
+        with open(os.path.join(phone, "listeners", "echo.json"), "w") as handle:
+            handle.write("[1]")
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "junk"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.owns_only("trig_nobody")
+        self.fb("bravo", "listen", "--once")
+        tried = " ".join(line for line in self.calls() if "action run" in line)
+        self.assertIn("trig_charlie", tried)
+        self.assertNotIn("trig_x", tried)
+        self.assertNotIn("rm -rf", tried)
+
     def test_a_failed_wake_tells_a_person(self):
         with open(self.shim, "w") as handle:
             handle.write("#!/bin/sh\nexit 3\n")

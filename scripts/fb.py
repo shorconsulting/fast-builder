@@ -15,7 +15,7 @@ Layout of the bus:
   STATUS.md                       human view, rewritten by the conductor
   settings.json                   repo-wide settings, such as max_accounts
   kit/                            fb.py and the role docs
-  listeners/<account>.json        who is listening, and what they can do
+  listeners/<account>.json        who is listening, what they can do, and their routine
   runs/<run>/job.json             goal and parameters
   runs/<run>/lanes.json           machine-readable ownership
   runs/<run>/<plan file>          REPO-MM-DD-YY-orchestration-plan.md
@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -75,7 +75,7 @@ SENSITIVE_DEFAULTS = [
     "**/crypto/**", "**/migrations/**", "**/secrets*", "**/.env*", ".github/**",
 ]
 
-# Who does what. David's routing table: the cheapest model that does the job well. Opus for security-sensitive
+# Who does what: the cheapest model that does the job well. Opus for security-sensitive
 # work, design and orchestration; Sonnet for pattern-following work; Haiku for anything mechanical; Fable never.
 ROUTES = {
     "orchestrate": ("opus", "opus"),
@@ -1409,15 +1409,43 @@ def ask_routine_api(trigger, action):
         return proc.stdout.strip()[:40]
 
 
-def wake_routine(trigger):
-    """Start this account's listener routine now. `claude --cloud` needs a real terminal and can stop at interactive
-    dialogs, so a daemon cannot use it. The routine claims a lane itself, in the cloud. About half a cent of Haiku."""
-    status = ask_routine_api(trigger, "run")
-    if status != "200":
-        raise FbError("routine %s did not start (%s)%s" % (trigger, status, ROUTINE_HELP if status == "404" else ""))
+def routine_roster(bus, account, own=None):
+    """Every account's routine on the bus, this account's first. Logins get swapped on a Mac user, and a routine belongs
+    to its login, so the bus is what lets any Mac user find the routine for whoever is signed in now."""
+    rows = []
+    for name in sorted(bus.listdir("listeners"), key=lambda n: n != "%s.json" % account):
+        doc = bus.json("listeners/" + name)
+        who, trigger = name[:-5], doc.get("routine") if isinstance(doc, dict) else None
+        if NAME_RE.match(who) and isinstance(trigger, str) and TRIGGER_RE.match(trigger):
+            rows.append((who, trigger))
+    if own and not any(t == own for _, t in rows):
+        rows.insert(0, (account, own))
+    return rows
 
 
-ROUTINE_HELP = ": this Mac user's claude login is not the account that owns the routine, see claude auth status"
+def wake_roster(rows):
+    """Start the routine of whichever account this Mac user is signed in to. `claude --cloud` needs a real terminal and
+    can stop at interactive dialogs, so a daemon cannot use it. A routine on another login answers 404 and starts
+    nothing, so walking the roster finds the login without trusting a cached profile. About half a cent of Haiku a try."""
+    for who, trigger in rows:
+        status = ask_routine_api(trigger, "run")
+        if status == "200":
+            return who, trigger
+        if status != "404":
+            raise FbError("routine %s did not start (%s)" % (trigger, status))
+    raise FbError("routine %s did not start (404)%s" % (rows[0][1], ROUTINE_HELP))
+
+
+def adopt_login(account, routines):
+    """Listen as `account` from the next pass, with `routines` by repo. A repo left out finds its routine at its next wake."""
+    config = load_config()
+    config["account"] = account
+    for slug, cfg in config.get("repos", {}).items():
+        cfg["routine_id"] = routines.get(slug)
+    save_config(config)
+
+
+ROUTINE_HELP = ": this Mac user's claude login owns none of the routines on the bus, see claude auth status, or set this login up once with /fast-builder:listen"
 
 
 def supervise(bus, repo_cfg, account):
@@ -1501,19 +1529,21 @@ def start_lane(bus, repo_cfg, run, lane, account, memory):
     if time.time() - woke.get(run, 0) < WAKE_SECONDS:
         return []
     woke[run] = time.time()
-    trigger = repo_cfg.get("routine_id")
     if not repo_cfg.get("cloud", True):
         return []
-    if not trigger:
+    rows = routine_roster(bus, account, repo_cfg.get("routine_id"))
+    if not rows:
         text = "%s is listening but has no cloud routine, so it cannot take a cloud lane. Run /fast-builder:listen --routine on it." % account
         if not any(m.get("body") == text for m in messages_for(bus, run, "human")):
             post(bus, run, account, "human", "blocker", text)
         return [{"did": "no-routine", "run": run}]
     try:
         bus.release()  # the wake takes seconds, and lanes on this account need the bus checkout meanwhile
-        wake_routine(trigger)
+        who, trigger = wake_roster(rows)
         bus.sync()
-        return [{"did": "woke-routine", "run": run, "routine": trigger}]
+        if who != account:
+            adopt_login(who, {repo_slug(bus.remote): trigger})
+        return [{"did": "woke-routine", "run": run, "routine": trigger, "account": who}]
     except FbError as exc:
         post(bus, run, account, "human", "blocker", "%s could not start its routine: %s" % (account, exc))
         return [{"did": "wake-failed", "run": run, "error": str(exc)}]
@@ -1552,7 +1582,7 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     if conduct_due:
         last["conduct"] = time.time()
     if beat_due:
-        doc = {"account": account, "at": now_iso(), "cloud": repo_cfg.get("cloud", True), "local": repo_cfg.get("local", True), "version": VERSION}
+        doc = {"account": account, "at": now_iso(), "cloud": repo_cfg.get("cloud", True), "local": repo_cfg.get("local", True), "routine": repo_cfg.get("routine_id"), "version": VERSION}
         announce_listener(bus, account, doc)
         last["beat"] = time.time()
     last["sha"] = bus.head()
@@ -1562,12 +1592,16 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
 
 
 def listen_loop(args):
-    account = account_name(args)
     heads = {}
     stopped = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stopped.update(now=True))
     while not stopped["now"]:
         config = load_config()
+        # Read every pass: a swapped login changes this without a restart, and lanes started below inherit it.
+        account = getattr(args, "account", None) or config.get("account") or account_name(args)
+        if os.environ.get("FB_ACCOUNT") != account:
+            os.environ["FB_ACCOUNT"] = account
+            heads.clear()
         for slug, cfg in config.get("repos", {}).items():
             try:
                 for action in poll_repo(cfg["remote"], cfg, account, heads):
@@ -1624,6 +1658,9 @@ def load_listener(domain):
 def announce_listener(bus, account, doc):
     """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists."""
     def mutate():
+        held = bus.json("listeners/%s.json" % account)
+        if not doc.get("routine") and isinstance(held, dict) and held.get("routine"):
+            doc["routine"] = held["routine"]
         files = {"listeners/%s.json" % account: dumps(doc)}
         if not bus.exists("kit/fb.py"):
             files.update(kit_files())
@@ -1635,11 +1672,13 @@ def listen_install(args):
     """Register a repo for this account and install the launchd listener, so it survives reboots and costs no tokens."""
     account = account_name(args)
     config = load_config()
+    same_account = config.get("account") in (None, account)
     config["account"] = account
     remote = args.remote or cwd_remote()
     slug = repo_slug(remote)
     held = config.setdefault("repos", {}).get(slug, {})
-    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": args.routine_id or held.get("routine_id")}
+    routine = args.routine_id or (held.get("routine_id") if same_account else None)
+    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": routine}
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
@@ -1664,7 +1703,7 @@ def listen_install(args):
         run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
         load_listener(domain)
         bus = Bus(remote, account)
-        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "version": VERSION}
+        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "routine": routine, "version": VERSION}
         announce_listener(bus, account, doc)
     print(json.dumps(out, indent=2))
 
@@ -2147,6 +2186,29 @@ def cmd_routine_check(args):
         sys.exit(1)
 
 
+def cmd_switch(args):
+    """Point this Mac user's listener at the account its claude login now belongs to, after a swap. Names one, or with no
+    name finds it, by asking which routine on the bus this login can see."""
+    config = load_config()
+    current = config.get("account")
+    known = {}
+    for slug, cfg in config.get("repos", {}).items():
+        bus = Bus(cfg["remote"], current or "unknown")
+        if bus.sync():
+            for who, trigger in routine_roster(bus, current, cfg.get("routine_id")):
+                known.setdefault(who, {})[slug] = trigger
+        bus.release()
+    if args.name and args.name not in known:
+        raise FbError("no routine for %s on the bus: run /fast-builder:listen once on that login" % args.name)
+    for who in [args.name] if args.name else sorted(known, key=lambda n: n != current):
+        if ask_routine_api(sorted(known[who].values())[0], "get") == "200":
+            adopt_login(who, known[who])
+            out({"account": who, "was": current, "switched": True, "routines": known[who]})
+            return
+    out({"account": current, "switched": False, "help": ROUTINE_HELP.lstrip(": ")})
+    sys.exit(1)
+
+
 def cmd_install_repo(args):
     """Commit-ready files for cloud enforcement: cloud sessions skip user plugins but run the repo's own hooks and
     agents. Writes into this clone only; the caller opens the PR."""
@@ -2184,6 +2246,9 @@ def cmd_doctor(args):
         remote = cwd_remote()
         bus = Bus(remote)
         checks.update(remote=repo_slug(remote), bus_reachable=True, bus_exists=bool(bus.head()))
+        if bus.sync():
+            checks["routines_on_bus"] = sorted(who for who, _ in routine_roster(bus, checks["account"]))
+        bus.release()
     except FbError as exc:
         checks.update(bus_reachable=False, error=str(exc))
     checks["repos"] = sorted(load_config().get("repos", {}))
@@ -2340,6 +2405,9 @@ def build_parser():
     p.add_argument("--routine-id", required=True)
 
     add("install-repo", cmd_install_repo, help="write the repo-side hooks that cloud sessions need")
+    p = add("switch", cmd_switch, help="point the listener at this Mac user's current claude login")
+    p.add_argument("name", nargs="?", help="the account to switch to (default: find it)")
+
     add("doctor", cmd_doctor, help="check this account's setup")
     return parser
 
