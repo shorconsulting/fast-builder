@@ -102,6 +102,15 @@ class World(unittest.TestCase):
         return info, draft, result
 
 
+class RoutineStatus(unittest.TestCase):
+    def test_only_the_status_the_reply_opens_with_counts(self):
+        self.assertEqual(fb.stated_status("200"), "200")
+        self.assertEqual(fb.stated_status("200\nHTTP 200 for trigger `trig_1`. Details follow."), "200")
+        self.assertEqual(fb.stated_status("HTTP 404"), "404")
+        self.assertEqual(fb.stated_status("error"), "error")
+        self.assertEqual(fb.stated_status("the call failed, not a 200"), "the call failed, not a 200")
+
+
 class Names(unittest.TestCase):
     def test_plan_name_matches_the_ask(self):
         import datetime

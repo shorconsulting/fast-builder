@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1385,6 +1385,12 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     return proc.pid
 
 
+def stated_status(reply):
+    """The status the model put first. It sometimes adds a sentence after it, which must not turn a 200 into a failure."""
+    found = re.match(r"\s*(?:HTTP\s+)?(\d{3})\b", reply)
+    return found.group(1) if found else reply.strip()[:40]
+
+
 def ask_routine_api(trigger, action):
     """Call the routine API through a headless Haiku, and return the HTTP status it saw. Exit 0 proves nothing here: a
     routine on another login answers 404 and claude still exits cleanly, so only a stated 200 counts."""
@@ -1398,7 +1404,7 @@ def ask_routine_api(trigger, action):
     if proc.returncode != 0:
         raise FbError("could not reach routine %s: %s" % (trigger, (proc.stderr or proc.stdout).strip()[:200]))
     try:
-        return str(json.loads(proc.stdout).get("result", "")).strip()
+        return stated_status(str(json.loads(proc.stdout).get("result", "")))
     except ValueError:
         return proc.stdout.strip()[:40]
 
@@ -1605,6 +1611,16 @@ def plist_path():
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", LABEL + ".plist")
 
 
+def load_listener(domain):
+    """launchd refuses a bootstrap for a moment after a bootout, so a reinstall has to retry."""
+    for attempt in range(10):
+        proc = run_cmd(["launchctl", "bootstrap", domain, plist_path()], check=False)
+        if proc.returncode == 0:
+            return
+        time.sleep(1)
+    raise FbError("launchctl bootstrap failed: %s" % (proc.stderr or proc.stdout).strip()[:300])
+
+
 def announce_listener(bus, account, doc):
     """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists."""
     def mutate():
@@ -1646,7 +1662,7 @@ def listen_install(args):
         write_file(plist_path(), text)
         domain = "gui/%d" % os.getuid()
         run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
-        run_cmd(["launchctl", "bootstrap", domain, plist_path()], check=True)
+        load_listener(domain)
         bus = Bus(remote, account)
         doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "version": VERSION}
         announce_listener(bus, account, doc)
