@@ -49,8 +49,9 @@ holding that `environment_id`, `session_context.model` `claude-opus-5-5` (the se
 Set `session_context.allowed_tools` to `Bash, Read, Write, Edit, Glob, Grep, Agent`.
 
 A new routine gets every claude.ai connector on the account, Gmail included. This one takes its direction from the repo,
-so remove them at once, before it first runs: RemoteTrigger `action: update` with `{"clear_mcp_connections": true}`, and
-check the response shows `mcp_connections` empty. The server may move the cron minute; that does not matter.
+so create it with `enabled: false`, then RemoteTrigger `action: update` with `{"clear_mcp_connections": true}`, check the
+response shows `mcp_connections` empty, and only then update `enabled` to true. The server may move the cron minute; that
+does not matter.
 
 Record it, and prove this Mac can reach it:
 
@@ -58,8 +59,13 @@ Record it, and prove this Mac can reach it:
     python3 "$FB" routine-check --routine-id TRIGGER_ID
 
 The daemon wakes the routine through this Mac user's `claude` login, which can differ from the login of the session you
-are in. If the check says 404, the two differ: fix it with `claude auth login` as the account that owns the routine, or
-create the routine under the CLI's login.
+are in. Check first by comparing `claude auth status` with the routine's owner. If the check says 404, the two differ: fix
+it with `claude auth login` as the account that owns the routine, or create the routine under the CLI's login by running
+the same RemoteTrigger calls through `claude -p --model haiku --allowedTools=RemoteTrigger,ToolSearch`. That login's
+environment list can differ, so use its `anthropic_cloud` environment.
+
+`listen-install` also puts the kit on the bus if it is missing, so run it before the routine's first fire: a routine with
+no `kit/fb.py` to fetch cannot poll, and tells you so every hour.
 
 On an account with no Mac, skip the daemon and try a GitHub trigger: `action: create_webhook_trigger`, event `issues.opened`
 on this repo, so the tracker issue a kickoff opens wakes it. It has not been proven: it needs an approval that was refused in

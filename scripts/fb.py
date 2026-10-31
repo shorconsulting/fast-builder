@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1547,7 +1547,7 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
         last["conduct"] = time.time()
     if beat_due:
         doc = {"account": account, "at": now_iso(), "cloud": repo_cfg.get("cloud", True), "local": repo_cfg.get("local", True), "version": VERSION}
-        bus.commit(lambda: {"listeners/%s.json" % account: dumps(doc)}, "listener: %s" % account)
+        announce_listener(bus, account, doc)
         last["beat"] = time.time()
     last["sha"] = bus.head()
     heads[remote] = last
@@ -1605,6 +1605,16 @@ def plist_path():
     return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", LABEL + ".plist")
 
 
+def announce_listener(bus, account, doc):
+    """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists."""
+    def mutate():
+        files = {"listeners/%s.json" % account: dumps(doc)}
+        if not bus.exists("kit/fb.py"):
+            files.update(kit_files())
+        return files
+    bus.commit(mutate, "listener: %s" % account)
+
+
 def listen_install(args):
     """Register a repo for this account and install the launchd listener, so it survives reboots and costs no tokens."""
     account = account_name(args)
@@ -1639,7 +1649,7 @@ def listen_install(args):
         run_cmd(["launchctl", "bootstrap", domain, plist_path()], check=True)
         bus = Bus(remote, account)
         doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "version": VERSION}
-        bus.commit(lambda: {"listeners/%s.json" % account: dumps(doc)}, "listener: %s" % account)
+        announce_listener(bus, account, doc)
     print(json.dumps(out, indent=2))
 
 

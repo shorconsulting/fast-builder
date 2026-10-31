@@ -872,6 +872,37 @@ class Listener(World):
 
 
 class CloudBootstrap(World):
+    def announce(self, account):
+        code = "import fb,sys; fb.announce_listener(fb.Bus(sys.argv[1], sys.argv[2]), sys.argv[2], {'account': sys.argv[2]})"
+        sh(["python3", "-c", code, self.remote, account], cwd=os.path.dirname(os.path.abspath(fb.__file__)), env=self.env(account))
+
+    def bus_file(self, repo, rel):
+        sh(["git", "fetch", "-q", "origin", "+refs/heads/fast-builder/bus:refs/remotes/origin/fb-bus"], cwd=repo)
+        return sh(["git", "show", "refs/remotes/origin/fb-bus:" + rel], cwd=repo).stdout
+
+    def test_a_routine_can_poll_a_repo_that_has_never_had_a_run(self):
+        """A cloud routine fetches kit/fb.py before anything else, so the first listener has to put it there."""
+        self.announce("bravo")
+        repo = self.clone("bravo")
+        kit = os.path.join(self.root, "kit-fb.py")
+        with open(kit, "w") as out:
+            out.write(self.bus_file(repo, "kit/fb.py"))
+        self.assertIn("NOTHING", sh(["python3", kit, "poll", "--account", "bravo"], cwd=repo, env=self.env("bravo")).stdout)
+
+    def test_a_later_listener_leaves_the_kit_alone(self):
+        self.announce("bravo")
+        repo = self.clone("bravo")
+        first = self.bus_file(repo, "kit/fb.py")
+        sh(["git", "checkout", "-q", "-b", "edit", "refs/remotes/origin/fb-bus"], cwd=repo)
+        with open(os.path.join(repo, "kit", "fb.py"), "w") as out:
+            out.write("# newer\n")
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "newer kit"], cwd=repo)
+        sh(["git", "push", "-q", "origin", "edit:refs/heads/fast-builder/bus"], cwd=repo)
+        self.announce("charlie")
+        self.assertNotEqual(first, "# newer\n")
+        self.assertEqual(self.bus_file(repo, "kit/fb.py"), "# newer\n")
+        self.assertIn("charlie", self.bus_file(repo, "listeners/charlie.json"))
+
     def test_prompt_bootstraps_from_nothing_but_git(self):
         """What a cloud session does: no plugin, only a clone and the pasted prompt's commands."""
         self.publish()
