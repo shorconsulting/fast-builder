@@ -1182,7 +1182,7 @@ def control_action(session, path):
 
 GUARD_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task"
 READ_ONLY_BASH = re.compile(r"^\s*(git\s+(status|log|diff|show|fetch)|ls|cat|grep|rg|head|tail|wc|pwd|echo)\b")
-KIT_BASH = re.compile(r"""^\s*python3?\s+(?:"\$FB"|\$FB|"[^"-][^"]*fb\.py"|'[^'-][^']*fb\.py'|\S*fb\.py)\s""")
+KIT_BASH = re.compile(r"""^\s*python3?\s+(?:"\$FB"|\$FB|"[^"-][^"]*fb\.py"|'[^'-][^']*fb\.py'|(?:[^\s"'-][^\s"']*)?fb\.py)\s""")
 PUSH_BASH = re.compile(r"\bgit\b(?:\s+-\S+(?:\s+\S+)?)*\s+push\b|\bgh\s+pr\s+create\b")
 
 

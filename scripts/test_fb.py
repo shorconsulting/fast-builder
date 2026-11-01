@@ -825,6 +825,9 @@ class Guard(World):
 
     def test_a_quoted_path_cannot_be_a_python_flag(self):
         self.assertFalse(fb.allowed_when_halted("Bash", """python3 "-cprint(1)#fb.py" x"""))
+        self.assertFalse(fb.allowed_when_halted("Bash", """python3 -c"print(1)#"fb.py x"""))
+        self.assertTrue(fb.allowed_when_halted("Bash", "python3 /tmp/kit/fb.py tick"))
+        self.assertTrue(fb.allowed_when_halted("Bash", "python3 fb.py tick"))
 
     def test_a_halted_lane_can_still_write_its_handoff_outside_the_repo(self):
         self.fb("bravo", "stop", "--run", "hph-10-30-26", "--remote", self.remote)
