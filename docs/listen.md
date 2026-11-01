@@ -29,6 +29,10 @@ Local lanes run with the permission mode chosen here, default `auto`, and anythi
 than left hanging. Only use `bypassPermissions` if the user says so in as many words: a local lane would then run
 whatever the plan on the bus leads it to, under this Mac user, with nothing asking. Say that before installing with it.
 
+A local lane that hangs is still alive when its lane is freed. Before starting that lane again the listener ends the old
+process and waits 10 seconds. If it will not stop, the lane is given back with a blocker, and no second process starts in
+that clone.
+
 A launchd agent runs while this Mac user is logged in, so fast user switching keeps several accounts alive at once, and
 logging a user out stops theirs.
 
@@ -87,7 +91,8 @@ set each account up once: sign it in, then run `--both` or `--routine` above wit
   routine. The name it listens under comes from that line, never from the bus, and it changes only after its own routine
   answered 404 or 400. A `get` and a `run` each cost about half a cent of Haiku.
 - One pass over a repo spends about 24 of those calls at most, so a stop never waits long behind them. A walk that finds
-  nothing, or renames the listener, ends waking for that pass. Runs it did not reach keep their turn for the next pass.
+  nothing, or renames the listener, ends waking for that pass. The run woken longest ago goes first, so runs it did not
+  reach go first in a later pass.
 - A repo with no routine in its config yet starts a proved routine but keeps its name, because nothing has disproved the
   current one. After a rename every repo's routine is cleared, and each finds its own at its next wake.
 - `python3 "$FB" switch` makes the same checks with `get`, so nothing starts. Run it after a swap to put local lanes and

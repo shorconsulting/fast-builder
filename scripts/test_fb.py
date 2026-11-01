@@ -6,6 +6,7 @@ import glob
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -21,9 +22,10 @@ import fb  # noqa: E402
 # Answers as the real CLI does with --output-format stream-json: the tool call, its result "HTTP nnn\\n<json>", the reply.
 # routines.json maps a routine id, or "*", to status, account, name, prompt, reply, is_error, raw (print this instead),
 # no_tool (the model answers without calling), on_run (touch this file), snapshot (copy children.json here), fail (exit 1
-# with this result subtype) and steer (make this RemoteTrigger call as well).
+# with this result subtype and result text, where <uuid> and <now> come out fresh), and steer (make this RemoteTrigger call
+# as well, on the action steer_on if given).
 CLAUDE_SHIM = r"""#!/usr/bin/env python3
-import json, os, re, shutil, sys, uuid
+import json, os, re, shutil, sys, time, uuid
 
 line = " ".join(sys.argv[1:])
 with open(os.environ["FB_SHIM_LOG"], "a") as log:
@@ -46,10 +48,11 @@ if "raw" in answer:
     sys.exit(0)
 if answer.get("fail"):  # as real claude does: exit 1, nothing on stderr, and stdout opening with fresh ids
     print(json.dumps({"type": "system", "subtype": "hook_started", "uuid": uuid.uuid4().hex, "session_id": uuid.uuid4().hex}))
-    print(json.dumps({"type": "result", "subtype": answer["fail"], "is_error": True}))
+    said = answer.get("result", "").replace("<uuid>", str(uuid.uuid4())).replace("<now>", time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    print(json.dumps({"type": "result", "subtype": answer["fail"], "is_error": True, "result": said}))
     sys.exit(1)
 status = answer.get("status", 200)
-if answer.get("steer"):  # as a steered Haiku does: another RemoteTrigger call in the same session
+if answer.get("steer") and answer.get("steer_on", action) == action:  # as a steered Haiku does: another RemoteTrigger call in the same session
     print(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_0", "name": "RemoteTrigger", "input": answer["steer"]}]}}))
     print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_0", "content": "HTTP 200\n{}"}]}}))
 if not answer.get("no_tool"):
@@ -193,7 +196,7 @@ class RoutineStatus(unittest.TestCase):
             self.assertNotEqual(fb.tool_reply(text, "trig_1", "run")[0], "200", name)
 
     def test_any_other_remote_trigger_call_fails_the_whole_call(self):
-        said = "HTTP 200\n{}"
+        said = "HTTP 200\n{\"trigger\": {}}"
         other = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": "RemoteTrigger", "input": {"action": "list"}}]}}
         odd = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": "RemoteTrigger", "input": "list"}]}}
         for name, text in (("before", stream(other, tool_answer(said, "toolu_2"), tool_call(), tool_answer(said), final("done"))),
@@ -201,8 +204,25 @@ class RoutineStatus(unittest.TestCase):
                            ("an embedded id", stream(tool_call("trig_2", "get", ident="toolu_2"), tool_answer(said, "toolu_2"), tool_call(), tool_answer(said))),
                            ("the same id, another action", stream(tool_call(action="update", ident="toolu_2"), tool_call(), tool_answer(said))),
                            ("no input at all", stream(odd, tool_call(), tool_answer(said)))):
-            self.assertEqual(fb.tool_reply(text, "trig_1", "run")[0], "another RemoteTrigger call", name)
+            self.assertEqual(fb.tool_reply(text, "trig_1", "run"), (fb.STEERED, "{\"trigger\": {}}"), name)
         self.assertEqual(fb.tool_reply(stream(tool_call(name="ToolSearch", ident="toolu_2"), tool_call(), tool_answer(said)), "trig_1", "run")[0], "200")
+
+    def test_only_a_run_that_answered_200_outlives_another_call(self):
+        said = "HTTP 200\n{}"
+        other = {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": "RemoteTrigger", "input": {"action": "list"}}]}}
+        self.assertEqual(fb.tool_reply(stream(other, tool_call(), tool_answer("HTTP 404\n{}")), "trig_1", "run")[0], "another RemoteTrigger call")
+        self.assertEqual(fb.tool_reply(stream(other, tool_call(), tool_answer(said, is_error=True)), "trig_1", "run")[0], "another RemoteTrigger call")
+        self.assertEqual(fb.tool_reply(stream(other), "trig_1", "run")[0], "another RemoteTrigger call")
+        self.assertEqual(fb.tool_reply(stream(other, tool_call(action="get"), tool_answer(said)), "trig_1", "get"), ("another RemoteTrigger call", ""))
+
+    def test_a_failing_exit_keeps_its_reason_and_nothing_that_changes(self):
+        note = fb.exit_note(stream({"type": "result", "subtype": "success", "result": "Not logged in \u00b7 Please run /login"}), 1)
+        self.assertEqual(note, "claude exited 1: Not logged in \u00b7 Please run /login")
+        said = "request req_011CgcZJtv6 9f1d2c3a-1111-4222-8333-abcdef012345 failed at 2026-11-01T10:16:00Z, 10:16:00 and deadbeefdeadbeefdeadbeef\nsecond line"
+        self.assertEqual(fb.exit_note(stream({"type": "result", "subtype": "error_during_execution", "result": said}), 1), "claude exited 1 (error_during_execution): request failed at and")
+        self.assertEqual(len(fb.exit_note(stream({"type": "result", "subtype": "success", "result": "x" * 500}), 1)), len("claude exited 1: ") + 120)
+        for said in (None, "", 7, ["x"]):
+            self.assertEqual(fb.exit_note(stream({"type": "result", "subtype": "error_max_turns", "result": said}), 1), "claude exited 1 (error_max_turns)")
 
     def test_a_failing_exit_reads_the_same_every_time(self):
         hook = {"type": "system", "subtype": "hook_started", "uuid": "a1"}
@@ -1362,6 +1382,25 @@ class Listener(World):
         self.assertEqual(len(got), 1, got)
         self.assertIn("claude exited 1 (error_max_turns)", got[0])
 
+    def test_a_login_failure_says_so_and_still_posts_one_blocker(self):
+        """Final 3. A real not-logged-in claude exits 1 with subtype success, and the reason is only in the result."""
+        self.roster()
+        self.answers({"*": {"fail": "success", "result": "Not logged in \u00b7 Please run /login"}})
+        for _ in range(3):
+            self.fb("bravo", "listen", "--once")
+        got = [b for b in self.human() if "could not start its routine" in b]
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("claude exited 1: Not logged in \u00b7 Please run /login", got[0])
+        self.assertNotIn("(success)", got[0])
+
+    def test_a_reason_with_fresh_ids_in_it_still_posts_one_blocker(self):
+        """Final 3."""
+        self.roster()
+        self.answers({"*": {"fail": "error_during_execution", "result": "request req_<uuid> <uuid> failed at <now>"}})
+        for _ in range(3):
+            self.fb("bravo", "listen", "--once")
+        self.assertEqual(len([b for b in self.human() if "could not start its routine" in b]), 1, self.human())
+
     def test_a_bus_id_of_any_other_shape_never_reaches_claude(self):
         """Re-review C. An id is pasted into the prompt and the whole tool is granted, so it can steer Haiku."""
         self.roster()
@@ -1381,12 +1420,37 @@ class Listener(World):
         self.assertEqual(self.ran(), [rid("bravo")])
         self.assertEqual(self.config("bravo")["account"], "bravo")
 
-    def test_a_steered_run_is_not_a_wake(self):
-        """Re-review C."""
+    def test_a_steered_run_that_answered_200_counts_as_started(self):
+        """Final 1. It did start, so "did not start" would be false, but a person should hear about the session."""
         self.roster()
         self.answers({"*": {"status": 200, "steer": {"action": "get", "trigger_id": rid("other")}}})
         self.fb("bravo", "listen", "--once")
-        self.assertTrue(any("did not start (another RemoteTrigger call)" in b for b in self.human()), self.human())
+        self.assertEqual(self.ran(), [rid("bravo")])
+        got = self.human()
+        self.assertFalse(any("could not start" in b or "did not start" in b for b in got), got)
+        self.assertTrue(any("started routine" in b and "another RemoteTrigger call" in b for b in got), got)
+
+    def test_no_rename_follows_a_steered_session(self):
+        """Final 1. Own is gone and the get was clean, so without the steered run this is a proved swap."""
+        self.roster()
+        self.answers({rid("charlie"): {"status": 200, "steer": {"action": "list"}, "steer_on": "run"}, "*": {"status": 404}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), [rid("bravo"), rid("charlie")])
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+        self.assertEqual(self.routine_of("bravo"), rid("bravo"))
+        self.assertFalse(any("did not start" in b for b in self.human()), self.human())
+
+    def test_a_steered_run_on_a_failing_exit_still_counts_as_started(self):
+        """Final 1. A 200 counts on any exit."""
+        self.roster()
+        wrapper = os.path.join(self.root, "exits")
+        os.rename(self.shim, wrapper)
+        with open(self.shim, "w") as handle:
+            handle.write('#!/bin/sh\n"%s" "$@"\nexit 1\n' % wrapper)
+        os.chmod(self.shim, 0o755)
+        self.answers({"*": {"status": 200, "steer": {"action": "list"}}})
+        self.fb("bravo", "listen", "--once")
+        self.assertFalse(any("could not start" in b for b in self.human()), self.human())
 
     def test_a_bad_row_on_the_bus_gives_way_to_a_beat(self):
         """Re-review C. An id no listener will take is not a value worth keeping over the config's."""
@@ -1416,6 +1480,29 @@ class Listener(World):
         self.fb("bravo", "listen", "--once")
         self.assertLessEqual(len(self.calls()), 25)
         self.assertGreaterEqual(len(self.ran()), 1)
+
+    def test_failed_walks_take_turns_across_runs(self):
+        """Final 2. Passes are five minutes apart on a shifted clock, and the wake window is ten: oldest first is what
+        stops the first two runs taking every turn. 12 passes used to give 6, 6, 0, 0."""
+        self.roster()
+        self.owns_only(rid("nobody"))
+        self.more_runs(3)
+        script = ("import fb, json, time\nreal = time.time\nshift = [0]\ntime.time = lambda: real() + shift[0]\n"
+                  "h = {}\ncfg = fb.load_config()['repos']['owner/app']\nseen = {}\ncounts = {}\n"
+                  "for i in range(12):\n"
+                  "    fb.poll_repo(cfg['remote'], cfg, 'bravo', h)\n"
+                  "    for run, at in h[cfg['remote']].get('woke', {}).items():\n"
+                  "        if seen.get(run) != at:\n"
+                  "            seen[run] = at\n"
+                  "            counts[run] = counts.get(run, 0) + 1\n"
+                  "    shift[0] += 301\n"
+                  "print(json.dumps(counts))\n")
+        counts = json.loads(sh([sys.executable, "-c", script], cwd=HERE, env=dict(self.env("bravo"), PYTHONDONTWRITEBYTECODE="1")).stdout)
+        self.assertEqual(len(counts), 4, counts)
+        self.assertGreaterEqual(min(counts.values()), 2, counts)
+        for run in counts:
+            got = [m["body"] for m in self.j("alpha", "inbox", "--run", run, "--who", "human") if "could not start its routine" in m["body"]]
+            self.assertEqual(len(got), 1, (run, got))
 
     def test_a_rename_ends_the_pass(self):
         """Re-review D. The other runs walk under the new name, not again under the old one."""
@@ -1477,6 +1564,144 @@ class Listener(World):
         self.assertIn("went untried", json.loads(proc.stdout)["help"])
         self.assertEqual(self.config("bravo")["account"], "bravo")
         self.assertEqual(self.j("bravo", "switch", "charlie")["account"], "charlie")
+
+    def stopped_child(self, bad_rel, bad_text):
+        """A live child of a stopped run, and one bad file on the bus that sorts ahead of it."""
+        self.register("bravo")
+        self.publish(accounts=2, today="2026-10-31")
+        self.more_runs_from("hph-10-31-26", "aaa-first")
+        self.fb("alpha", "stop", "--run", "hph-10-31-26")
+        child = self.orphan()
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        with open(path, "w") as handle:
+            json.dump({"hph-10-31-26/core": {"pid": child, "remote": self.remote, "attempt": 0, "at": "x"}}, handle)
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, bad_rel), "w") as handle:
+            handle.write(bad_text)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "bad"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.fb("bravo", "listen", "--once")
+        return json.load(open(path))["hph-10-31-26/core"]
+
+    def more_runs_from(self, run, name):
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        shutil.copytree(os.path.join(phone, "runs", run), os.path.join(phone, "runs", name))
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "run"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def orphan(self, ignore_term=False):
+        """A real process in its own session, as a lane is, whose parent has gone: a lane left by an earlier listener. Being
+        nobody's child here means it does not linger as a zombie once it is told to stop."""
+        ready = os.path.join(self.root, "ready-%d" % time.time_ns())
+        body = "import signal, time\nif %r:\n    signal.signal(signal.SIGTERM, signal.SIG_IGN)\nopen(%r, 'w').close()\ntime.sleep(120)\n" % (ignore_term, ready)
+        spawn = "import subprocess, sys\nprint(subprocess.Popen([sys.executable, '-c', %r], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)\n" % body
+        pid = int(sh([sys.executable, "-c", spawn]).stdout)
+        self.addCleanup(self.kill, pid)
+        self.until(lambda: os.path.exists(ready))
+        return pid
+
+    def kill(self, pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    def running(self, pid):
+        return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()[:1] not in ("", "Z")
+
+    def test_a_list_in_control_json_does_not_cost_another_runs_stop(self):
+        """Final 4. active_runs raised before supervise, so the stop was never recorded for the live child."""
+        self.assertIn("term_at", self.stopped_child("runs/aaa-first/control.json", "[1]"))
+
+    def test_a_bad_state_in_control_json_does_not_cost_another_runs_stop(self):
+        """Final 4. An unhashable state raised in the same place."""
+        self.assertIn("term_at", self.stopped_child("runs/aaa-first/control.json", '{"state": ["running"]}'))
+
+    def test_a_list_in_conductor_json_does_not_cost_another_runs_stop(self):
+        """Final 4. conduct now runs ahead of supervise, so its lease read is on the same path."""
+        self.assertIn("term_at", self.stopped_child("runs/aaa-first/conductor.json", "[1]"))
+
+    def test_a_conduct_that_fails_for_any_reason_does_not_cost_a_stop(self):
+        """Final 4. Not a read this time: a goal that is no string fails while the status page is written."""
+        self.assertIn("term_at", self.stopped_child("runs/aaa-first/job.json", '{"goal": 7}'))
+
+    def test_non_dict_claims_and_beats_do_not_stop_a_pass(self):
+        """Final 4. The other reads on that path."""
+        self.register("bravo", routine=rid("bravo"))
+        self.publish(accounts=2)
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        os.makedirs(os.path.join(phone, "runs/hph-10-30-26/claims"), exist_ok=True)
+        os.makedirs(os.path.join(phone, "runs/hph-10-30-26/beats"), exist_ok=True)
+        with open(os.path.join(phone, "runs/hph-10-30-26/claims/core.json"), "w") as handle:
+            handle.write("[1]")
+        with open(os.path.join(phone, "runs/hph-10-30-26/beats/core.json"), "w") as handle:
+            handle.write("[1]")
+        with open(os.path.join(phone, "runs/hph-10-30-26/job.json"), "w") as handle:
+            handle.write("[1]")
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "bad"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        proc = self.fb("bravo", "listen", "--once")
+        self.assertNotIn("AttributeError", proc.stdout + proc.stderr)
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["lanes"][0]["lane"], "core")
+
+    def hung_lane(self, ignore_term):
+        """A local lane whose beat is stale, whose process is alive and hung, on a listener holding the lease."""
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        self.until(self.calls)
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        children = json.load(open(path))
+        key = list(children)[0]
+        run, lane = key.split("/")
+        pid = self.orphan(ignore_term)
+        children[key]["pid"] = pid
+        with open(path, "w") as handle:
+            json.dump(children, handle)
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "runs", run, "beats", lane + ".json"), "w") as handle:
+            json.dump({"at": "2026-01-01T00:00:00Z", "status": "working", "account": "bravo", "note": ""}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "stale"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        open(self.shim_log, "w").close()
+        self.fb("bravo", "listen", "--once")
+        return path, key, pid
+
+    def test_a_hung_lane_is_ended_before_its_replacement_starts(self):
+        """Final 5. A second process in its clone, with the first no longer tracked, is what this used to give."""
+        path, key, pid = self.hung_lane(False)
+        self.until(self.calls)
+        self.assertFalse(self.running(pid), "the hung process must be gone")
+        self.assertEqual(len([c for c in self.calls() if "account orchestrator" in c]), 1)
+        self.assertNotEqual(json.load(open(path))[key]["pid"], pid)
+
+    def test_a_lane_that_will_not_die_blocks_its_replacement(self):
+        """Final 5. It ignores SIGTERM: no second process, it stays tracked, and a person is told."""
+        path, key, pid = self.hung_lane(True)
+        self.assertTrue(self.running(pid))
+        self.assertEqual([c for c in self.calls() if "account orchestrator" in c], [])
+        self.assertEqual(json.load(open(path))[key]["pid"], pid)
+        self.assertTrue(any("will not stop" in b for b in self.human()), self.human())
+
+    def test_a_lane_of_another_repo_under_the_same_key_is_left_alone(self):
+        """Final 5. children.json keys carry no repo, and ending an unrelated repo's healthy lane is no fix."""
+        pid = self.orphan()
+        env = self.env("bravo")
+        os.makedirs(env["FB_HOME"], exist_ok=True)
+        with open(os.path.join(env["FB_HOME"], "children.json"), "w") as handle:
+            json.dump({"r/l": {"pid": pid, "remote": "/some/other.git", "attempt": 0, "at": "x"}}, handle)
+        script = "import fb, sys\ntry:\n    fb.end_child('r/l', sys.argv[1])\nexcept fb.FbError as exc:\n    print('refused', exc)\n"
+        got = sh([sys.executable, "-c", script, self.remote], cwd=HERE, env=dict(env, PYTHONDONTWRITEBYTECODE="1")).stdout
+        self.assertIn("refused", got)
+        self.assertTrue(self.running(pid))
 
     def test_a_failed_wake_tells_a_person(self):
         with open(self.shim, "w") as handle:
