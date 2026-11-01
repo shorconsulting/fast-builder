@@ -8,3 +8,5 @@ Cloud sessions do not load user plugins, but they do run hooks and agents commit
 
 1. From a fresh clone, on a new branch `fast-builder/install`, run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fb.py" install-repo`.
 2. Commit the files it lists and open a pull request explaining what they do. Hooks do nothing in a session that is not a lane. Follow the repo's own rules on who may land `.claude/` changes.
+
+The hooks run a copy of `fb.py` committed to the repo, so upgrading the plugin does not reach them. Run this again after an upgrade.

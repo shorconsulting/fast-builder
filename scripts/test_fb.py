@@ -5,6 +5,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import shlex
 import shutil
 import signal
 import stat
@@ -802,6 +803,18 @@ class Guard(World):
         self.assertIn("deny", self.guard("Write", {"file_path": os.path.join(self.repo, ".GIT/fast-builder/lanes.json")}))
         self.assertIn("deny", self.guard("Write", {"file_path": os.path.join(self.repo, ".git/fast-builder/lanes.json")}))
         self.assertIn("deny", self.guard("Edit", {"file_path": os.path.join(self.repo, ".git/hooks/pre-push")}))
+
+    def test_the_stop_denial_gives_commands_that_get_through(self):
+        """In the real cloud a lane chained its handoff with export FB=..., was refused, and lost the handoff."""
+        self.fb("bravo", "stop", "--run", "hph-10-30-26")
+        self.clear_cache()
+        chained = 'export FB="$(pwd)/fb.py"; python3 "$FB" lane-state stopped'
+        reason = json.loads(self.guard("Bash", {"command": chained}))["hookSpecificOutput"]["permissionDecisionReason"]
+        script = shlex.quote(FB)
+        self.assertIn("python3 %s lane-state stopped" % script, reason)
+        self.assertEqual(self.guard("Bash", {"command": "python3 %s lane-state stopped" % script}), "")
+        self.assertEqual(self.guard("Bash", {"command": "python3 %s handoff /tmp/x" % script}), "")
+        self.assertIn("deny", self.guard("Bash", {"command": "python3 'other.py'; python3 %s handoff /tmp/x" % script}))
 
     def test_a_halted_lane_can_still_write_its_handoff_outside_the_repo(self):
         self.fb("bravo", "stop", "--run", "hph-10-30-26", "--remote", self.remote)
