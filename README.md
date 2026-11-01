@@ -95,9 +95,10 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - Anyone who can push to the bus can start work on listening accounts, read every routine id on it, and change the `fb.py`
   that cloud lanes run. Listen only to repos whose write access you control.
 - A bus writer can list routine ids, but that alone cannot rename a healthy listener or start another routine, and a
-  listener whose own routine answers never tries the list. Once it does not, a listed routine runs only if it is on
-  this login and is a fast-builder listener for this repo, and that routine says whose it is. A bus writer can make such a
-  listener spend up to 12 Haiku calls a wake, or crowd real entries out of those 12 so a swap goes unnoticed.
+  listener whose own routine answers never tries the list. Once it does not, a listed routine runs only if it has the
+  real id shape, is on this login and is a fast-builder listener for this repo, and that routine says whose it is. A bus
+  writer can make such a listener spend up to 12 Haiku calls a pass, or crowd real entries out of those 12. The blocker
+  then says how many went untried, and `/fast-builder:switch NAME` still reaches that name.
 - A swap is noticed at the next cloud wake, or at once with `/fast-builder:switch`. Until then local lanes claim under the
   previous account's name. A repo with no routine of its own yet starts a proved one but keeps the old name.
 - Check that your use of several accounts fits the terms that apply to them. Fast Builder coordinates accounts you already

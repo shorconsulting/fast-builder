@@ -81,10 +81,13 @@ set each account up once: sign it in, then run `--both` or `--routine` above wit
 
 - The listener follows the swap by itself. When a run needs a cloud lane it runs this account's routine, the one in its own
   config. If that starts, it stops there and tries nothing from the bus. A routine on another login answers 404, or 400
-  for an id it cannot parse, and starts nothing, so it then walks the other routines on the bus, at most 12. Each must
-  first pass a `get` showing it is on this login, is named for this repo and has one `poll --account NAME` line. It then
-  runs that routine. The name it listens under comes from that line, never from the bus, and it changes only after its own
-  routine answered 404 or 400. A `get` and a `run` each cost about half a cent of Haiku.
+  for an id it cannot parse, and starts nothing, so it then walks the other routines on the bus, at most 12. An id on the
+  bus must have the real shape, `trig_` and 24 letters or digits, because it goes into a prompt. Each must first pass a
+  `get` showing it is on this login, is named for this repo and has one `poll --account NAME` line. It then runs that
+  routine. The name it listens under comes from that line, never from the bus, and it changes only after its own routine
+  answered 404 or 400. A `get` and a `run` each cost about half a cent of Haiku.
+- One pass over a repo spends about 24 of those calls at most, so a stop never waits long behind them. A walk that finds
+  nothing, or renames the listener, ends waking for that pass. Runs it did not reach keep their turn for the next pass.
 - A repo with no routine in its config yet starts a proved routine but keeps its name, because nothing has disproved the
   current one. After a rename every repo's routine is cleared, and each finds its own at its next wake.
 - `python3 "$FB" switch` makes the same checks with `get`, so nothing starts. Run it after a swap to put local lanes and

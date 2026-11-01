@@ -65,6 +65,7 @@ STOP_BLOCK_CAP = 3
 MAX_RESTARTS = 5
 WAKE_SECONDS = 600
 MAX_ROSTER = 12  # each try costs a Haiku call and calls run one at a time, so a bus cannot be let list as many as it likes
+PASS_CALLS = 24  # about what one pass over one repo may spend on wakes: those run one at a time, and a stop waits behind the pass
 GONE = ("400", "404")  # what a routine on another login answers; neither starts anything
 
 # The default guess at throughput when a repo has no merged history to measure, and what each extra account costs
@@ -101,6 +102,7 @@ EXIT_CODES = {GO: 0, PAUSE: 10, DRAIN: 11, STOP: 20, LOST: 21, FINISHED: 22}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\Z")
 RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\Z")
 TRIGGER_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}\Z")
+BUS_TRIGGER_RE = re.compile(r"^trig_[A-Za-z0-9]{24}\Z")  # an id goes into a prompt, so one from the bus gets no room to say anything
 POLL_RE = re.compile(r"\bfb\.py poll --account ([a-z0-9][a-z0-9-]{0,40})(?![A-Za-z0-9_-])")
 STATUS_RE = re.compile(r"(?:HTTP(?:/[0-9.]+)?\s+|Status:?\s*)?([0-9]{3})(?:\s+(?:OK|Created|Accepted|Bad Request|Unauthorized|Forbidden|Not Found))?\Z", re.I)
 FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
@@ -169,7 +171,7 @@ def read_json(path, default=None):
     try:
         with open(path) as handle:
             return json.load(handle)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return default
 
 
@@ -1415,7 +1417,8 @@ def stated_status(text):
 
 def tool_reply(stream, trigger, action):
     """What RemoteTrigger answered, as (status, body), from the stream-json transcript and not from the model. Only the
-    result of this very call counts, so a reply that says 200 proves nothing, and neither does a call that never ran."""
+    result of this very call counts, so a reply that says 200 proves nothing, and neither does a call that never ran.
+    The whole tool is granted, so any other RemoteTrigger call means the model was steered, and that fails it outright."""
     calls, reply = [], ("no tool result", "")
     for line in stream.split("\n"):
         try:
@@ -1425,14 +1428,32 @@ def tool_reply(stream, trigger, action):
         note = event.get("message") if isinstance(event, dict) else None
         blocks = note.get("content") if isinstance(note, dict) else None
         for block in blocks if isinstance(blocks, list) else []:
-            given = block.get("input") if isinstance(block, dict) else None
-            if isinstance(given, dict) and block.get("type") == "tool_use" and block.get("name") == "RemoteTrigger" and given.get("action") == action and given.get("trigger_id") == trigger:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "RemoteTrigger":
+                given = block.get("input")
+                if not isinstance(given, dict) or given.get("action") != action or given.get("trigger_id") != trigger:
+                    return "another RemoteTrigger call", ""
                 calls.append(block.get("id"))
-            elif isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in calls and reply[0] != "200":
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls and reply[0] != "200":
                 content = block.get("content")
                 text = content if isinstance(content, str) else "".join(str(b.get("text", "")) for b in content if isinstance(b, dict)) if isinstance(content, list) else ""
                 reply = ("error" if block.get("is_error") else stated_status(text), text.partition("\n")[2])
     return reply
+
+
+def exit_note(stream, code):
+    """Why claude failed, in words that stay the same from one try to the next, or a repeated failure is a new blocker each
+    time: stdout opens with events full of fresh ids, and stderr is often empty."""
+    subtype = None
+    for line in stream.split("\n"):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            subtype = event.get("subtype")
+    return "claude exited %d%s" % (code, " (%s)" % str(subtype)[:40] if subtype else "")
 
 
 def routine_call(trigger, action):
@@ -1447,7 +1468,7 @@ def routine_call(trigger, action):
     proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
     reply = tool_reply(proc.stdout or "", trigger, action)
     if proc.returncode != 0 and reply[0] != "200":
-        raise FbError("could not reach routine %s: %s" % (trigger, (proc.stderr or proc.stdout).strip()[:200]))
+        raise FbError("could not reach routine %s: %s" % (trigger, exit_note(proc.stdout or "", proc.returncode)))
     return reply
 
 
@@ -1475,22 +1496,25 @@ def routine_owner(trigger, slug):
     return status, names.pop()
 
 
-def routine_roster(bus, account, own=None):
-    """Routine ids to try, this account's own first whatever the bus says. Logins get swapped on a Mac user, and a routine
-    belongs to its login, so the bus is what lets any Mac user find the routine for whoever is signed in now. It can list
-    anything, so no id comes twice and the list stops at MAX_ROSTER."""
-    rows = [(account, own)] if own else []
-    for name in sorted(bus.listdir("listeners"), key=lambda n: n != "%s.json" % account):
-        if len(rows) >= MAX_ROSTER:
-            break
+def routine_roster(bus, account, own=None, first=None):
+    """Routine ids to try, this account's own first whatever the bus says, then the row for `first` or this account.
+    Logins get swapped on a Mac user, and a routine belongs to its login, so the bus is what lets any Mac user find the
+    routine for whoever is signed in now. It can list anything, so no id comes twice, one has to look like a real routine
+    id, and the list stops at MAX_ROSTER. Returns the rows and how many it left off."""
+    rows, cut, seen = [(account, own)] if own else [], 0, {own}
+    for name in sorted(bus.listdir("listeners"), key=lambda n: n != "%s.json" % (first or account)):
         doc = bus.json("listeners/" + name)
         who, trigger = name[:-5], doc.get("routine") if isinstance(doc, dict) else None
-        if NAME_RE.match(who) and isinstance(trigger, str) and TRIGGER_RE.match(trigger) and not any(t == trigger for _, t in rows):
-            rows.append((who, trigger))
-    return rows
+        if NAME_RE.match(who) and isinstance(trigger, str) and BUS_TRIGGER_RE.match(trigger) and trigger not in seen:
+            seen.add(trigger)
+            if len(rows) < MAX_ROSTER:
+                rows.append((who, trigger))
+            else:
+                cut += 1
+    return rows, cut
 
 
-def wake_roster(rows, own, slug):
+def wake_roster(rows, own, slug, cut=0):
     """Start the routine of whichever account this Mac user is signed in to, and return (account, routine). `claude
     --cloud` needs a real terminal and can stop at interactive dialogs, so a daemon cannot use it. A routine on another
     login answers 404 or 400 and starts nothing, so walking the roster finds the login without trusting a cached profile.
@@ -1511,7 +1535,7 @@ def wake_roster(rows, own, slug):
         if status not in GONE:
             raise FbError("routine %s did not start (%s)" % (trigger, status))
         first = first or status
-    raise FbError("routine %s did not start (%s)%s" % (rows[0][1], first, ROUTINE_HELP))
+    raise FbError("routine %s did not start (%s)%s" % (rows[0][1], first, roster_help(cut)))
 
 
 def adopt_login(account, routines):
@@ -1529,6 +1553,13 @@ def adopt_login(account, routines):
 
 
 ROUTINE_HELP = ": this Mac user's claude login owns none of the routines on the bus, see claude auth status, or set this login up once with /fast-builder:listen"
+
+
+def roster_help(cut):
+    """What to do when nothing started. With rows left off the list, nobody can say this login owns none of them."""
+    if not cut:
+        return ROUTINE_HELP
+    return ": %d more routines on the bus went untried past the limit of %d, so this login may own one of them: remove the rows that do not belong from listeners/ on the bus, or run /fast-builder:switch NAME" % (cut, MAX_ROSTER)
 
 
 def supervise(bus, repo_cfg, account):
@@ -1593,8 +1624,9 @@ def claim_picked(bus, run, lane, account):
         return False
 
 
-def start_lane(bus, repo_cfg, run, lane, account, memory):
-    """Local: claim and launch. Cloud: wake this account's routine, which claims a lane from inside the cloud."""
+def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
+    """Local: claim and launch. Cloud: wake this account's routine, which claims a lane from inside the cloud. `budget` is
+    what this pass may still spend on wakes: a run it cannot pay for keeps its turn for the next pass."""
     job = bus.json("runs/%s/job.json" % run) or {}
     failed = memory.setdefault("failed", {})
     if job.get("where", "cloud") == "local":
@@ -1611,19 +1643,22 @@ def start_lane(bus, repo_cfg, run, lane, account, memory):
     woke = memory.setdefault("woke", {})
     if time.time() - woke.get(run, 0) < WAKE_SECONDS:
         return []
-    woke[run] = time.time()
     if not repo_cfg.get("cloud", True):
         return []
     own = repo_cfg.get("routine_id")
-    rows = routine_roster(bus, account, own)
+    rows, cut = routine_roster(bus, account, own)
+    if rows and budget["calls"] < len(rows):
+        return []
+    woke[run] = time.time()
     if not rows:
         post_once(bus, run, account, "%s is listening but has no cloud routine, so it cannot take a cloud lane. Run /fast-builder:listen --routine on it." % account)
         return [{"did": "no-routine", "run": run}]
     slug = repo_slug(bus.remote)
     try:
         bus.release()  # the wake takes seconds, and lanes on this account need the bus checkout meanwhile
-        who, trigger = wake_roster(rows, own, slug)
+        who, trigger = wake_roster(rows, own, slug, cut)
     except FbError as exc:
+        budget["calls"] = 0  # the same rows and the same login: another run's walk would find the same nothing
         post_once(bus, run, account, "%s could not start its routine: %s" % (account, exc))
         return [{"did": "wake-failed", "run": run, "error": str(exc)}]
     # It started, so nothing after this line may say otherwise. The walk only gets past `own` on a 400 or 404, so a new
@@ -1633,6 +1668,9 @@ def start_lane(bus, repo_cfg, run, lane, account, memory):
         repo_cfg["routine_id"] = trigger
     if trigger != own and (who == account or own):
         adopt_login(who, {slug: trigger})
+    budget["calls"] -= 1 if trigger == own else len(rows) + 1
+    if who != account and own:
+        budget["calls"] = 0  # the rest of this pass is working under the old name: the next one starts under the new
     action = {"did": "woke-routine", "run": run, "routine": trigger, "account": who}
     try:
         bus.sync()
@@ -1661,16 +1699,18 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     if not sha or (sha == last.get("sha") and not beat_due and not conduct_due and not (read_json(children_path()) or {})):
         return actions
     bus.sync()
-    supervise(bus, repo_cfg, account)  # before any wake: those run one Haiku call at a time, and a stop must not wait
-    for run in active_runs(bus):
-        if conduct_due:
+    if conduct_due:  # before supervise: a dead lane it frees must not be restarted there and started again below
+        for run in active_runs(bus):
             report = conduct(bus, run, account)
             if report["freed"] or report["finished"]:
                 actions.append(dict(report, did="conduct"))
+    supervise(bus, repo_cfg, account)  # before any wake: those run one Haiku call at a time, and a stop must not wait
+    budget = {"calls": PASS_CALLS}
+    for run in active_runs(bus):
         if launch and run_state(bus, run)["action"] == GO:
             pick = pick_lane(bus, run, account)
             if pick:
-                actions += start_lane(bus, repo_cfg, run, pick, account, last)
+                actions += start_lane(bus, repo_cfg, run, pick, account, last, budget)
                 if actions and actions[-1].get("sync_failed"):  # the checkout is not one to read: the next pass syncs again
                     bus.release()
                     return actions
@@ -1758,7 +1798,7 @@ def announce_listener(bus, account, doc, proved=False):
     def mutate():
         held = bus.json("listeners/%s.json" % account)
         kept = held.get("routine") if isinstance(held, dict) else None
-        if not proved and isinstance(kept, str) and TRIGGER_RE.match(kept):
+        if not proved and isinstance(kept, str) and BUS_TRIGGER_RE.match(kept):
             doc["routine"] = kept
         files = {"listeners/%s.json" % account: dumps(doc)}
         if not bus.exists("kit/fb.py"):
@@ -2294,12 +2334,14 @@ def cmd_switch(args):
     login has the routine, and the routine says whose it is. One repo that cannot be read costs that repo, not the switch."""
     config = load_config()
     current = config.get("account")
-    known, unreachable = {}, {}
+    known, unreachable, cut = {}, {}, 0
     for slug, cfg in config.get("repos", {}).items():
         bus = Bus(cfg["remote"], current or "unknown")
         try:
             if bus.sync():
-                for who, trigger in routine_roster(bus, current, cfg.get("routine_id")):
+                rows, left = routine_roster(bus, current, cfg.get("routine_id"), first=args.name)
+                cut += left
+                for who, trigger in rows:
                     known.setdefault(who, []).append((slug, trigger))
         except (FbError, OSError) as exc:
             unreachable[slug] = str(exc)[:200]
@@ -2326,7 +2368,7 @@ def cmd_switch(args):
             return
         if unsure and not args.name:
             raise FbError(unsure)
-    out({"account": current, "switched": False, "help": ROUTINE_HELP.lstrip(": "), "unreachable": unreachable})
+    out({"account": current, "switched": False, "help": roster_help(cut).lstrip(": "), "unreachable": unreachable})
     sys.exit(1)
 
 
@@ -2368,7 +2410,7 @@ def cmd_doctor(args):
         bus = Bus(remote)
         checks.update(remote=repo_slug(remote), bus_reachable=True, bus_exists=bool(bus.head()))
         if bus.sync():
-            checks["routines_on_bus"] = sorted(who for who, _ in routine_roster(bus, checks["account"]))
+            checks["routines_on_bus"] = sorted(who for who, _ in routine_roster(bus, checks["account"])[0])
         bus.release()
     except FbError as exc:
         checks.update(bus_reachable=False, error=str(exc))
