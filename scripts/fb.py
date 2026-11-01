@@ -15,7 +15,7 @@ Layout of the bus:
   STATUS.md                       human view, rewritten by the conductor
   settings.json                   repo-wide settings, such as max_accounts
   kit/                            fb.py and the role docs
-  listeners/<account>.json        who is listening, and what they can do
+  listeners/<account>.json        who is listening, what they can do, and their routine
   runs/<run>/job.json             goal and parameters
   runs/<run>/lanes.json           machine-readable ownership
   runs/<run>/<plan file>          REPO-MM-DD-YY-orchestration-plan.md
@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.3"
+VERSION = "0.1.5"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -64,6 +64,10 @@ LEASE_MINUTES = 20
 STOP_BLOCK_CAP = 3
 MAX_RESTARTS = 5
 WAKE_SECONDS = 600
+MAX_ROSTER = 12  # each try costs a Haiku call and calls run one at a time, so a bus cannot be let list as many as it likes
+PASS_CALLS = 24  # about what one pass over one repo may spend on wakes: those run one at a time, and a stop waits behind the pass
+STEERED = "200, with another RemoteTrigger call"  # it started, so say so, but the session cannot be believed about anything else
+GONE = ("400", "404")  # what a routine on another login answers; neither starts anything
 
 # The default guess at throughput when a repo has no merged history to measure, and what each extra account costs
 # in coordination. Both are assumptions: `size` says so in its output, and --rate overrides the first.
@@ -75,7 +79,7 @@ SENSITIVE_DEFAULTS = [
     "**/crypto/**", "**/migrations/**", "**/secrets*", "**/.env*", ".github/**",
 ]
 
-# Who does what. David's routing table: the cheapest model that does the job well. Opus for security-sensitive
+# Who does what: the cheapest model that does the job well. Opus for security-sensitive
 # work, design and orchestration; Sonnet for pattern-following work; Haiku for anything mechanical; Fable never.
 ROUTES = {
     "orchestrate": ("opus", "opus"),
@@ -99,10 +103,15 @@ EXIT_CODES = {GO: 0, PAUSE: 10, DRAIN: 11, STOP: 20, LOST: 21, FINISHED: 22}
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\Z")
 RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\Z")
 TRIGGER_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}\Z")
+BUS_TRIGGER_RE = re.compile(r"^trig_[A-Za-z0-9]{24}\Z")  # an id goes into a prompt, so one from the bus gets no room to say anything
+VOLATILE_RE = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}\S*|\b\d{1,2}:\d{2}(?::\d{2})?\b|\b(?:req|msg|toolu|cse|session)_[\w-]+|\b[0-9a-f]{16,}\b", re.I)
+POLL_RE = re.compile(r"\bfb\.py poll --account ([a-z0-9][a-z0-9-]{0,40})(?![A-Za-z0-9_-])")
+STATUS_RE = re.compile(r"(?:HTTP(?:/[0-9.]+)?\s+|Status:?\s*)?([0-9]{3})(?:\s+(?:OK|Created|Accepted|Bad Request|Unauthorized|Forbidden|Not Found))?\Z", re.I)
 FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}\Z")
 MODEL_RE = re.compile(r"^(opus|sonnet|haiku|claude-[a-z0-9-]{1,40})\Z")
 LOCK_SECONDS = 30
+LANE_STOP_SECONDS = 10
 HOOK_LOCK_SECONDS = 4
 
 
@@ -165,7 +174,7 @@ def read_json(path, default=None):
     try:
         with open(path) as handle:
             return json.load(handle)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return default
 
 
@@ -381,6 +390,11 @@ class Bus:
     def json(self, rel, default=None):
         return read_json(self.path(rel), default)
 
+    def doc(self, rel):
+        """A file that has to be an object: anyone can push anything, and one bad file must not stop what comes after it."""
+        value = self.json(rel)
+        return value if isinstance(value, dict) else {}
+
     def listdir(self, rel):
         try:
             return sorted(n for n in os.listdir(self.path(rel)) if not n.startswith("."))
@@ -442,8 +456,11 @@ To stop every run from a phone: add a file named `STOP` at the top of this branc
 def run_state(bus, run):
     """What a builder should do now, from control.json and the stop switches. A STOP file overrides a live run only:
     a closed run stays closed."""
-    control = bus.json("runs/%s/control.json" % run) or {}
+    rel = "runs/%s/control.json" % run
+    control = bus.doc(rel)
     state = control.get("state", "running")
+    if not isinstance(state, str) or (not isinstance(bus.json(rel), dict) and bus.exists(rel)):
+        state = "stopping"  # as for any state nobody knows, and a file nobody can read is one
     if state in ("finished", "stopped"):
         return {"state": state, "action": FINISHED if state == "finished" else STOP, "reason": control.get("reason", "")}
     if bus.exists("STOP") or bus.exists("runs/%s/STOP" % run):
@@ -472,13 +489,13 @@ def lane_names(bus, run):
 
 
 def beat_of(bus, run, lane):
-    return bus.json("runs/%s/beats/%s.json" % (run, lane)) or {}
+    return bus.doc("runs/%s/beats/%s.json" % (run, lane))
 
 
 def lane_table(bus, run):
     rows = []
     for name in lane_names(bus, run):
-        claim = bus.json("runs/%s/claims/%s.json" % (run, name))
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
         beat = beat_of(bus, run, name)
         rows.append({
             "lane": name, "account": claim.get("account") if claim else None, "status": beat.get("status", "open" if not claim else "claimed"),
@@ -501,6 +518,15 @@ def post(bus, run, frm, to, kind, body):
     bus.commit(lambda: {rel: dumps(message(frm, to, kind, body))}, "msg(%s): %s to %s" % (run, kind, to))
 
 
+def post_once(bus, run, frm, body):
+    """A blocker for a person, unless that exact text is already there: a wake that keeps failing must not fill the inbox."""
+    def mutate():
+        if any(m.get("body") == body for m in messages_for(bus, run, "human")):
+            return {}
+        return {"runs/%s/msgs/%s.json" % (run, make_id(frm)): dumps(message(frm, "human", "blocker", body))}
+    bus.commit(mutate, "msg(%s): blocker to human" % run)
+
+
 def messages_for(bus, run, who, seen=()):
     """Messages for who, skipping ids already seen. An id set, not a watermark: a slow push can land an older id late."""
     out = []
@@ -508,7 +534,7 @@ def messages_for(bus, run, who, seen=()):
         if name in seen:
             continue
         msg = bus.json("runs/%s/msgs/%s" % (run, name))
-        if msg and (who is None or msg.get("to") in (who, "all")) and msg.get("from") != who:
+        if isinstance(msg, dict) and msg and (who is None or msg.get("to") in (who, "all")) and msg.get("from") != who:
             msg["id"] = name
             out.append(msg)
     return out
@@ -531,12 +557,12 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         state = run_state(bus, run)
         if state["action"] != GO:
             raise FbError("run %s is %s" % (run, state["state"]))
-        mine = [n for n in names if (bus.json("runs/%s/claims/%s.json" % (run, n)) or {}).get("account") == account]
+        mine = [n for n in names if bus.doc("runs/%s/claims/%s.json" % (run, n)).get("account") == account]
         if lane and lane in mine:
             won["lane"] = lane
             if not token:
                 return {}
-            doc = dict(bus.json("runs/%s/claims/%s.json" % (run, lane)) or {}, session=token)
+            doc = dict(bus.doc("runs/%s/claims/%s.json" % (run, lane)), session=token)
             return {"runs/%s/claims/%s.json" % (run, lane): dumps(doc)}
         if mine and not allow_second:
             if lane:
@@ -544,7 +570,7 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
             won["lane"] = mine[0]
             if not token:
                 return {}
-            doc = dict(bus.json("runs/%s/claims/%s.json" % (run, mine[0])) or {}, session=token)
+            doc = dict(bus.doc("runs/%s/claims/%s.json" % (run, mine[0])), session=token)
             return {"runs/%s/claims/%s.json" % (run, mine[0]): dumps(doc)}
         if lane:
             if lane not in names:
@@ -556,7 +582,7 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         if not open_lanes:
             raise Taken("no open lane in " + run)
         won["lane"] = open_lanes[0]
-        doc = {"account": account, "at": now_iso(), "session": token, "where": where or (bus.json("runs/%s/job.json" % run) or {}).get("where", "cloud")}
+        doc = {"account": account, "at": now_iso(), "session": token, "where": where or bus.doc("runs/%s/job.json" % run).get("where", "cloud")}
         beat = {"at": now_iso(), "status": "working", "account": account, "note": "claimed"}
         return {"runs/%s/claims/%s.json" % (run, won["lane"]): dumps(doc),
                 "runs/%s/beats/%s.json" % (run, won["lane"]): dumps(beat)}
@@ -580,7 +606,7 @@ def set_control(bus, run, state, reason, by):
     moved = {}
 
     def mutate():
-        current = (bus.json("runs/%s/control.json" % run) or {}).get("state", "running")
+        current = bus.doc("runs/%s/control.json" % run).get("state", "running")
         moved["ok"] = current in TRANSITIONS[state]
         if not moved["ok"]:
             if state == "running" and current == "running" and bus.exists("runs/%s/STOP" % run):
@@ -613,7 +639,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
     def mutate():
         files = {}
         report.update(freed=[], finished=False)
-        lease = bus.json("runs/%s/conductor.json" % run) or {}
+        lease = bus.doc("runs/%s/conductor.json" % run)
         report["holder"] = lease.get("holder")
         if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
             return {}
@@ -631,7 +657,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
         names = lane_names(bus, run)
         if state["action"] == GO:
             for name in _stale(bus, run, stale_minutes):
-                claim = bus.json("runs/%s/claims/%s.json" % (run, name)) or {}
+                claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
                 files["runs/%s/claims/%s.json" % (run, name)] = None
                 files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "freed: %s went quiet" % claim.get("account")})
                 note = message(account, "all", "note", "Lane %s freed: %s went quiet for over %d minutes." % (name, claim.get("account"), stale_minutes))
@@ -643,7 +669,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
                 reason = "every lane is done" if not blocked else "%d lanes done, %d blocked" % (statuses.count("done"), blocked)
                 files["runs/%s/control.json" % run] = dumps({"state": "finished", "reason": reason, "by": account, "at": now_iso()})
                 report["finished"] = True
-        elif (bus.json("runs/%s/control.json" % run) or {}).get("state") in ("draining", "stopping"):
+        elif bus.doc("runs/%s/control.json" % run).get("state") in ("draining", "stopping"):
             quiet = _stale(bus, run, stale_minutes)
             if all(n in quiet or beat_of(bus, run, n).get("status") in ("done", "blocked", "stopped", "open", None) for n in names):
                 files["runs/%s/control.json" % run] = dumps({"state": "stopped", "reason": state["reason"], "by": account, "at": now_iso()})
@@ -669,7 +695,7 @@ def render_status(bus):
         lines += ["**STOP is set: every run is stopping.**", ""]
     runs = list_runs(bus)
     for run in runs[-6:]:
-        job = bus.json("runs/%s/job.json" % run) or {}
+        job = bus.doc("runs/%s/job.json" % run)
         state = run_state(bus, run)
         lines += ["## %s: %s" % (run, state["state"]), "", job.get("goal", ""), "",
                   "| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
@@ -1027,10 +1053,17 @@ def render_draft(draft, today):
         write_file(path, text)
 
 
+def docs_dir():
+    """The role docs: beside scripts/ in the plugin, beside fb.py in any copy of it. Outside the plugin HERE/../docs is
+    somebody else's folder, ~/.config/docs for the installed copy, and whatever is there would go on the bus."""
+    root = os.path.dirname(HERE)
+    return os.path.join(root if os.path.isdir(os.path.join(root, ".claude-plugin")) else HERE, "docs")
+
+
 def kit_files():
     """fb.py and the role docs, as they go on the bus."""
     out = {"kit/fb.py": read_text(os.path.abspath(__file__))}
-    for path in sorted(globlib.glob(os.path.join(HERE, "..", "docs", "*.md")) + globlib.glob(os.path.join(HERE, "docs", "*.md"))):
+    for path in sorted(globlib.glob(os.path.join(docs_dir(), "*.md"))):
         out["kit/docs/" + os.path.basename(path)] = read_text(path)
     return out
 
@@ -1094,7 +1127,7 @@ def build_tick(bus, session):
     """Where the lane stands: the action to take, plus anything new for it."""
     run, lane = session["run"], session["lane"]
     state = run_state(bus, run)
-    claim = bus.json("runs/%s/claims/%s.json" % (run, lane)) or {}
+    claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
     action = state["action"]
     if action in (GO, PAUSE, DRAIN) and not holds_claim(claim, session):
         action = LOST
@@ -1357,14 +1390,65 @@ def work_clone(remote, run, lane, base):
     return path
 
 
+def process_start(pid):
+    """When a process began, or None if `ps` cannot say. In UTC and the C locale, so the same process reads the same after
+    a change of time zone. The command line would not do: a live CLI claude shows in `ps` as bare `claude`."""
+    try:
+        return run_cmd(["ps", "-o", "lstart=", "-p", str(pid)], check=False, timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout.strip() or None
+    except FbError:
+        return None
+
+
+def child_state(child):
+    """Is this entry still our process? A pid outlives its process, and a Mac that restarted hands the same numbers out
+    again, so a live pid alone proves nothing. "gone": dead, or another process with its number, so not ours to touch.
+    "ours": the start time recorded at launch still matches. "unsure": alive, but with no recorded time, from an older
+    version, or none to read now. That gets no signal, and nothing starts beside it."""
+    if not alive(child["pid"]):
+        return "gone"
+    recorded, actual = child.get("started"), process_start(child["pid"])
+    if not recorded or not actual:
+        return "unsure"
+    return "ours" if recorded == actual else "gone"
+
+
+def unsure_note(key, child):
+    return "%s: pid %d cannot be told from an unrelated process, so it was not signalled. End it by hand if it is the lane, or remove %s from %s." % (key, child["pid"], key, children_path())
+
+
+def end_child(key, remote):
+    """Clear the way for a new lane. A hung lane is still alive when its lane is freed, and a second process in its clone,
+    with the first no longer tracked, is what this prevents: it gets the signal a stopped lane gets, and time to go. If it
+    will not go, this raises, and its entry stays in children.json so it is never untracked. Only a process proved to be
+    ours is signalled."""
+    child = (read_json(children_path()) or {}).get(key)
+    state = child_state(child) if child else "gone"
+    if state == "gone":
+        return
+    if child.get("remote") != remote:
+        raise FbError("%s is already running for %s" % (key, repo_slug(child.get("remote") or "another repo")))
+    if state == "unsure":
+        raise FbError(unsure_note(key, child))
+    try:
+        os.killpg(child["pid"], signal.SIGTERM)
+    except OSError:
+        pass
+    end = time.time() + LANE_STOP_SECONDS
+    while alive(child["pid"]) and time.time() < end:
+        time.sleep(0.1)
+    if alive(child["pid"]):
+        raise FbError("its last process, pid %d, will not stop, so no second one was started in its clone" % child["pid"])
+
+
 def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     """Start a local lane under this account, in its own clone. The prompt is a fixed template: nothing from the bus
     reaches a command line."""
-    job = bus.json("runs/%s/job.json" % run) or {}
+    job = bus.doc("runs/%s/job.json" % run)
     errors = job_errors(job)
     if errors or not (RUN_RE.match(run) and NAME_RE.match(lane)):
         raise FbError("refusing an unsafe run: %s" % ", ".join(errors or ["bad run or lane name"]))
     bus.release()  # a first clone can take minutes, and lanes on this account need the bus checkout meanwhile
+    end_child("%s/%s" % (run, lane), bus.remote)
     clone = work_clone(bus.remote, run, lane, job.get("base", "main"))
     bus.sync()
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
@@ -1380,44 +1464,174 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     finally:
         log.close()
     children = read_json(children_path()) or {}
-    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "remote": bus.remote, "attempt": attempt, "at": now_iso()}
+    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "started": process_start(proc.pid), "remote": bus.remote, "attempt": attempt, "at": now_iso()}
     write_file(children_path(), dumps(children))
     return proc.pid
 
 
-def stated_status(reply):
-    """The status the model put first. It sometimes adds a sentence after it, which must not turn a 200 into a failure."""
-    found = re.match(r"\s*(?:HTTP\s+)?(\d{3})\b", reply)
-    return found.group(1) if found else reply.strip()[:40]
+def stated_status(text):
+    """The HTTP status a result opens with. The whole first line has to be the status: "200 was expected, but the tool
+    returned 404" is no 200. Whatever follows that line does not matter."""
+    line = text.strip().split("\n")[0].strip()
+    found = STATUS_RE.match(line)
+    return found.group(1) if found else line[:40]
+
+
+def tool_reply(stream, trigger, action):
+    """What RemoteTrigger answered, as (status, body), from the stream-json transcript and not from the model. Only the
+    result of this very call counts, so a reply that says 200 proves nothing, and neither does a call that never ran.
+    The whole tool is granted, so any other RemoteTrigger call means the model was steered, and that fails it, with one
+    exception: a `run` that answered 200 has started and cannot be unstarted, which STEERED reports."""
+    calls, reply, other = [], ("no tool result", ""), False
+    for line in stream.split("\n"):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        note = event.get("message") if isinstance(event, dict) else None
+        blocks = note.get("content") if isinstance(note, dict) else None
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == "RemoteTrigger":
+                given = block.get("input")
+                if isinstance(given, dict) and given.get("action") == action and given.get("trigger_id") == trigger:
+                    calls.append(block.get("id"))
+                else:
+                    other = True
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls and reply[0] != "200":
+                content = block.get("content")
+                text = content if isinstance(content, str) else "".join(str(b.get("text", "")) for b in content if isinstance(b, dict)) if isinstance(content, list) else ""
+                reply = ("error" if block.get("is_error") else stated_status(text), text.partition("\n")[2])
+    if not other:
+        return reply
+    return (STEERED, reply[1]) if action == "run" and reply[0] == "200" else ("another RemoteTrigger call", "")
+
+
+def exit_note(stream, code):
+    """Why claude failed, in words that stay the same from one try to the next, or a repeated failure is a new blocker each
+    time: stdout opens with events full of fresh ids, and stderr is often empty. A login failure exits 1 with the subtype
+    `success`, and only its result text says what went wrong."""
+    subtype, said = None, None
+    for line in stream.split("\n"):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "result":
+            subtype, said = event.get("subtype"), event.get("result")
+    note = "claude exited %d" % code
+    if subtype and subtype != "success":
+        note += " (%s)" % str(subtype)[:40]
+    said = " ".join(VOLATILE_RE.sub("", said.strip().split("\n")[0]).split())[:120] if isinstance(said, str) else ""
+    return note + ": " + said if said else note
+
+
+def routine_call(trigger, action):
+    """Call the routine API through a headless Haiku, and return the (status, body) the tool got. Exit 0 proves nothing
+    here: a routine on another login answers 404 or 400 and claude still exits cleanly, so only a 200 from the tool
+    counts. It counts on any exit, since by then the routine has started."""
+    if not TRIGGER_RE.match(trigger):
+        raise FbError("bad routine id")
+    prompt = "Use the RemoteTrigger tool once, with action %s and trigger_id %s. Then reply with only the word done." % (action, trigger)
+    args = [CLAUDE, "-p", prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4", "--output-format", "stream-json", "--verbose"]
+    os.makedirs(HOME_DIR, exist_ok=True)
+    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
+    reply = tool_reply(proc.stdout or "", trigger, action)
+    if proc.returncode != 0 and reply[0] not in ("200", STEERED):
+        raise FbError("could not reach routine %s: %s" % (trigger, exit_note(proc.stdout or "", proc.returncode)))
+    return reply
 
 
 def ask_routine_api(trigger, action):
-    """Call the routine API through a headless Haiku, and return the HTTP status it saw. Exit 0 proves nothing here: a
-    routine on another login answers 404 and claude still exits cleanly, so only a stated 200 counts."""
-    if not TRIGGER_RE.match(trigger):
-        raise FbError("bad routine id")
-    prompt = ("Use the RemoteTrigger tool once, with action %s and trigger_id %s. Then reply with only the three-digit HTTP "
-              "status on the first line of the tool's result, or the word error if the tool failed." % (action, trigger))
-    args = [CLAUDE, "-p", prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4", "--output-format", "json"]
-    os.makedirs(HOME_DIR, exist_ok=True)
-    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
-    if proc.returncode != 0:
-        raise FbError("could not reach routine %s: %s" % (trigger, (proc.stderr or proc.stdout).strip()[:200]))
-    try:
-        return stated_status(str(json.loads(proc.stdout).get("result", "")))
-    except ValueError:
-        return proc.stdout.strip()[:40]
+    return routine_call(trigger, action)[0]
 
 
-def wake_routine(trigger):
-    """Start this account's listener routine now. `claude --cloud` needs a real terminal and can stop at interactive
-    dialogs, so a daemon cannot use it. The routine claims a lane itself, in the cloud. About half a cent of Haiku."""
-    status = ask_routine_api(trigger, "run")
+def routine_owner(trigger, slug):
+    """Which account a routine listens as, as (status, account or None), from the routine's own definition on this login.
+    The bus can file any id under any name, so a 200 proves the id and only the routine can say whose it is: listen.md
+    has it named `fast-builder listener OWNER/NAME`, with the line `fb.py poll --account NAME` in its prompt."""
+    status, body = routine_call(trigger, "get")
     if status != "200":
-        raise FbError("routine %s did not start (%s)%s" % (trigger, status, ROUTINE_HELP if status == "404" else ""))
+        return status, None
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        doc = None
+    routine = doc.get("trigger") if isinstance(doc, dict) else None
+    state = routine.get("derived_state") if isinstance(routine, dict) else None
+    prompt = state.get("prompt") if isinstance(state, dict) else None
+    names = set(POLL_RE.findall(prompt)) if isinstance(prompt, str) else set()
+    if len(names) != 1 or str(routine.get("name") if routine else "").lower() != ("fast-builder listener " + slug).lower():
+        return "not a fast-builder listener for " + slug, None
+    return status, names.pop()
 
 
-ROUTINE_HELP = ": this Mac user's claude login is not the account that owns the routine, see claude auth status"
+def routine_roster(bus, account, own=None, first=None):
+    """Routine ids to try, this account's own first whatever the bus says, then the row for `first` or this account.
+    Logins get swapped on a Mac user, and a routine belongs to its login, so the bus is what lets any Mac user find the
+    routine for whoever is signed in now. It can list anything, so no id comes twice, one has to look like a real routine
+    id, and the list stops at MAX_ROSTER. Returns the rows and how many it left off."""
+    rows, cut, seen = [(account, own)] if own else [], 0, {own}
+    for name in sorted(bus.listdir("listeners"), key=lambda n: n != "%s.json" % (first or account)):
+        doc = bus.json("listeners/" + name)
+        who, trigger = name[:-5], doc.get("routine") if isinstance(doc, dict) else None
+        if NAME_RE.match(who) and isinstance(trigger, str) and BUS_TRIGGER_RE.match(trigger) and trigger not in seen:
+            seen.add(trigger)
+            if len(rows) < MAX_ROSTER:
+                rows.append((who, trigger))
+            else:
+                cut += 1
+    return rows, cut
+
+
+def wake_roster(rows, own, slug, cut=0):
+    """Start the routine of whichever account this Mac user is signed in to, and return (account, routine). `claude
+    --cloud` needs a real terminal and can stop at interactive dialogs, so a daemon cannot use it. A routine on another
+    login answers 404 or 400 and starts nothing, so walking the roster finds the login without trusting a cached profile.
+
+    The bus only suggests ids. `own` came from this Mac user's config and goes first, so a healthy listener tries nothing
+    from the bus. Any other row must first prove with `get` that it is a listener for this repo, and that routine, not the
+    bus, says whose it is. About half a cent of Haiku a call. The third value is False for a steered session: the routine
+    started, and nothing else that session said can be relied on."""
+    first = None
+    for who, trigger in rows:
+        if trigger != own:
+            status, who = routine_owner(trigger, slug)
+            if not who:
+                first = first or status
+                continue
+        status = ask_routine_api(trigger, "run")
+        if status in ("200", STEERED):
+            return who, trigger, status == "200"
+        if status not in GONE:
+            raise FbError("routine %s did not start (%s)" % (trigger, status))
+        first = first or status
+    raise FbError("routine %s did not start (%s)%s" % (rows[0][1], first, roster_help(cut)))
+
+
+def adopt_login(account, routines):
+    """Listen as `account` from the next pass, with `routines` by repo. A routine belongs to one login, so a change of name
+    also clears every other repo's: each finds its own at its next wake. The same name changes only the repos given."""
+    config = load_config()
+    renamed = config.get("account") != account
+    config["account"] = account
+    for slug, cfg in config.get("repos", {}).items():
+        if slug in routines:
+            cfg["routine_id"] = routines[slug]
+        elif renamed:
+            cfg["routine_id"] = None
+    save_config(config)
+
+
+ROUTINE_HELP = ": this Mac user's claude login owns none of the routines on the bus, see claude auth status, or set this login up once with /fast-builder:listen"
+
+
+def roster_help(cut):
+    """What to do when nothing started. With rows left off the list, nobody can say this login owns none of them."""
+    if not cut:
+        return ROUTINE_HELP
+    return ": %d more routines on the bus went untried past the limit of %d, so this login may own one of them: remove the rows that do not belong from listeners/ on the bus, or run /fast-builder:switch NAME" % (cut, MAX_ROSTER)
 
 
 def supervise(bus, repo_cfg, account):
@@ -1430,14 +1644,18 @@ def supervise(bus, repo_cfg, account):
             continue
         run, lane = key.split("/", 1)
         action = run_state(bus, run)["action"]
-        running = alive(child["pid"])
+        state = child_state(child)
+        running = state != "gone"
         if action in (STOP, FINISHED):
             if running:
                 child.setdefault("term_at", time.time())
                 if time.time() - child["term_at"] > 120:
                     try:
-                        os.killpg(child["pid"], signal.SIGTERM)
-                    except OSError:
+                        if state == "ours":
+                            os.killpg(child["pid"], signal.SIGTERM)
+                        else:
+                            post_once(bus, run, account, unsure_note(key, child))
+                    except (OSError, FbError):
                         pass
                 changed = True
             elif not running:
@@ -1447,7 +1665,7 @@ def supervise(bus, repo_cfg, account):
         if running or action != GO:
             continue
         status = beat_of(bus, run, lane).get("status")
-        claim = bus.json("runs/%s/claims/%s.json" % (run, lane)) or {}
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
         del children[key]
         changed = True
         if status == "working" and claim.get("account") == account and child.get("attempt", 0) < MAX_RESTARTS:
@@ -1482,9 +1700,10 @@ def claim_picked(bus, run, lane, account):
         return False
 
 
-def start_lane(bus, repo_cfg, run, lane, account, memory):
-    """Local: claim and launch. Cloud: wake this account's routine, which claims a lane from inside the cloud."""
-    job = bus.json("runs/%s/job.json" % run) or {}
+def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
+    """Local: claim and launch. Cloud: wake this account's routine, which claims a lane from inside the cloud. `budget` is
+    what this pass may still spend on wakes: a run it cannot pay for keeps its turn for the next pass."""
+    job = bus.doc("runs/%s/job.json" % run)
     failed = memory.setdefault("failed", {})
     if job.get("where", "cloud") == "local":
         if time.time() - failed.get(run, 0) < WAKE_SECONDS:  # a lane that cannot start must not churn the bus
@@ -1500,31 +1719,56 @@ def start_lane(bus, repo_cfg, run, lane, account, memory):
     woke = memory.setdefault("woke", {})
     if time.time() - woke.get(run, 0) < WAKE_SECONDS:
         return []
-    woke[run] = time.time()
-    trigger = repo_cfg.get("routine_id")
     if not repo_cfg.get("cloud", True):
         return []
-    if not trigger:
-        text = "%s is listening but has no cloud routine, so it cannot take a cloud lane. Run /fast-builder:listen --routine on it." % account
-        if not any(m.get("body") == text for m in messages_for(bus, run, "human")):
-            post(bus, run, account, "human", "blocker", text)
+    own = repo_cfg.get("routine_id")
+    rows, cut = routine_roster(bus, account, own)
+    if rows and budget["calls"] < len(rows):
+        return []
+    woke[run] = time.time()
+    if not rows:
+        post_once(bus, run, account, "%s is listening but has no cloud routine, so it cannot take a cloud lane. Run /fast-builder:listen --routine on it." % account)
         return [{"did": "no-routine", "run": run}]
+    slug = repo_slug(bus.remote)
     try:
         bus.release()  # the wake takes seconds, and lanes on this account need the bus checkout meanwhile
-        wake_routine(trigger)
-        bus.sync()
-        return [{"did": "woke-routine", "run": run, "routine": trigger}]
+        who, trigger, clean = wake_roster(rows, own, slug, cut)
     except FbError as exc:
-        post(bus, run, account, "human", "blocker", "%s could not start its routine: %s" % (account, exc))
+        budget["calls"] = 0  # the same rows and the same login: another run's walk would find the same nothing
+        post_once(bus, run, account, "%s could not start its routine: %s" % (account, exc))
         return [{"did": "wake-failed", "run": run, "error": str(exc)}]
+    # It started, so nothing after this line may say otherwise. The walk only gets past `own` on a 400 or 404, so a new
+    # name with an `own` is a proved swap. With no `own` nothing was disproved: the routine ran, and the name stays. A
+    # steered session proves nothing either.
+    if clean:
+        memory["proved"] = [who, trigger]
+        if who == account:
+            repo_cfg["routine_id"] = trigger
+        if trigger != own and (who == account or own):
+            adopt_login(who, {slug: trigger})
+    budget["calls"] -= 1 if trigger == own else len(rows) + 1
+    if not clean or (who != account and own):
+        budget["calls"] = 0  # the rest of this pass is working under the old name, or from a session nobody can trust
+    action = {"did": "woke-routine", "run": run, "routine": trigger, "account": who}
+    try:
+        if not clean:
+            post_once(bus, run, account, "%s started routine %s, but that session also made another RemoteTrigger call, so it changed nothing here. Check the routine ids under listeners/ on the bus." % (account, trigger))
+        bus.sync()
+    except FbError as exc:
+        action["sync_failed"] = str(exc)
+    return [action]
 
 
 def release_lane(bus, run, lane, account, reason):
     """Give a lane back, so the next listener can take it."""
+    text = "Could not start lane %s: %s" % (lane, reason)
+
     def mutate():
-        return {"runs/%s/claims/%s.json" % (run, lane): None,
-                "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200]}),
-                "runs/%s/msgs/%s.json" % (run, make_id(account)): dumps(message(account, "human", "blocker", "Could not start lane %s: %s" % (lane, reason)))}
+        files = {"runs/%s/claims/%s.json" % (run, lane): None,
+                 "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200]})}
+        if not any(m.get("body") == text for m in messages_for(bus, run, "human")):  # a lane refused all day is one blocker
+            files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(message(account, "human", "blocker", text))
+        return files
     bus.commit(mutate, "release(%s): %s" % (run, lane))
 
 
@@ -1533,41 +1777,56 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     bus = Bus(remote, account)
     sha = bus.head()
     actions = []
-    last = heads.get(remote) or {}
+    last = heads.setdefault(remote, {})  # here and not at the end: a pass that dies must still remember its wake
     beat_due = time.time() - last.get("beat", 0) > 3600
     conduct_due = time.time() - last.get("conduct", 0) > 300
     if not sha or (sha == last.get("sha") and not beat_due and not conduct_due and not (read_json(children_path()) or {})):
         return actions
     bus.sync()
-    for run in active_runs(bus):
-        if conduct_due:
-            report = conduct(bus, run, account)
+    if conduct_due:  # before supervise: a dead lane it frees must not be restarted there and started again below
+        for run in active_runs(bus):
+            try:
+                report = conduct(bus, run, account)
+            except Exception as exc:  # one bad run must not cost another run's stop
+                actions.append({"did": "conduct-failed", "run": run, "error": repr(exc)[:200]})
+                continue
             if report["freed"] or report["finished"]:
                 actions.append(dict(report, did="conduct"))
+    supervise(bus, repo_cfg, account)  # before any wake: those run one Haiku call at a time, and a stop must not wait
+    budget = {"calls": PASS_CALLS}
+    for run in sorted(active_runs(bus), key=lambda r: last.get("woke", {}).get(r, 0)):  # or a failing walk starves all but the first
         if launch and run_state(bus, run)["action"] == GO:
             pick = pick_lane(bus, run, account)
             if pick:
-                actions += start_lane(bus, repo_cfg, run, pick, account, last)
-    supervise(bus, repo_cfg, account)
+                actions += start_lane(bus, repo_cfg, run, pick, account, last, budget)
+                if actions and actions[-1].get("sync_failed"):  # the checkout is not one to read: the next pass syncs again
+                    bus.release()
+                    return actions
     if conduct_due:
         last["conduct"] = time.time()
     if beat_due:
-        doc = {"account": account, "at": now_iso(), "cloud": repo_cfg.get("cloud", True), "local": repo_cfg.get("local", True), "version": VERSION}
-        announce_listener(bus, account, doc)
+        routine = repo_cfg.get("routine_id")
+        doc = {"account": account, "at": now_iso(), "cloud": repo_cfg.get("cloud", True), "local": repo_cfg.get("local", True), "routine": routine, "version": VERSION}
+        announce_listener(bus, account, doc, proved=last.pop("proved", None) == [account, routine])
         last["beat"] = time.time()
     last["sha"] = bus.head()
-    heads[remote] = last
     bus.release()
     return actions
 
 
 def listen_loop(args):
-    account = account_name(args)
     heads = {}
     stopped = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stopped.update(now=True))
     while not stopped["now"]:
         config = load_config()
+        # Read every pass: a swapped login changes this without a restart, and lanes started below inherit it.
+        account = getattr(args, "account", None) or config.get("account") or account_name(args)
+        if os.environ.get("FB_ACCOUNT") != account:
+            os.environ["FB_ACCOUNT"] = account
+            for last in heads.values():  # beat and look again under the new name, but what was started stays started
+                for key in ("sha", "beat", "conduct"):
+                    last.pop(key, None)
         for slug, cfg in config.get("repos", {}).items():
             try:
                 for action in poll_repo(cfg["remote"], cfg, account, heads):
@@ -1621,9 +1880,14 @@ def load_listener(domain):
     raise FbError("launchctl bootstrap failed: %s" % (proc.stderr or proc.stdout).strip()[:300])
 
 
-def announce_listener(bus, account, doc):
-    """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists."""
+def announce_listener(bus, account, doc, proved=False):
+    """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists. A routine
+    nothing has just `proved` never replaces the one on the bus: the config can be the stale side of the two."""
     def mutate():
+        held = bus.json("listeners/%s.json" % account)
+        kept = held.get("routine") if isinstance(held, dict) else None
+        if not proved and isinstance(kept, str) and BUS_TRIGGER_RE.match(kept):
+            doc["routine"] = kept
         files = {"listeners/%s.json" % account: dumps(doc)}
         if not bus.exists("kit/fb.py"):
             files.update(kit_files())
@@ -1635,17 +1899,22 @@ def listen_install(args):
     """Register a repo for this account and install the launchd listener, so it survives reboots and costs no tokens."""
     account = account_name(args)
     config = load_config()
+    same_account = config.get("account") in (None, account)
+    if not same_account:  # a routine belongs to one login, so no repo keeps the previous name's
+        for cfg in config.get("repos", {}).values():
+            cfg["routine_id"] = None
     config["account"] = account
     remote = args.remote or cwd_remote()
     slug = repo_slug(remote)
     held = config.setdefault("repos", {}).get(slug, {})
-    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": args.routine_id or held.get("routine_id")}
+    routine = args.routine_id or (held.get("routine_id") if same_account else None)
+    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": routine}
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
     if os.path.abspath(__file__) != script:
         shutil.copyfile(os.path.abspath(__file__), script)
-    for path in globlib.glob(os.path.join(HERE, "..", "docs", "*.md")):
+    for path in globlib.glob(os.path.join(docs_dir(), "*.md")):
         write_file(os.path.join(HOME_DIR, "docs", os.path.basename(path)), read_text(path))
     root = os.path.dirname(HERE)
     if os.path.isdir(os.path.join(root, ".claude-plugin")) and os.path.abspath(root) != plugin_copy():
@@ -1664,8 +1933,8 @@ def listen_install(args):
         run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
         load_listener(domain)
         bus = Bus(remote, account)
-        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "version": VERSION}
-        announce_listener(bus, account, doc)
+        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "routine": routine, "version": VERSION}
+        announce_listener(bus, account, doc, proved=bool(args.routine_id))
     print(json.dumps(out, indent=2))
 
 
@@ -1718,7 +1987,7 @@ def cmd_draft(args):
     bus.sync()
     remote = bus.remote
     slug = repo_slug(remote)
-    settings = bus.json("settings.json") or {}
+    settings = bus.doc("settings.json")
     code = re.sub(r"[^A-Za-z0-9-]+", "-", args.code or slug.split("/")[-1]).strip("-").upper()
     today = datetime.datetime.strptime(args.today, "%Y-%m-%d").date() if args.today else datetime.date.today()
     run, plan_file = run_names(code, today, set(list_runs(bus)))
@@ -1737,10 +2006,10 @@ def cmd_size(args):
     rate = args.rate or measured or DEFAULT_RATE_PER_DAY
     bus = get_bus(args)
     bus.sync()
-    max_accounts = args.max_accounts or (bus.json("settings.json") or {}).get("max_accounts") or DEFAULT_MAX_ACCOUNTS
+    max_accounts = args.max_accounts or bus.doc("settings.json").get("max_accounts") or DEFAULT_MAX_ACCOUNTS
     result = size(args.items, args.hours, max_accounts, rate)
     result.update(rate_per_account_day=rate, rate_source="--rate" if args.rate else ("measured: merged PRs a day, last 14 days" if measured else "assumed default, no history"), max_accounts=max_accounts)
-    result["listeners"] = [n[:-5] for n in bus.listdir("listeners") if age_minutes((bus.json("listeners/" + n) or {}).get("at")) < 90]
+    result["listeners"] = [n[:-5] for n in bus.listdir("listeners") if age_minutes(bus.doc("listeners/" + n).get("at")) < 90]
     out(result)
 
 
@@ -1795,7 +2064,7 @@ def cmd_publish(args):
         for name in os.listdir(os.path.join(args.draft, "lanes")):
             files[prefix + "lanes/" + name] = read_text(os.path.join(args.draft, "lanes", name))
         files.update(kit_files())
-        settings = bus.json("settings.json") or {"format": FORMAT}
+        settings = bus.doc("settings.json") or {"format": FORMAT}
         settings["max_accounts"] = job["max_accounts"]
         files["settings.json"] = dumps(settings)
         return files
@@ -1819,10 +2088,10 @@ def cmd_join(args):
     token = uuid.uuid4().hex
     lane = claim_lane(bus, run, account, lane, allow_second=args.second, token=token)
     bus.sync()
-    claim = bus.json("runs/%s/claims/%s.json" % (run, lane)) or {}
+    claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
     if claim.get("account") != account or claim.get("session") != token:
         raise Taken("lane %s is held by %s" % (lane, claim.get("account")))
-    job = bus.json("runs/%s/job.json" % run) or {}
+    job = bus.doc("runs/%s/job.json" % run)
     if job_errors(job):
         raise FbError("refusing run %s: %s" % (run, ", ".join(job_errors(job))))
     path = session_path()
@@ -1873,7 +2142,7 @@ def write_beat(bus, session, status, note):
     doc = {"at": now_iso(), "status": status, "account": session["account"], "note": str(note)}
 
     def mutate():
-        if not holds_claim(bus.json("runs/%s/claims/%s.json" % (run, lane)) or {}, session):
+        if not holds_claim(bus.doc("runs/%s/claims/%s.json" % (run, lane)), session):
             raise Lost("this session no longer holds lane %s" % lane)
         return {"runs/%s/beats/%s.json" % (run, lane): dumps(doc)}
 
@@ -1992,11 +2261,11 @@ def control_cmd(state, reason_default):
         if not bus.sync():
             raise FbError("no bus on this repo yet")
         if args.all and state == "running":
-            runs = [r for r in list_runs(bus) if bus.exists("runs/%s/STOP" % r) or (bus.json("runs/%s/control.json" % r) or {}).get("state") in ("paused", "draining", "stopping")]
+            runs = [r for r in list_runs(bus) if bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
         elif args.all:
             runs = [r for r in list_runs(bus) if run_state(bus, r)["state"] not in ("finished", "stopped")]
         elif state == "running" and not args.run and not load_session()[0]:
-            runs = [r for r in list_runs(bus) if (bus.json("runs/%s/control.json" % r) or {}).get("state", "running") in TRANSITIONS["running"]]
+            runs = [r for r in list_runs(bus) if bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
             if len(runs) != 1:
                 raise FbError("%d runs could resume: pass --run or --all (%s)" % (len(runs), ", ".join(runs)))
         else:
@@ -2033,11 +2302,11 @@ def cmd_status(args):
         return
     report = []
     for run in runs:
-        job = bus.json("runs/%s/job.json" % run) or {}
+        job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
-                       "lanes": lane_table(bus, run), "conductor": (bus.json("runs/%s/conductor.json" % run) or {}).get("holder"),
+                       "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
-    out({"runs": report, "listeners": [dict(bus.json("listeners/" + n) or {}, stale=age_minutes((bus.json("listeners/" + n) or {}).get("at")) > 90) for n in bus.listdir("listeners")]})
+    out({"runs": report, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
 
 
 def cmd_report(args):
@@ -2064,7 +2333,7 @@ def cmd_prompt(args):
     if args.lane:
         rows = [r for r in rows if r["lane"] == args.lane]
     for row in rows:
-        print("=== lane %s: paste into a new %s session on the account that takes it ===\n" % (row["lane"], (bus.json("runs/%s/job.json" % run) or {}).get("where", "cloud")))
+        print("=== lane %s: paste into a new %s session on the account that takes it ===\n" % (row["lane"], bus.doc("runs/%s/job.json" % run).get("where", "cloud")))
         print(lane_prompt(run, row["lane"], args.account or "<account name>"))
         print()
 
@@ -2093,7 +2362,7 @@ def cmd_settings(args):
     bus = get_bus(args)
 
     def mutate():
-        settings = bus.json("settings.json") or {"format": FORMAT}
+        settings = bus.doc("settings.json") or {"format": FORMAT}
         if args.max_accounts:
             settings["max_accounts"] = args.max_accounts
         return {"settings.json": dumps(settings)}
@@ -2147,6 +2416,50 @@ def cmd_routine_check(args):
         sys.exit(1)
 
 
+def cmd_switch(args):
+    """Point this Mac user's listener at the account its claude login now belongs to, after a swap. Names one, or with no
+    name finds it, by asking which routine on the bus this login can see. The bus only suggests ids: `get` proves this
+    login has the routine, and the routine says whose it is. One repo that cannot be read costs that repo, not the switch."""
+    config = load_config()
+    current = config.get("account")
+    known, unreachable, cut = {}, {}, 0
+    for slug, cfg in config.get("repos", {}).items():
+        bus = Bus(cfg["remote"], current or "unknown")
+        try:
+            if bus.sync():
+                rows, left = routine_roster(bus, current, cfg.get("routine_id"), first=args.name)
+                cut += left
+                for who, trigger in rows:
+                    known.setdefault(who, []).append((slug, trigger))
+        except (FbError, OSError) as exc:
+            unreachable[slug] = str(exc)[:200]
+        finally:
+            bus.release()
+    if args.name and args.name not in known:
+        raise FbError("no routine for %s on the bus: run /fast-builder:listen once on that login%s" % (args.name, " (could not read: %s)" % ", ".join(sorted(unreachable)) if unreachable else ""))
+    for who in [args.name] if args.name else sorted(known, key=lambda n: n != current):
+        routines, unsure = {}, None
+        for slug, trigger in known[who]:
+            if slug in routines:
+                continue
+            if who == current and trigger == config["repos"][slug].get("routine_id"):  # the config's own: nothing to rename
+                status = ask_routine_api(trigger, "get")
+                if status == "200":
+                    routines[slug] = trigger
+                elif status not in GONE:
+                    unsure = "routine %s answered %s, which proves no swap" % (trigger, status)
+            elif routine_owner(trigger, slug)[1] == who:
+                routines[slug] = trigger
+        if routines:
+            adopt_login(who, routines)
+            out({"account": who, "was": current, "switched": True, "routines": routines, "unreachable": unreachable})
+            return
+        if unsure and not args.name:
+            raise FbError(unsure)
+    out({"account": current, "switched": False, "help": roster_help(cut).lstrip(": "), "unreachable": unreachable})
+    sys.exit(1)
+
+
 def cmd_install_repo(args):
     """Commit-ready files for cloud enforcement: cloud sessions skip user plugins but run the repo's own hooks and
     agents. Writes into this clone only; the caller opens the PR."""
@@ -2184,6 +2497,9 @@ def cmd_doctor(args):
         remote = cwd_remote()
         bus = Bus(remote)
         checks.update(remote=repo_slug(remote), bus_reachable=True, bus_exists=bool(bus.head()))
+        if bus.sync():
+            checks["routines_on_bus"] = sorted(who for who, _ in routine_roster(bus, checks["account"])[0])
+        bus.release()
     except FbError as exc:
         checks.update(bus_reachable=False, error=str(exc))
     checks["repos"] = sorted(load_config().get("repos", {}))
@@ -2340,6 +2656,9 @@ def build_parser():
     p.add_argument("--routine-id", required=True)
 
     add("install-repo", cmd_install_repo, help="write the repo-side hooks that cloud sessions need")
+    p = add("switch", cmd_switch, help="point the listener at this Mac user's current claude login")
+    p.add_argument("name", nargs="?", help="the account to switch to (default: find it)")
+
     add("doctor", cmd_doctor, help="check this account's setup")
     return parser
 
