@@ -43,7 +43,13 @@ at the top of the bus, or in a run's folder, overrides all of them. It can be ad
 ## Trust
 
 Anyone who can push to the bus branch can start work on accounts that listen to the repo, so listen only to repos whose
-write access you control. The listener puts no free text from the bus on a command line: names, model and base branch
+write access you control. The roster in `listeners/` only suggests routine ids. A listener's own routine comes from its
+config and goes first, so a healthy listener tries nothing from the bus. Any other id must pass a `get` on this login, and
+the listener reads the raw tool result, not Haiku's reply, for the routine's name and its `poll --account NAME` line. That
+is what says the routine is this repo's and whose it is, and a bus writer cannot edit a routine. The listener renames
+itself only after its own routine answered 404 or 400. A bus writer can still spend up to 12 Haiku calls per wake on a
+listener whose routine is gone, or fill those 12 places and hide a real swap until those rows are removed. The listener
+puts no free text from the bus on a command line: names, model and base branch
 must match strict patterns, and the prompt is a fixed template. A bus with a symlink on it is refused. Local lanes run the
 `fb.py` that `listen-install` copied to the Mac. Cloud lanes cannot, so they run the bus's copy, which is one more reason
 the repo's write access matters. A lane's model reads the plan, so a hostile plan could still mislead it.

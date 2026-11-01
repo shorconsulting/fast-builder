@@ -18,6 +18,7 @@ the listener sees a run.
 
 If you move a Mac user between Claude logins, set each account up once. After that the listener finds the current login
 itself, and `/fast-builder:switch` updates it straight away. See "Swapping logins" in [docs/listen.md](docs/listen.md).
+Keep each routine's name and its `poll --account NAME` line as that page gives them: they are what proves whose it is.
 
 Optional, once per repo: `/fast-builder:install-repo` opens a PR adding the hooks that let cloud lanes enforce stop and
 lane rules on every tool call. Without it, cloud lanes obey them through their own loop, so a stop lands at their next
@@ -91,10 +92,14 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - The guard hook sees Claude's tools, and `check-diff` catches a shell edit at push time. It is a guardrail for
   well-meaning builders, not a sandbox: a determined shell command can get past it.
 - Cloud lanes fetch `fb.py` from the bus, because cloud sessions get no user plugins. Local lanes use the copy on the Mac.
-- Anyone who can push to the bus can start work on listening accounts, and can list routine ids a listener will try to
-  start under its own login. Listen only to repos whose write access you control.
+- Anyone who can push to the bus can start work on listening accounts, read every routine id on it, and change the `fb.py`
+  that cloud lanes run. Listen only to repos whose write access you control.
+- A bus writer can list routine ids, but that alone cannot rename a healthy listener or start another routine, and a
+  listener whose own routine answers never tries the list. Once it does not, a listed routine runs only if it is on
+  this login and is a fast-builder listener for this repo, and that routine says whose it is. A bus writer can make such a
+  listener spend up to 12 Haiku calls a wake, or crowd real entries out of those 12 so a swap goes unnoticed.
 - A swap is noticed at the next cloud wake, or at once with `/fast-builder:switch`. Until then local lanes claim under the
-  previous account's name.
+  previous account's name. A repo with no routine of its own yet starts a proved one but keeps the old name.
 - Check that your use of several accounts fits the terms that apply to them. Fast Builder coordinates accounts you already
   have. It is not a way around usage limits.
 

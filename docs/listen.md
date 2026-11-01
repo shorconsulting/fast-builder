@@ -48,6 +48,9 @@ holding that `environment_id`, `session_context.model` `claude-opus-5-5` (the se
 
 Set `session_context.allowed_tools` to `Bash, Read, Write, Edit, Glob, Grep, Agent`.
 
+Keep that name and the `poll --account NAME` line as they are. They are how a listener proves a routine is this repo's and
+whose it is, and it will not start a roster routine without them.
+
 A new routine gets every claude.ai connector on the account, Gmail included. This one takes its direction from the repo,
 so create it with `enabled: false`, then RemoteTrigger `action: update` with `{"clear_mcp_connections": true}`, check the
 response shows `mcp_connections` empty, and only then update `enabled` to true. The server may move the cron minute; that
@@ -59,29 +62,37 @@ Record it, and prove this Mac can reach it:
     python3 "$FB" routine-check --routine-id TRIGGER_ID
 
 The daemon wakes the routine through this Mac user's `claude` login, which can differ from the login of the session you
-are in. Check first by comparing `claude auth status` with the routine's owner. If the check says 404, the two differ: fix
-it with `claude auth login` as the account that owns the routine, or create the routine under the CLI's login by running
+are in. Check first by comparing `claude auth status` with the routine's owner. If the check says 404 or 400, the two
+differ: fix it with `claude auth login` as the account that owns the routine, or create the routine under the CLI's login by running
 the same RemoteTrigger calls through `claude -p --model haiku --allowedTools=RemoteTrigger,ToolSearch`. That login's
 environment list can differ, so use its `anthropic_cloud` environment.
 
 `listen-install` also puts the kit on the bus if it is missing, so run it before the routine's first fire: a routine with
 no `kit/fb.py` to fetch cannot poll, and tells you so every hour.
 
-`listen-install` also writes the routine's id to `listeners/NAME.json` on the bus, so every Mac user listening to this repo
-can find it. That is what makes swapping logins work.
+`listen-install --routine-id` also writes the routine's id to `listeners/NAME.json` on the bus, so every Mac user listening
+to this repo can find it. That is what makes swapping logins work. A listener's hourly beat leaves a different id there
+alone unless a wake has just proved its own: this Mac's config can be the stale one.
 
 ## Swapping logins
 
 A routine belongs to one login, and a Mac user has one `claude` login at a time. If you move a Mac user between accounts,
 set each account up once: sign it in, then run `--both` or `--routine` above with its own `--account NAME`. After that:
 
-- The listener follows the swap by itself. When a run needs a cloud lane it tries this account's routine, then the others
-  on the bus. A routine on another login answers 404 and starts nothing, so the one that answers 200 is the current login.
-  It then listens under that name. Each try costs about half a cent of Haiku.
-- `python3 "$FB" switch` does the same check now, with `get` rather than `run`, so nothing starts. Run it after a swap to
-  put local lanes and `status` under the right name before the next wake. `python3 "$FB" switch NAME` checks that one
-  account and refuses if this login does not own its routine.
-- A login that was never set up has no routine on the bus: the wake posts a blocker saying so, and nothing starts.
+- The listener follows the swap by itself. When a run needs a cloud lane it runs this account's routine, the one in its own
+  config. If that starts, it stops there and tries nothing from the bus. A routine on another login answers 404, or 400
+  for an id it cannot parse, and starts nothing, so it then walks the other routines on the bus, at most 12. Each must
+  first pass a `get` showing it is on this login, is named for this repo and has one `poll --account NAME` line. It then
+  runs that routine. The name it listens under comes from that line, never from the bus, and it changes only after its own
+  routine answered 404 or 400. A `get` and a `run` each cost about half a cent of Haiku.
+- A repo with no routine in its config yet starts a proved routine but keeps its name, because nothing has disproved the
+  current one. After a rename every repo's routine is cleared, and each finds its own at its next wake.
+- `python3 "$FB" switch` makes the same checks with `get`, so nothing starts. Run it after a swap to put local lanes and
+  `status` under the right name before the next wake. `python3 "$FB" switch NAME` checks that one account and refuses
+  unless this login owns a routine that carries that name. A repo it cannot read is listed under `unreachable` and finds
+  its routine at its next wake.
+- A login that was never set up has no routine on the bus: the wake posts one blocker saying so, however often it retries,
+  and nothing starts.
 
 An account that has run out of usage cannot wake anything, because the wake itself is a Claude call. Its lanes go quiet and
 are freed after 45 minutes for another account, which starts from the lane's last saved handoff.

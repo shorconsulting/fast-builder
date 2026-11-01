@@ -18,11 +18,55 @@ FB = os.path.join(HERE, "fb.py")
 sys.path.insert(0, HERE)
 import fb  # noqa: E402
 
-CLAUDE_SHIM = """#!/bin/sh
-echo "$PWD :: $*" >> "$FB_SHIM_LOG"
-echo '{"result": "200"}'
-exit 0
+# Answers as the real CLI does with --output-format stream-json: the tool call, its result "HTTP nnn\\n<json>", the reply.
+# routines.json maps a routine id, or "*", to status, account, name, prompt, reply, is_error, raw (print this instead),
+# no_tool (the model answers without calling), on_run (touch this file) and snapshot (copy children.json here).
+CLAUDE_SHIM = r"""#!/usr/bin/env python3
+import json, os, re, shutil, sys
+
+line = " ".join(sys.argv[1:])
+with open(os.environ["FB_SHIM_LOG"], "a") as log:
+    log.write("%s :: %s\n" % (os.getcwd(), line))
+asked = re.search(r"with action (\w+) and trigger_id ([\w-]+)\.", line)
+if not asked:
+    sys.exit(0)
+action, trigger = asked.groups()
+try:
+    table = json.load(open(os.environ["FB_SHIM_TABLE"]))
+except OSError:
+    table = {}
+answer = table.get(trigger, table.get("*", {"status": 200}))
+if action == "run" and answer.get("on_run"):
+    open(answer["on_run"], "w").close()
+if action == "run" and answer.get("snapshot") and os.path.exists("children.json"):
+    shutil.copyfile("children.json", answer["snapshot"])
+if "raw" in answer:
+    print(answer["raw"])
+    sys.exit(0)
+status = answer.get("status", 200)
+if not answer.get("no_tool"):
+    prompt = answer.get("prompt", "python3 /tmp/fb.py poll --account %s\nIf that printed NOTHING, end." % answer.get("account", trigger.replace("trig_", "")))
+    body = {"trigger": {"id": trigger, "name": answer.get("name", "fast-builder listener owner/app"), "derived_state": {"prompt": prompt}}} if status == 200 else {"error": {"type": "not_found_error"}}
+    print(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "RemoteTrigger", "input": {"action": action, "trigger_id": trigger}}]}}))
+    print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "HTTP %s\n%s" % (status, json.dumps(body)), "is_error": answer.get("is_error", False)}]}}))
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": answer.get("reply", "done")}))
 """
+
+
+def stream(*events):
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+def tool_call(trigger="trig_1", action="run", name="RemoteTrigger", ident="toolu_1"):
+    return {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": ident, "name": name, "input": {"action": action, "trigger_id": trigger}}]}}
+
+
+def tool_answer(content, ident="toolu_1", **extra):
+    return {"type": "user", "message": {"content": [dict({"type": "tool_result", "tool_use_id": ident, "content": content}, **extra)]}}
+
+
+def final(reply):
+    return {"type": "result", "subtype": "success", "is_error": False, "result": reply}
 
 
 def sh(args, cwd=None, env=None, check=True):
@@ -54,6 +98,8 @@ class World(unittest.TestCase):
             handle.write(CLAUDE_SHIM)
         os.chmod(self.shim, os.stat(self.shim).st_mode | stat.S_IEXEC)
         self.shim_log = os.path.join(self.root, "shim.log")
+        self.shim_table = os.path.join(self.root, "routines.json")
+        self.more_env = {}
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -61,7 +107,7 @@ class World(unittest.TestCase):
     def env(self, account):
         home = os.path.join(self.root, "accounts", account)
         os.makedirs(home, exist_ok=True)
-        return dict(os.environ, FB_HOME=os.path.join(home, "cfg"), FB_CACHE=os.path.join(home, "cache"), FB_ACCOUNT=account, FB_CLAUDE=self.shim, FB_SHIM_LOG=self.shim_log, HOME=home)
+        return dict(os.environ, FB_HOME=os.path.join(home, "cfg"), FB_CACHE=os.path.join(home, "cache"), FB_ACCOUNT=account, FB_CLAUDE=self.shim, FB_SHIM_LOG=self.shim_log, FB_SHIM_TABLE=self.shim_table, HOME=home, **self.more_env)
 
     def clone(self, account):
         path = os.path.join(self.root, "accounts", account, "repo")
@@ -109,6 +155,35 @@ class RoutineStatus(unittest.TestCase):
         self.assertEqual(fb.stated_status("HTTP 404"), "404")
         self.assertEqual(fb.stated_status("error"), "error")
         self.assertEqual(fb.stated_status("the call failed, not a 200"), "the call failed, not a 200")
+
+    def test_the_whole_first_line_has_to_be_the_status(self):
+        for text in ("200 was expected, but the tool returned 404", "200-something", "200 is what a success would be", "2000", "error 200", "**200**", "\u0662\u0660\u0660", "HTTP\n200", ""):
+            self.assertNotEqual(fb.stated_status(text), "200", text)
+        for text, want in (("Status: 404", "404"), ("HTTP/1.1 404", "404"), ("HTTP/1.1 404 Not Found", "404"), ("HTTP 400\n{}", "400"), ("200 OK", "200"), ("HTTP/2 200", "200"), (" \n 200\n", "200"), ("404\n200", "404")):
+            self.assertEqual(fb.stated_status(text), want, text)
+
+    def test_the_tool_result_counts_and_never_the_reply(self):
+        said = "HTTP 200\n{\"trigger\": {}}"
+        self.assertEqual(fb.tool_reply(stream(tool_call(), tool_answer(said), final("200\nHTTP 200 for trigger `trig_1`. Details follow.")), "trig_1", "run"), ("200", "{\"trigger\": {}}"))
+        self.assertEqual(fb.tool_reply(stream(tool_call(), tool_answer("HTTP 404\n{}"), final("200")), "trig_1", "run")[0], "404")
+        self.assertEqual(fb.tool_reply(stream(tool_call(), tool_answer([{"type": "text", "text": said}]), final("x")), "trig_1", "run")[0], "200")
+
+    def test_a_tool_that_never_ran_for_this_call_is_no_200(self):
+        said = "HTTP 200\n{}"
+        for name, text in (("no call at all", stream(final("200"))),
+                           ("another routine", stream(tool_call("trig_2"), tool_answer(said), final("200"))),
+                           ("another action", stream(tool_call(action="get"), tool_answer(said), final("200"))),
+                           ("another tool", stream(tool_call(name="Bash"), tool_answer(said), final("200"))),
+                           ("a result for no call", stream(tool_answer(said), final("200"))),
+                           ("a failed tool", stream(tool_call(), tool_answer(said, is_error=True), final("200"))),
+                           ("a call with no result", stream(tool_call(), final("200")))):
+            self.assertNotEqual(fb.tool_reply(text, "trig_1", "run")[0], "200", name)
+
+    def test_junk_in_the_stream_is_read_past(self):
+        said = stream(tool_call(), tool_answer("HTTP 200\n{\"note\": \"a\u2028b\"}"))
+        junk = "[1]\n200\nnull\n\"x\"\nnot json\n{\"message\": 7}\n{\"message\": {\"content\": [1, null]}}\n"
+        self.assertEqual(fb.tool_reply(junk + said, "trig_1", "run")[0], "200")
+        self.assertNotEqual(fb.tool_reply(junk, "trig_1", "run")[0], "200")
 
 
 class Names(unittest.TestCase):
@@ -710,8 +785,7 @@ class Listener(World):
 
     def test_a_clean_exit_is_not_a_wake(self):
         """The bug the real cloud test found: another login's routine answers 404 and claude still exits 0."""
-        with open(self.shim, "w") as handle:
-            handle.write("#!/bin/sh\necho '{\"result\": \"404\"}'\nexit 0\n")
+        self.answers({"*": {"status": 404, "reply": "200"}})
         self.register("bravo")
         self.publish(accounts=2)
         self.fb("bravo", "listen", "--once")
@@ -719,10 +793,70 @@ class Listener(World):
         self.assertTrue(any("did not start (404)" in b and "claude auth status" in b for b in got), got)
         self.assertNotEqual(self.fb("bravo", "routine-check", "--routine-id", "trig_1", check=False).returncode, 0)
 
+    def answers(self, table):
+        with open(self.shim_table, "w") as handle:
+            json.dump(table, handle)
+
     def owns_only(self, trigger):
         """The shim answers as a login that owns one routine: 200 for it, 404 for the rest."""
-        with open(self.shim, "w") as handle:
-            handle.write('#!/bin/sh\necho "$PWD :: $*" >> "$FB_SHIM_LOG"\ncase "$*" in *%s*) echo \'{"result": "200"}\';; *) echo \'{"result": "404"}\';; esac\nexit 0\n' % trigger)
+        self.answers({trigger: {"status": 200}, "*": {"status": 404}})
+
+    def plant(self, remote=None, **routines):
+        """A bus writer files routine ids under account names, or removes a name with None."""
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", remote or self.remote, phone])
+        for name, trigger in routines.items():
+            path = os.path.join(phone, "listeners", name + ".json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if trigger is None:
+                os.remove(path)
+            else:
+                with open(path, "w") as handle:
+                    json.dump({"account": name, "routine": trigger}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "plant"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def on_bus(self, rel, remote=None):
+        proc = sh(["git", "--git-dir", remote or self.remote, "show", "fast-builder/bus:" + rel], check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    def bus_routine(self, name, remote=None):
+        return json.loads(self.on_bus("listeners/%s.json" % name, remote))["routine"]
+
+    def second_repo(self, name="other"):
+        remote = os.path.join(self.root, "owner", name + ".git")
+        os.makedirs(remote)
+        sh(["git", "init", "-q", "--bare", "-b", "main", remote])
+        seed = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "init", "-q", "-b", "fast-builder/bus"], cwd=seed)
+        with open(os.path.join(seed, "README.md"), "w") as handle:
+            handle.write("x")
+        sh(["git", "add", "-A"], cwd=seed)
+        sh(["git", "-c", "user.name=s", "-c", "user.email=s@s", "commit", "-qm", "s"], cwd=seed)
+        sh(["git", "push", "-q", remote, "HEAD:fast-builder/bus"], cwd=seed)
+        return remote
+
+    def ran(self):
+        return [line.split("trigger_id ")[1].split(".")[0] for line in self.calls() if "action run" in line]
+
+    def human(self):
+        return [m["body"] for m in self.j("alpha", "inbox", "--run", "hph-10-30-26", "--who", "human")]
+
+    def routine_of(self, account, slug="owner/app"):
+        return self.config(account)["repos"][slug]["routine_id"]
+
+    def live(self, account):
+        proc = subprocess.Popen([sys.executable, FB, "listen", "--seconds", "1"], cwd=self.clone(account), env=self.env(account), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.terminate)
+        return proc
+
+    def until(self, check, seconds=20):
+        end = time.time() + seconds
+        while time.time() < end and not check():
+            time.sleep(0.1)
+        self.assertTrue(check())
 
     def config(self, account):
         return json.load(open(os.path.join(self.env(account)["FB_HOME"], "config.json")))
@@ -804,10 +938,347 @@ class Listener(World):
         sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
         self.owns_only("trig_nobody")
         self.fb("bravo", "listen", "--once")
-        tried = " ".join(line for line in self.calls() if "action run" in line)
+        tried = " ".join(self.calls())
         self.assertIn("trig_charlie", tried)
         self.assertNotIn("trig_x", tried)
         self.assertNotIn("rm -rf", tried)
+
+    def test_a_bus_write_cannot_make_a_healthy_listener_fire_or_rename(self):
+        """Finding 1. bravo's id filed under another name, and a real routine of this login put ahead of it."""
+        self.roster()
+        second = self.second_repo()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", second, "--routine-id", "trig_bravo2")
+        self.answers({"trig_bravo": {"status": 200}, "trig_unrelated": {"status": 200, "account": "aaa"}, "*": {"status": 404}})
+        self.plant(bravo="junk1", aaa="trig_unrelated", bbb="trig_bravo")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_bravo"])
+        self.assertEqual(len(self.calls()), 1, "a healthy listener tries nothing from the bus")
+        config = self.config("bravo")
+        self.assertEqual(config["account"], "bravo")
+        self.assertEqual(config["repos"]["owner/app"]["routine_id"], "trig_bravo")
+        self.assertEqual(config["repos"]["owner/other"]["routine_id"], "trig_bravo2")
+
+    def test_a_routine_that_is_no_listener_for_this_repo_is_never_run(self):
+        """Finding 1. Each answers 200 to this login, so a get alone would pass all of them."""
+        self.roster()
+        self.answers({"trig_mail": {"status": 200, "name": "nightly deploy"},
+                      "trig_repo": {"status": 200, "name": "fast-builder listener owner/elsewhere"},
+                      "trig_line": {"status": 200, "prompt": "do something else"},
+                      "trig_two": {"status": 200, "prompt": "fb.py poll --account aaa\nfb.py poll --account bbb"},
+                      "trig_empty": {"raw": '{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t", "name": "RemoteTrigger", "input": {"action": "get", "trigger_id": "trig_empty"}}]}}\n{"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t", "content": "HTTP 200\\n[1]"}]}}'},
+                      "*": {"status": 404}})
+        self.plant(aaa="trig_mail", bbb="trig_repo", ccc="trig_line", ddd="trig_two", eee="trig_empty")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_bravo"])
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+        self.assertTrue(any("could not start" in b for b in self.human()))
+
+    def test_the_routine_and_not_the_bus_says_whose_it_is(self):
+        """Finding 1. A real swap to charlie, whose id the bus files under mallory."""
+        self.roster()
+        self.owns_only("trig_charlie")
+        self.plant(charlie=None, mallory="trig_charlie")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.config("bravo")["account"], "charlie")
+
+    def test_with_no_own_routine_a_listener_starts_one_but_keeps_its_name(self):
+        """Finding 1. Nothing answered 404 for this account, so a 200 elsewhere proves no swap."""
+        self.roster()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "delta")
+        self.owns_only("trig_charlie")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_charlie"])
+        self.assertEqual(self.config("bravo")["account"], "delta")
+        self.assertEqual(self.routine_of("bravo"), None)
+
+    def test_the_row_under_this_name_is_proved_too_when_no_own_is_set(self):
+        """Finding 1. With no config value the row under this very name came from the bus like any other."""
+        self.roster()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "delta")
+        self.plant(delta="trig_evil")
+        self.answers({"trig_evil": {"status": 200, "name": "nightly deploy"}, "*": {"status": 404}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), [])
+
+    def test_an_own_routine_that_answers_oddly_proves_no_swap(self):
+        self.roster()
+        self.answers({"trig_bravo": {"status": 500}, "trig_charlie": {"status": 200}, "*": {"status": 404}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_bravo"])
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+        self.assertNotEqual(self.fb("bravo", "switch", check=False).returncode, 0)
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+
+    def test_switch_will_not_take_a_name_the_routine_does_not_carry(self):
+        """Finding 1. The hole `get` left: mallory's row holds bravo's id, and it answers 200."""
+        self.roster()
+        self.plant(mallory="trig_bravo")
+        self.owns_only("trig_bravo")
+        self.assertEqual(self.fb("bravo", "switch", "mallory", check=False).returncode, 1)
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+        self.assertEqual(self.j("bravo", "switch")["account"], "bravo")
+
+    def test_switch_proves_each_repo_on_its_own(self):
+        """Finding 1. One repo's bus cannot slip a wrong id into another repo's entry."""
+        self.roster()
+        second = self.second_repo()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", second, "--routine-id", "trig_bravo2")
+        self.plant(remote=second, charlie="trig_mail")
+        self.answers({"trig_charlie": {"status": 200}, "trig_mail": {"status": 200, "name": "nightly deploy"}, "*": {"status": 404}})
+        self.assertEqual(self.j("bravo", "switch", "charlie")["routines"], {"owner/app": "trig_charlie"})
+        self.assertEqual(self.routine_of("bravo", "owner/other"), None)
+
+    def test_a_healthy_repo_is_not_held_up_by_an_unsure_one_in_switch(self):
+        self.roster()
+        second = self.second_repo()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", second, "--routine-id", "trig_bravo2")
+        self.answers({"trig_bravo": {"status": 200}, "trig_bravo2": {"status": 500}, "*": {"status": 404}})
+        got = self.j("bravo", "switch")
+        self.assertEqual([got["account"], got["routines"]], ["bravo", {"owner/app": "trig_bravo"}])
+        self.assertEqual(self.routine_of("bravo", "owner/other"), "trig_bravo2")
+
+    def test_a_second_repo_seeing_the_same_swap_keeps_the_first_repos_routine(self):
+        """Finding 1. Each repo in a pass adopts from a config read before the first adoption."""
+        self.register("bravo", routine="trig_bravo")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.second_repo(), "--routine-id", "trig_bravo2")
+        script = "import fb\nfb.adopt_login('charlie', {'owner/app': 'trig_a'})\nfb.adopt_login('charlie', {'owner/other': 'trig_b'})\n"
+        sh([sys.executable, "-c", script], cwd=HERE, env=dict(self.env("bravo"), PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual([self.routine_of("bravo"), self.routine_of("bravo", "owner/other")], ["trig_a", "trig_b"])
+
+    def test_a_400_is_a_miss_like_a_404(self):
+        """Finding 2. The real server answers 400 to ids that pass TRIGGER_RE."""
+        self.roster()
+        self.answers({"trig_bravo": {"status": 400}, "trig_junk": {"status": 400}, "trig_charlie": {"status": 200}, "*": {"status": 404}})
+        self.plant(aaa="trig_junk")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_bravo", "trig_charlie"])
+        self.assertEqual(self.config("bravo")["account"], "charlie")
+        self.assertEqual(self.human(), [])
+
+    def test_a_new_name_leaves_no_repo_with_the_old_routine(self):
+        """Finding 3a. On a two-repo Mac the old name's routine must not reach the new name's row on the other bus."""
+        self.roster()
+        self.answers({"*": {"status": 404}})
+        second = self.second_repo()
+        self.fb("charlie", "listen-install", "--dry-run", "--remote", second, "--routine-id", "trig_charlie")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", second, "--routine-id", "trig_bravo")
+        self.fb("charlie", "listen", "--once")
+        self.assertEqual(self.bus_routine("charlie", second), "trig_charlie")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "charlie", "--routine-id", "trig_charlie")
+        self.assertEqual(self.routine_of("bravo", "owner/other"), None)
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.bus_routine("charlie", second), "trig_charlie")
+
+    def test_a_walk_that_finds_a_newer_routine_saves_it(self):
+        """Finding 3b. Same name, a stale config and a newer id on the bus."""
+        self.register("bravo", routine="trig_old")
+        self.publish(accounts=2)
+        self.plant(bravo="trig_new")
+        self.answers({"trig_new": {"status": 200, "account": "bravo"}, "*": {"status": 404}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.routine_of("bravo"), "trig_new")
+        self.assertEqual(self.bus_routine("bravo"), "trig_new")
+        self.assertEqual(self.ran(), ["trig_old", "trig_new"])
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_old", "trig_new", "trig_new"], "the second wake goes straight to it")
+
+    def test_a_beat_never_writes_an_unproved_routine_over_the_bus(self):
+        """Finding 3. No wake here, so nothing has proved the config's value."""
+        self.register("bravo", routine="trig_old")
+        self.publish(accounts=2)
+        self.fb("alpha", "stop", "--run", "hph-10-30-26")
+        self.plant(bravo="trig_new")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.bus_routine("bravo"), "trig_new")
+
+    def test_a_routine_that_answered_goes_back_on_the_bus(self):
+        """Finding 3. Keeping the bus's value must not let a bad row stick once own has proved itself."""
+        self.roster()
+        self.plant(bravo="trig_planted")
+        self.owns_only("trig_bravo")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.bus_routine("bravo"), "trig_bravo")
+
+    def test_a_repeated_failure_posts_one_blocker(self):
+        """Finding 4."""
+        self.roster()
+        self.owns_only("trig_nobody")
+        for _ in range(3):
+            self.fb("bravo", "listen", "--once")
+        self.assertEqual(len([b for b in self.human() if "could not start its routine" in b]), 1, self.human())
+
+    def test_a_planted_message_does_not_silence_the_blocker(self):
+        self.roster()
+        self.owns_only("trig_nobody")
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        os.makedirs(os.path.join(phone, "runs/hph-10-30-26/msgs"), exist_ok=True)
+        with open(os.path.join(phone, "runs/hph-10-30-26/msgs/0-x.json"), "w") as handle:
+            handle.write("[1]")
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "x"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.fb("bravo", "listen", "--once")
+        got = sh(["git", "--git-dir", self.remote, "log", "--format=%s", "fast-builder/bus"]).stdout
+        self.assertIn("blocker to human", got)
+
+    def test_a_padded_roster_is_cut_off(self):
+        """Finding 4. 60 planted rows gave 62 Haiku calls, one at a time, ahead of the rest of the pass."""
+        self.roster()
+        self.owns_only("trig_nobody")
+        self.plant(**{"z%03d" % i: "t%03d" % i for i in range(60)})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len(self.calls()), 12)
+        self.assertIn("trigger_id trig_bravo.", self.calls()[0])
+
+    def test_one_id_under_many_names_is_tried_once(self):
+        """Finding 4."""
+        self.roster()
+        self.owns_only("trig_nobody")
+        self.plant(aaa="trig_same", bbb="trig_same", ccc="trig_same", ddd="trig_bravo")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len([line for line in self.calls() if "trig_same" in line]), 1)
+        self.assertEqual(len([line for line in self.calls() if "trig_bravo" in line]), 1)
+
+    def test_a_stop_is_handled_before_a_wake(self):
+        """Finding 4. The walk runs one Haiku call at a time, and supervise used to wait behind it."""
+        self.roster()
+        self.publish(accounts=2, today="2026-10-31")
+        self.fb("alpha", "stop", "--run", "hph-10-31-26")
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        with open(path, "w") as handle:
+            json.dump({"hph-10-31-26/core": {"pid": dead.pid, "remote": self.remote, "attempt": 0, "at": "x"}}, handle)
+        seen = os.path.join(self.root, "children-at-wake")
+        self.answers({"trig_bravo": {"status": 200, "snapshot": seen}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.ran(), ["trig_bravo"])
+        self.assertEqual(json.load(open(seen)), {})
+
+    def test_a_rename_under_a_live_listener_does_not_repeat_the_wake(self):
+        """Finding 5."""
+        self.roster()
+        self.owns_only("trig_charlie")
+        self.live("bravo")
+        self.until(lambda: self.config("bravo")["account"] == "charlie")
+        time.sleep(4)  # time for several passes, each of which would wake again
+        self.assertEqual(self.ran(), ["trig_bravo", "trig_charlie"])
+
+    def test_switch_under_a_live_listener_does_not_repeat_the_wake(self):
+        """Finding 5."""
+        self.roster()
+        self.answers({"trig_bravo": {"status": 200}, "trig_charlie": {"status": 200}})
+        self.live("bravo")
+        self.until(lambda: self.ran() == ["trig_bravo"])
+        self.assertEqual(self.j("bravo", "switch", "charlie")["account"], "charlie")
+        time.sleep(4)
+        self.assertEqual(self.ran(), ["trig_bravo"])
+
+    def test_a_pass_that_dies_still_remembers_its_wake(self):
+        """Finding 5. A wake made before a pass fails must count, or it repeats every minute."""
+        self.roster()
+        self.owns_only("trig_bravo")
+        script = "import fb\nh = {}\ncfg = fb.load_config()['repos']['owner/app']\nfb.announce_listener = lambda *a, **k: 1 / 0\nfor i in range(2):\n    try:\n        fb.poll_repo(cfg['remote'], cfg, 'bravo', h)\n    except ZeroDivisionError:\n        pass\n    h.get('" + self.remote + "', {}).pop('beat', None)\n    fb.Bus(cfg['remote']).release()\n"
+        sh([sys.executable, "-c", script], cwd=HERE, env=dict(self.env("bravo"), PYTHONDONTWRITEBYTECODE="1"))
+        self.assertEqual(self.ran(), ["trig_bravo"])
+
+    def test_what_the_model_says_cannot_change_what_the_tool_answered(self):
+        """Finding 6, through the whole wake."""
+        self.roster()
+        self.answers({"trig_bravo": {"status": 404, "reply": "200 was expected, but the tool returned 404"}, "trig_charlie": {"status": 200, "reply": "200\nHTTP 200 for trigger `trig_charlie`. Details follow."}, "*": {"status": 404}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.config("bravo")["account"], "charlie")
+        self.assertEqual(self.human(), [])
+
+    def test_a_tool_that_never_ran_is_not_a_wake(self):
+        """Finding 6."""
+        self.roster()
+        self.answers({"*": {"no_tool": True, "reply": "200"}})
+        self.fb("bravo", "listen", "--once")
+        self.assertTrue(any("did not start (no tool result)" in b for b in self.human()), self.human())
+        self.assertEqual(self.config("bravo")["account"], "bravo")
+
+    def test_a_failed_tool_is_not_a_wake(self):
+        """Finding 6."""
+        self.roster()
+        self.answers({"*": {"status": 200, "is_error": True, "reply": "200"}})
+        self.fb("bravo", "listen", "--once")
+        self.assertTrue(any("did not start (error)" in b for b in self.human()), self.human())
+
+    def test_switch_skips_a_repo_it_cannot_read_and_says_which(self):
+        """Finding 7. One unreachable repo and one bus with a symlink on it."""
+        self.roster()
+        broken = self.second_repo("broken")
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", broken, phone])
+        os.symlink("/etc/passwd", os.path.join(phone, "link"))
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "link"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", broken, "--routine-id", "trig_b2")
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", os.path.join(self.root, "owner", "gone.git"), "--routine-id", "trig_b3")
+        self.owns_only("trig_charlie")
+        got = self.j("bravo", "switch")
+        self.assertEqual(got["account"], "charlie")
+        self.assertEqual(sorted(got["unreachable"]), ["owner/broken", "owner/gone"])
+        self.assertIn("symlink", got["unreachable"]["owner/broken"])
+        self.assertEqual(self.routine_of("bravo"), "trig_charlie")
+        self.assertEqual(self.routine_of("bravo", "owner/gone"), None)
+
+    def test_switch_that_finds_nothing_still_says_what_it_could_not_read(self):
+        """Finding 7."""
+        self.roster()
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", os.path.join(self.root, "owner", "gone.git"), "--routine-id", "trig_b3")
+        self.owns_only("trig_nobody")
+        proc = self.fb("bravo", "switch", check=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(list(json.loads(proc.stdout)["unreachable"]), ["owner/gone"])
+
+    def non_dict(self, raw):
+        """Finding 9. It used to raise AttributeError past the handler, so no person heard."""
+        self.register("bravo", routine="trig_bravo")
+        self.publish(accounts=2)
+        self.answers({"*": {"raw": raw}})
+        self.assertEqual(self.fb("bravo", "listen", "--once").returncode, 0)
+        self.assertTrue(any("could not start its routine" in b for b in self.human()), raw)
+
+    def test_a_json_list_from_claude_is_a_blocker(self):
+        self.non_dict("[1]")
+
+    def test_a_bare_json_number_from_claude_is_a_blocker(self):
+        self.non_dict("200")
+
+    def test_json_null_from_claude_is_a_blocker(self):
+        self.non_dict("null")
+
+    def test_a_result_array_from_claude_is_a_blocker(self):
+        self.non_dict('[{"type": "result", "result": "200"}]')
+
+    def test_a_routine_that_answered_200_counts_whatever_the_sync_does(self):
+        """Finding 10. git fails once, straight after the 200, so a false blocker would still get posted."""
+        self.roster()
+        self.publish(accounts=2, today="2026-10-31")
+        flag = os.path.join(self.root, "fail-git")
+        bin_dir = os.path.join(self.root, "bin")
+        os.makedirs(bin_dir)
+        with open(os.path.join(bin_dir, "git"), "w") as handle:
+            handle.write('#!/bin/sh\nif [ -f "%s" ]; then rm -f "%s"; exit 1; fi\nexec "%s" "$@"\n' % (flag, flag, shutil.which("git")))
+        os.chmod(os.path.join(bin_dir, "git"), 0o755)
+        self.more_env = {"PATH": bin_dir + os.pathsep + os.environ["PATH"]}
+        self.answers({"trig_charlie": {"status": 200, "on_run": flag}, "*": {"status": 404}})
+        self.assertEqual(self.fb("bravo", "listen", "--once").returncode, 0)
+        self.assertFalse(os.path.exists(flag))
+        self.assertEqual(self.config("bravo")["account"], "charlie")
+        self.assertEqual(self.routine_of("bravo"), "trig_charlie")
+        self.assertEqual(self.human(), [])
+        self.assertEqual(self.ran(), ["trig_bravo", "trig_charlie"], "the pass stops at a checkout it could not refresh")
+
+    def test_the_documented_routine_passes_the_listener_check(self):
+        """What listen.md tells a person to create is what routine_owner reads."""
+        text = open(os.path.join(HERE, "..", "docs", "listen.md")).read()
+        self.assertIn("`fast-builder listener OWNER/NAME`", text)
+        self.assertEqual(set(fb.POLL_RE.findall(text.replace("poll --account NAME", "poll --account bravo"))), {"bravo"})
 
     def test_a_failed_wake_tells_a_person(self):
         with open(self.shim, "w") as handle:
@@ -1001,6 +1472,33 @@ class CloudBootstrap(World):
         self.assertNotEqual(first, "# newer\n")
         self.assertEqual(self.bus_file(repo, "kit/fb.py"), "# newer\n")
         self.assertIn("charlie", self.bus_file(repo, "listeners/charlie.json"))
+
+    def test_the_installed_copy_keeps_to_its_own_docs(self):
+        """Finding 8. From ~/.config/fast-builder, HERE/../docs is ~/.config/docs, and it is not ours."""
+        env = self.env("bravo")
+        installed, stray = env["FB_HOME"], os.path.join(os.path.dirname(env["FB_HOME"]), "docs")
+        os.makedirs(os.path.join(installed, "docs"))
+        os.makedirs(stray)
+        shutil.copyfile(FB, os.path.join(installed, "fb.py"))
+        with open(os.path.join(installed, "docs", "lane-lead.md"), "w") as out:
+            out.write("ours\n")
+        with open(os.path.join(stray, "private-notes.md"), "w") as out:
+            out.write("secret\n")
+        code = "import fb,sys; fb.announce_listener(fb.Bus(sys.argv[1], 'bravo'), 'bravo', {'account': 'bravo'})"
+        sh([sys.executable, "-c", code, self.remote], cwd=installed, env=dict(env, PYTHONDONTWRITEBYTECODE="1"))
+        repo = self.clone("bravo")
+        self.assertEqual(self.bus_file(repo, "kit/docs/lane-lead.md"), "ours\n")
+        self.assertEqual(sh(["git", "ls-tree", "-r", "--name-only", "refs/remotes/origin/fb-bus", "kit/docs"], cwd=repo).stdout.split(), ["kit/docs/lane-lead.md"])
+        sh([sys.executable, os.path.join(installed, "fb.py"), "listen-install", "--dry-run", "--remote", self.remote], cwd=repo, env=env)
+        self.assertEqual(os.listdir(os.path.join(installed, "docs")), ["lane-lead.md"])
+
+    def test_the_plugin_still_ships_its_docs(self):
+        self.announce("bravo")
+        repo = self.clone("bravo")
+        self.bus_file(repo, "README.md")
+        names = sh(["git", "ls-tree", "-r", "--name-only", "refs/remotes/origin/fb-bus", "kit/docs"], cwd=repo).stdout.split()
+        self.assertIn("kit/docs/lane-lead.md", names)
+        self.assertIn("kit/docs/conductor.md", names)
 
     def test_prompt_bootstraps_from_nothing_but_git(self):
         """What a cloud session does: no plugin, only a clone and the pasted prompt's commands."""
