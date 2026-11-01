@@ -95,7 +95,9 @@ Keep a rolling handoff in a file and save it after each landed slice, and always
 
     python3 "$FB" handoff /tmp/handoff-<lane>.md
 
-Keep that file outside the repo: once a run is stopped it is the one place you can still write.
+Keep that file outside the repo: once a run is stopped it is the one place you can still write. After a stop or pause only
+single commands get through, so write it with the Write tool, and run `handoff` and `lane-state` on their own with the full
+path to `fb.py`. A command that sets `$FB` first or chains anything is refused.
 
 It holds open PRs (number, head sha, state, sequence number), position in the work, next three slices, blockers and
 lessons. It is what a replacement account starts from if this one runs out of usage, so write it for a stranger.

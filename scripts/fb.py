@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1182,7 +1182,7 @@ def control_action(session, path):
 
 GUARD_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task"
 READ_ONLY_BASH = re.compile(r"^\s*(git\s+(status|log|diff|show|fetch)|ls|cat|grep|rg|head|tail|wc|pwd|echo)\b")
-KIT_BASH = re.compile(r"""^\s*python3?\s+(?:"\$FB"|\$FB|"?\S*fb\.py"?)\s""")
+KIT_BASH = re.compile(r"""^\s*python3?\s+(?:"\$FB"|\$FB|"[^"-][^"]*fb\.py"|'[^'-][^']*fb\.py'|(?:[^\s"'-][^\s"']*)?fb\.py)\s""")
 PUSH_BASH = re.compile(r"\bgit\b(?:\s+-\S+(?:\s+\S+)?)*\s+push\b|\bgh\s+pr\s+create\b")
 
 
@@ -1231,7 +1231,7 @@ def hook_guard(payload):
         return
     # A halted lane still has to write its handoff somewhere, so a file outside the repo stays open.
     if action in (STOP, LOST, PAUSE) and not allowed_when_halted(tool, command) and not (writes and repo_relative(target, cwd, path) is None and outside_tree(target, cwd)):
-        deny("fast-builder: run %s says %s. %s" % (session["run"], action, INSTRUCTIONS[action]))
+        deny("fast-builder: run %s says %s. %s %s" % (session["run"], action, INSTRUCTIONS[action], halted_help(action)))
         return
     if action == DRAIN and tool in ("Agent", "Task"):
         deny("fast-builder: run is draining, so no new work. " + INSTRUCTIONS[DRAIN])
@@ -1248,6 +1248,19 @@ def hook_guard(payload):
         bad = out_of_lane(cwd, session, lanes)
         if bad:
             deny("fast-builder: this branch cannot be pushed from lane %s: %s" % (session["lane"], ", ".join(bad[:5])))
+
+
+def halted_help(action):
+    """A lane that chains its handoff or sets $FB in the same command is refused, and then loses the handoff."""
+    script = shlex.quote(os.path.abspath(__file__))
+    rule = "Only single commands get through now, with no chaining and no $(...). "
+    if action == LOST:
+        return rule + "Run: python3 %s leave" % script
+    if action == PAUSE:
+        return (rule + "Write the handoff with the Write tool to a file outside the repo, then run these as separate commands: "
+                "python3 %s handoff FILE, and python3 %s wait --until-resumed --seconds 540." % (script, script))
+    return (rule + "Write the handoff with the Write tool to a file outside the repo, then run these as separate commands: "
+            "python3 %s handoff FILE, and python3 %s lane-state stopped." % (script, script))
 
 
 def inside_git_dir(target, cwd, session_file):
