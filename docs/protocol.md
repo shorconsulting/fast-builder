@@ -56,6 +56,7 @@ a real swap until those rows are removed. The blocker then says how many went un
 that name's row. The listener puts no free text from the bus on a command line: names, model and base branch must match
 strict patterns, and the prompt is a fixed template. A bus with a symlink on it is refused. Local lanes run the `fb.py`
 that `listen-install` copied to the Mac. Cloud lanes cannot, so they run the bus's copy, which is one more reason the
-repo's write access matters. A bus file that is not the object it should be reads as empty, and one bad run cannot stop
-another run's stop being handled. A lane's model reads the plan, so a hostile plan could still mislead it. That is why
-the listener's local permission mode defaults to `auto` and `bypassPermissions` has to be chosen when it is installed.
+repo's write access matters. A bus file that is not the object it should be reads as empty, except `control.json`, which
+then reads as stopping, as an unknown state does. One bad run cannot stop another run's stop being handled. A lane's
+model reads the plan, so a hostile plan could still mislead it. That is why the listener's local permission mode
+defaults to `auto` and `bypassPermissions` has to be chosen when it is installed.

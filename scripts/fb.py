@@ -456,10 +456,11 @@ To stop every run from a phone: add a file named `STOP` at the top of this branc
 def run_state(bus, run):
     """What a builder should do now, from control.json and the stop switches. A STOP file overrides a live run only:
     a closed run stays closed."""
-    control = bus.doc("runs/%s/control.json" % run)
+    rel = "runs/%s/control.json" % run
+    control = bus.doc(rel)
     state = control.get("state", "running")
-    if not isinstance(state, str):
-        state = "stopping"  # as for any state nobody knows
+    if not isinstance(state, str) or (not isinstance(bus.json(rel), dict) and bus.exists(rel)):
+        state = "stopping"  # as for any state nobody knows, and a file nobody can read is one
     if state in ("finished", "stopped"):
         return {"state": state, "action": FINISHED if state == "finished" else STOP, "reason": control.get("reason", "")}
     if bus.exists("STOP") or bus.exists("runs/%s/STOP" % run):
@@ -1389,15 +1390,45 @@ def work_clone(remote, run, lane, base):
     return path
 
 
+def process_start(pid):
+    """When a process began, or None if `ps` cannot say. In UTC and the C locale, so the same process reads the same after
+    a change of time zone. The command line would not do: a live CLI claude shows in `ps` as bare `claude`."""
+    try:
+        return run_cmd(["ps", "-o", "lstart=", "-p", str(pid)], check=False, timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout.strip() or None
+    except FbError:
+        return None
+
+
+def child_state(child):
+    """Is this entry still our process? A pid outlives its process, and a Mac that restarted hands the same numbers out
+    again, so a live pid alone proves nothing. "gone": dead, or another process with its number, so not ours to touch.
+    "ours": the start time recorded at launch still matches. "unsure": alive, but with no recorded time, from an older
+    version, or none to read now. That gets no signal, and nothing starts beside it."""
+    if not alive(child["pid"]):
+        return "gone"
+    recorded, actual = child.get("started"), process_start(child["pid"])
+    if not recorded or not actual:
+        return "unsure"
+    return "ours" if recorded == actual else "gone"
+
+
+def unsure_note(key, child):
+    return "%s: pid %d cannot be told from an unrelated process, so it was not signalled. End it by hand if it is the lane, or remove %s from %s." % (key, child["pid"], key, children_path())
+
+
 def end_child(key, remote):
     """Clear the way for a new lane. A hung lane is still alive when its lane is freed, and a second process in its clone,
     with the first no longer tracked, is what this prevents: it gets the signal a stopped lane gets, and time to go. If it
-    will not go, this raises, and its entry stays in children.json so it is never untracked."""
+    will not go, this raises, and its entry stays in children.json so it is never untracked. Only a process proved to be
+    ours is signalled."""
     child = (read_json(children_path()) or {}).get(key)
-    if not child or not alive(child["pid"]):
+    state = child_state(child) if child else "gone"
+    if state == "gone":
         return
     if child.get("remote") != remote:
         raise FbError("%s is already running for %s" % (key, repo_slug(child.get("remote") or "another repo")))
+    if state == "unsure":
+        raise FbError(unsure_note(key, child))
     try:
         os.killpg(child["pid"], signal.SIGTERM)
     except OSError:
@@ -1433,7 +1464,7 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     finally:
         log.close()
     children = read_json(children_path()) or {}
-    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "remote": bus.remote, "attempt": attempt, "at": now_iso()}
+    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "started": process_start(proc.pid), "remote": bus.remote, "attempt": attempt, "at": now_iso()}
     write_file(children_path(), dumps(children))
     return proc.pid
 
@@ -1613,14 +1644,18 @@ def supervise(bus, repo_cfg, account):
             continue
         run, lane = key.split("/", 1)
         action = run_state(bus, run)["action"]
-        running = alive(child["pid"])
+        state = child_state(child)
+        running = state != "gone"
         if action in (STOP, FINISHED):
             if running:
                 child.setdefault("term_at", time.time())
                 if time.time() - child["term_at"] > 120:
                     try:
-                        os.killpg(child["pid"], signal.SIGTERM)
-                    except OSError:
+                        if state == "ours":
+                            os.killpg(child["pid"], signal.SIGTERM)
+                        else:
+                            post_once(bus, run, account, unsure_note(key, child))
+                    except (OSError, FbError):
                         pass
                 changed = True
             elif not running:
@@ -1726,10 +1761,14 @@ def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
 
 def release_lane(bus, run, lane, account, reason):
     """Give a lane back, so the next listener can take it."""
+    text = "Could not start lane %s: %s" % (lane, reason)
+
     def mutate():
-        return {"runs/%s/claims/%s.json" % (run, lane): None,
-                "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200]}),
-                "runs/%s/msgs/%s.json" % (run, make_id(account)): dumps(message(account, "human", "blocker", "Could not start lane %s: %s" % (lane, reason)))}
+        files = {"runs/%s/claims/%s.json" % (run, lane): None,
+                 "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200]})}
+        if not any(m.get("body") == text for m in messages_for(bus, run, "human")):  # a lane refused all day is one blocker
+            files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(message(account, "human", "blocker", text))
+        return files
     bus.commit(mutate, "release(%s): %s" % (run, lane))
 
 

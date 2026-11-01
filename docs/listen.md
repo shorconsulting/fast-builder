@@ -33,6 +33,11 @@ A local lane that hangs is still alive when its lane is freed. Before starting t
 process and waits 10 seconds. If it will not stop, the lane is given back with a blocker, and no second process starts in
 that clone.
 
+The listener records each lane's process start time, because a pid can come back as somebody else's process, for instance
+after a restart. If the time no longer matches, the process is not touched and the lane starts as normal. An entry with no
+recorded time, from an older version, is never signalled. While its pid is alive nothing starts over it, and a blocker says
+what to do.
+
 A launchd agent runs while this Mac user is logged in, so fast user switching keeps several accounts alive at once, and
 logging a user out stops theirs.
 

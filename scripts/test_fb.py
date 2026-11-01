@@ -23,7 +23,7 @@ import fb  # noqa: E402
 # routines.json maps a routine id, or "*", to status, account, name, prompt, reply, is_error, raw (print this instead),
 # no_tool (the model answers without calling), on_run (touch this file), snapshot (copy children.json here), fail (exit 1
 # with this result subtype and result text, where <uuid> and <now> come out fresh), and steer (make this RemoteTrigger call
-# as well, on the action steer_on if given).
+# as well, on the action steer_on if given). lane_sleep at the top keeps a lane up for that many seconds.
 CLAUDE_SHIM = r"""#!/usr/bin/env python3
 import json, os, re, shutil, sys, time, uuid
 
@@ -31,13 +31,14 @@ line = " ".join(sys.argv[1:])
 with open(os.environ["FB_SHIM_LOG"], "a") as log:
     log.write("%s :: %s\n" % (os.getcwd(), line))
 asked = re.search(r"with action (\w+) and trigger_id ([\w-]+)\.", line)
-if not asked:
-    sys.exit(0)
-action, trigger = asked.groups()
 try:
     table = json.load(open(os.environ["FB_SHIM_TABLE"]))
 except OSError:
     table = {}
+if not asked:
+    time.sleep(table.get("lane_sleep", 0))
+    sys.exit(0)
+action, trigger = asked.groups()
 answer = table.get(trigger, table.get("*", {"status": 200}))
 if action == "run" and answer.get("on_run"):
     open(answer["on_run"], "w").close()
@@ -235,6 +236,20 @@ class RoutineStatus(unittest.TestCase):
         junk = "[1]\n200\nnull\n\"x\"\nnot json\n{\"message\": 7}\n{\"message\": {\"content\": [1, null]}}\n"
         self.assertEqual(fb.tool_reply(junk + said, "trig_1", "run")[0], "200")
         self.assertNotEqual(fb.tool_reply(junk, "trig_1", "run")[0], "200")
+
+
+class ProcessStart(unittest.TestCase):
+    def test_the_same_process_reads_the_same_in_any_time_zone_or_locale(self):
+        """A lane must not stop being ours because the Mac crossed a time zone."""
+        code = "import fb, os; print(fb.process_start(os.getppid()))"
+        got = {sh([sys.executable, "-c", code], cwd=HERE, env=dict(os.environ, TZ=zone, LC_ALL=loc, PYTHONDONTWRITEBYTECODE="1")).stdout for zone, loc in (("Asia/Tokyo", "C"), ("America/New_York", "fr_FR.UTF-8"))}
+        self.assertEqual(len(got), 1, got)
+        self.assertEqual(fb.process_start(os.getpid()), got.pop().strip())
+
+    def test_a_process_that_is_not_there_has_no_start(self):
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        self.assertIsNone(fb.process_start(dead.pid))
 
 
 class ReadJson(unittest.TestCase):
@@ -1218,7 +1233,7 @@ class Listener(World):
         dead.wait()
         path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
         with open(path, "w") as handle:
-            json.dump({"hph-10-31-26/core": {"pid": dead.pid, "remote": self.remote, "attempt": 0, "at": "x"}}, handle)
+            json.dump({"hph-10-31-26/core": self.entry(dead.pid)}, handle)
         seen = os.path.join(self.root, "children-at-wake")
         self.answers({rid("bravo"): {"status": 200, "snapshot": seen}})
         self.fb("bravo", "listen", "--once")
@@ -1574,7 +1589,7 @@ class Listener(World):
         child = self.orphan()
         path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
         with open(path, "w") as handle:
-            json.dump({"hph-10-31-26/core": {"pid": child, "remote": self.remote, "attempt": 0, "at": "x"}}, handle)
+            json.dump({"hph-10-31-26/core": self.entry(child)}, handle)
         phone = tempfile.mkdtemp(dir=self.root)
         sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
         with open(os.path.join(phone, bad_rel), "w") as handle:
@@ -1650,7 +1665,23 @@ class Listener(World):
         self.assertNotIn("AttributeError", proc.stdout + proc.stderr)
         self.assertEqual(self.j("alpha", "status")["runs"][0]["lanes"][0]["lane"], "core")
 
-    def hung_lane(self, ignore_term):
+    def entry(self, pid, started=True, **more):
+        """A children.json entry as launch_lane writes it. started=None leaves the field out, as older versions did."""
+        doc = dict({"pid": pid, "remote": self.remote, "attempt": 0, "at": "x"}, **more)
+        if started is not None:
+            doc["started"] = fb.process_start(pid) if started is True else started
+        return doc
+
+    def stale_beat(self, run, lane):
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "runs", run, "beats", lane + ".json"), "w") as handle:
+            json.dump({"at": "2026-01-01T00:00:00Z", "status": "working", "account": "bravo", "note": ""}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "stale"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def hung_lane(self, ignore_term, started=True):
         """A local lane whose beat is stale, whose process is alive and hung, on a listener holding the lease."""
         self.register("bravo")
         self.publish(accounts=2, where="local")
@@ -1661,19 +1692,115 @@ class Listener(World):
         key = list(children)[0]
         run, lane = key.split("/")
         pid = self.orphan(ignore_term)
-        children[key]["pid"] = pid
+        children[key] = self.entry(pid, started)
         with open(path, "w") as handle:
             json.dump(children, handle)
-        phone = tempfile.mkdtemp(dir=self.root)
-        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
-        with open(os.path.join(phone, "runs", run, "beats", lane + ".json"), "w") as handle:
-            json.dump({"at": "2026-01-01T00:00:00Z", "status": "working", "account": "bravo", "note": ""}, handle)
-        sh(["git", "add", "-A"], cwd=phone)
-        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "stale"], cwd=phone)
-        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.stale_beat(run, lane)
         open(self.shim_log, "w").close()
         self.fb("bravo", "listen", "--once")
         return path, key, pid
+
+    def stop_past_grace(self, started):
+        """A stopped run's entry whose two minutes are up, so the next pass signals it if it is going to."""
+        self.register("bravo")
+        self.publish(accounts=2)
+        self.fb("alpha", "stop", "--run", "hph-10-30-26")
+        pid = self.orphan()
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        with open(path, "w") as handle:
+            json.dump({"hph-10-30-26/core": self.entry(pid, started, term_at=1)}, handle)
+        self.fb("bravo", "listen", "--once")
+        return pid, json.load(open(path))
+
+    REUSED = "Thu Jan  1 00:00:00 2026"
+
+    def test_a_reused_pid_survives_a_lane_starting(self):
+        """Last 1. The number came back as somebody else's process, in a session of its own, so SIGTERM would have hit it."""
+        path, key, pid = self.hung_lane(False, started=self.REUSED)
+        self.until(self.calls)
+        time.sleep(1)
+        self.assertTrue(self.running(pid), "an unrelated process must not be signalled")
+        self.assertEqual(len([c for c in self.calls() if "account orchestrator" in c]), 1, "and the lane starts as normal")
+        self.assertNotEqual(json.load(open(path))[key]["pid"], pid)
+
+    def test_a_reused_pid_survives_a_stop(self):
+        """Last 1. The same mistake in supervise, and its entry goes."""
+        pid, children = self.stop_past_grace(self.REUSED)
+        time.sleep(1)
+        self.assertTrue(self.running(pid))
+        self.assertEqual(children, {})
+
+    def test_an_entry_from_an_older_version_is_never_signalled_on_a_stop(self):
+        """Last 1. No start time means nobody can say whose this pid is now."""
+        pid, children = self.stop_past_grace(None)
+        time.sleep(1)
+        self.assertTrue(self.running(pid))
+        self.assertEqual(list(children), ["hph-10-30-26/core"])
+        self.assertTrue(any("was not signalled" in b for b in self.human()), self.human())
+
+    def test_nothing_starts_over_an_entry_from_an_older_version(self):
+        """Last 1. It may be the lane, so no second process, and a person hears once however often it is retried."""
+        path, key, pid = self.hung_lane(False, started=None)
+        self.fb("bravo", "listen", "--once")
+        time.sleep(1)
+        self.assertTrue(self.running(pid))
+        self.assertEqual([c for c in self.calls() if "account orchestrator" in c], [])
+        self.assertEqual(json.load(open(path))[key]["pid"], pid)
+        self.assertEqual(len([b for b in self.human() if "was not signalled" in b]), 1, self.human())
+
+    def test_an_older_entry_is_cleared_once_its_pid_is_dead(self):
+        """Last 1. The rule is for while the pid is alive: a dead one goes through as before."""
+        path, key, pid = self.hung_lane(False, started=None)
+        self.kill(pid)
+        self.until(lambda: not self.running(pid))
+        self.answers({"lane_sleep": 0})
+        for _ in range(2):
+            self.fb("bravo", "listen", "--once")
+        self.until(lambda: [c for c in self.calls() if "account orchestrator" in c])
+        self.assertNotEqual(json.load(open(path))[key]["pid"], pid)
+
+    def test_a_stopped_lane_past_its_grace_is_still_ended(self):
+        """Last 1. Its start time matches, so the stop reaches it."""
+        pid, children = self.stop_past_grace(True)
+        self.until(lambda: not self.running(pid))
+
+    def test_a_real_hung_lane_is_ended_and_replaced(self):
+        """Last 1. Through launch_lane itself: what it records is what proves the process is ours later."""
+        self.answers({"lane_sleep": 60})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        key, first = list(json.load(open(path)).items())[0]
+        self.addCleanup(self.kill, first["pid"])
+        self.assertEqual(first["started"], fb.process_start(first["pid"]))
+        self.assertTrue(first["started"])
+        self.stale_beat(*key.split("/"))
+        self.fb("bravo", "listen", "--once")
+        again = json.load(open(path))[key]
+        self.addCleanup(self.kill, again["pid"])
+        self.until(lambda: not self.running(first["pid"]))
+        self.assertNotEqual(again["pid"], first["pid"])
+        self.assertTrue(self.running(again["pid"]))
+        self.assertEqual(again["started"], fb.process_start(again["pid"]))
+
+    def test_a_control_file_nobody_can_read_reads_as_stopping(self):
+        """Last 2. A bad state already did, and neither should start work."""
+        for name, bad in (("list", "[1]"), ("broken", "[1, 2"), ("number", "7")):
+            self.register("bravo", routine=rid("bravo"))
+            today = {"list": "2026-10-28", "broken": "2026-10-29", "number": "2026-10-27"}[name]
+            self.publish(accounts=2, today=today)
+            run = "hph-%s-%s-26" % (today[5:7], today[8:10])
+            phone = tempfile.mkdtemp(dir=self.root)
+            sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+            with open(os.path.join(phone, "runs", run, "control.json"), "w") as handle:
+                handle.write(bad)
+            sh(["git", "add", "-A"], cwd=phone)
+            sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "bad"], cwd=phone)
+            sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+            self.fb("bravo", "listen", "--once")
+            self.assertEqual(self.calls(), [], name)
+            self.assertEqual([r["state"] for r in self.j("alpha", "status")["runs"] if r["run"] == run], ["stopping"], name)
 
     def test_a_hung_lane_is_ended_before_its_replacement_starts(self):
         """Final 5. A second process in its clone, with the first no longer tracked, is what this used to give."""
@@ -1697,7 +1824,7 @@ class Listener(World):
         env = self.env("bravo")
         os.makedirs(env["FB_HOME"], exist_ok=True)
         with open(os.path.join(env["FB_HOME"], "children.json"), "w") as handle:
-            json.dump({"r/l": {"pid": pid, "remote": "/some/other.git", "attempt": 0, "at": "x"}}, handle)
+            json.dump({"r/l": self.entry(pid, remote="/some/other.git")}, handle)
         script = "import fb, sys\ntry:\n    fb.end_child('r/l', sys.argv[1])\nexcept fb.FbError as exc:\n    print('refused', exc)\n"
         got = sh([sys.executable, "-c", script, self.remote], cwd=HERE, env=dict(env, PYTHONDONTWRITEBYTECODE="1")).stdout
         self.assertIn("refused", got)
