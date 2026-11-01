@@ -699,6 +699,29 @@ class Guard(World):
         if os.path.exists(path):
             os.remove(path)
 
+    def stop_behind_a_fresh_cache(self):
+        """The real cloud failure: the hook had just cached a running answer when the stop landed."""
+        self.assertEqual(self.guard("Edit", {"file_path": os.path.join(self.repo, "src/pay/charge.ts")}), "")
+        self.fb("bravo", "stop", "--run", "hph-10-30-26")
+
+    def assert_denied_now(self):
+        out = json.loads(self.guard("Write", {"file_path": os.path.join(self.repo, "src/pay/charge.ts")}))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_a_tick_that_sees_a_stop_reaches_the_hook_at_once(self):
+        self.stop_behind_a_fresh_cache()
+        self.fb("alpha", "tick")
+        self.assert_denied_now()
+
+    def test_a_wait_that_sees_a_stop_reaches_the_hook_at_once(self):
+        self.stop_behind_a_fresh_cache()
+        env = self.env("alpha")
+        session = subprocess.Popen(["python3", FB, "wait", "--seconds", "20", "--poll", "0.2"], cwd=self.repo, env=env, stdout=subprocess.PIPE, universal_newlines=True)
+        time.sleep(1)
+        self.fb("bravo", "send", "--run", "hph-10-30-26", "--to", "all", "--kind", "note", "--body", "move the bus")
+        self.assertIn('"action": "stop"', session.communicate(timeout=30)[0])
+        self.assert_denied_now()
+
     def test_edit_in_lane_passes_and_out_of_lane_is_denied(self):
         self.assertEqual(self.guard("Edit", {"file_path": os.path.join(self.repo, "src/pay/charge.ts")}), "")
         out = json.loads(self.guard("Write", {"file_path": os.path.join(self.repo, "src/auth/login.ts")}))

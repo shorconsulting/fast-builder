@@ -48,7 +48,7 @@ import tempfile
 import time
 import uuid
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -59,7 +59,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAX_ACCOUNTS = 4
 STALE_MINUTES = 45
 BEAT_SECONDS = 300
-CONTROL_CACHE_SECONDS = 60
+CONTROL_CACHE_SECONDS = 15
 LEASE_MINUTES = 20
 STOP_BLOCK_CAP = 3
 MAX_RESTARTS = 5
@@ -1146,6 +1146,11 @@ INSTRUCTIONS = {
 }
 
 
+def remember_control(path, action):
+    """A lane that has just been told the run's action must not have its own hook act on an older answer."""
+    write_file(os.path.join(os.path.dirname(path), "control-cache.json"), json.dumps({"ts": time.time(), "sha": None, "action": action}))
+
+
 def control_action(session, path):
     """The run's action for the hooks: cached, cheap, and open on any failure so a network blip stops nothing."""
     cache = os.path.join(os.path.dirname(path), "control-cache.json")
@@ -2112,6 +2117,7 @@ def cmd_tick(args):
     session, path, bus = need_session()
     bus.sync()
     result = build_tick(bus, session)
+    remember_control(path, result["action"])
     if result["action"] in (GO, DRAIN, PAUSE) and (time.time() - session.get("last_beat", 0) >= BEAT_SECONDS or args.note):
         # Before conducting: a lane's own quiet spell must not get it freed by its own tick.
         session["note"] = args.note or session.get("note", "")
@@ -2191,6 +2197,7 @@ def cmd_wait(args):
                 bus.sync()
                 seen = sha  # only once synced: a busy checkout means this change is looked at again next pass
                 tick = build_tick(bus, session)
+                remember_control(path, tick["action"])
                 if tick["inbox"] or tick["action"] not in (GO, PAUSE):
                     out({"woke": "bus", "action": tick["action"], "messages": len(tick["inbox"])})
                     return
