@@ -62,6 +62,13 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - **Orchestrators.** Each account's session runs its lane and dispatches subagents. Over all of them, a conductor frees a
   lane when its account goes quiet, closes the run, and answers requests between lanes. It is a lease, not an account, so
   it survives any account running out of usage. Most of it is code: it only spends tokens on a judgement call.
+- **Red main.** The conductor reads the base branch's checks about every 5 minutes with `gh`. Lanes are told when main
+  changes, the steward fixes it first, the rest keep building, and a person hears if it stays red over 2 hours.
+- **Lost lanes.** A lane freed for going quiet does not go back to that account for 3 hours, unless a person names it with
+  `/fast-builder:join --lane`. A claim no session joined is freed after 20 minutes, and a local lane out of restarts at
+  once. A lane left open for 30 minutes tells a person.
+- **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
+  the conductor, before it marks itself done, and a lane done early with time left raises a request by itself.
 - **Tokens.** `fb.py route` picks the model for every task: Opus for security-sensitive work and design, Sonnet for
   pattern work, Haiku for mechanical work, never Fable. Listening and waiting on CI use no tokens.
 - **Autopilot.** On `full` no lane stops to ask. Reversible decisions are logged under "Decided without you". Deleting
@@ -89,6 +96,16 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - Each account needs a routine for instant cloud starts, created under the same login as that Mac user's `claude` CLI,
   and its GitHub connection must reach the repo. `routine-check` proves the first.
 - Claude usage limits are per account. A lane that runs dry goes quiet, and is freed after 45 minutes.
+- A lead with subagents must loop on `fb.py wait` or it looks quiet too. That is the lead's own instructions, not something
+  the tool can enforce: a lead stuck on a foreground subagent in a cloud session without the repo hook beats nothing.
+- Red main is only seen by a lease holder with `gh` logged in. Without one, main reads `unknown`, or stays at its last
+  known state. Only `failure` and `timed_out` count as red. A deadline in free text, such as `Friday`, reads as no deadline.
+- The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another
+  account too, and its old process stays until it ticks or the run stops. With no other account, a person hears at 30 minutes.
+- Nothing restarts a lane marked done, so a request raised for a done lane whose session has ended needs a person.
+- All of this is in the copy of `fb.py` each account runs. A listener gets it at `/fast-builder:listen`, and cloud lanes at
+  the next kickoff. While an older copy holds the conductor lease, main goes unwatched and nothing is raised, and an older
+  listener ignores the 3-hour rule.
 - The guard hook sees Claude's tools, and `check-diff` catches a shell edit at push time. It is a guardrail for
   well-meaning builders, not a sandbox: a determined shell command can get past it.
 - Cloud lanes fetch `fb.py` from the bus, because cloud sessions get no user plugins. Local lanes use the copy on the Mac.

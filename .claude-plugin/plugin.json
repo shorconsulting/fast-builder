@@ -1,7 +1,7 @@
 {
   "name": "fast-builder",
   "displayName": "Fast Builder",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "license": "MIT",
   "description": "Run one repo's build across several Claude accounts: size the team, split the work into swim lanes proven not to overlap, kick off through the repo so listening accounts pick it up, stop everything from one command, and route every task to the cheapest model that can do it.",
   "author": { "name": "David Shor", "url": "https://github.com/shorconsulting" },

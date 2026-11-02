@@ -108,7 +108,8 @@ set each account up once: sign it in, then run `--both` or `--routine` above wit
   and nothing starts.
 
 An account that has run out of usage cannot wake anything, because the wake itself is a Claude call. Its lanes go quiet and
-are freed after 45 minutes for another account, which starts from the lane's last saved handoff.
+are freed after 45 minutes for another account, which starts from the lane's last saved handoff. A lane is not handed back
+to the account that lost it for 3 hours, unless a person names it with `join --lane`.
 
 ## No Mac
 
