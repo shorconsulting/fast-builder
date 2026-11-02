@@ -125,6 +125,8 @@ MAIN_ASK_SECONDS = 60  # every page of a head: a real one with 1,054 rows took 1
 MAIN_RED_MINUTES = 120
 MAIN_NAMES = 8
 MAIN_NAME_LEN = 60
+BYPASS = "bypassPermissions"
+KEPT_MODES = ("acceptEdits", "auto", "dontAsk")  # what a reinstall may carry over without being told
 COOLDOWN_MINUTES = 180  # how long an account that lost a lane to going quiet is not handed it back
 UNCLAIMED_MINUTES = 30
 CLAIM_QUIET_MINUTES = 20  # a claim no session ever joined: a live one joins in a minute or two
@@ -132,6 +134,8 @@ REQUEST_UNREAD_MINUTES = 60  # a request to the conductor nobody has read: every
 REQUESTS_FILE = "requests.json"
 MAIN_RED = ("failure", "timed_out", "startup_failure")
 MAIN_GREEN = ("success", "neutral", "skipped")
+MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
+CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
 
 
@@ -434,6 +438,8 @@ class Bus:
                 return False
             for rel, text in files.items():
                 full = self.path(rel)
+                if os.path.isdir(full) and not os.path.islink(full):  # anyone can push one, and it reads as a bad file does: empty, and replaced on writing
+                    shutil.rmtree(full)
                 if text is None:
                     if os.path.exists(full):
                         os.remove(full)
@@ -668,15 +674,28 @@ def back_on_offer(bus, run):
     return files
 
 
-def set_control(bus, run, state, reason, by):
+def has_cooled_lane(bus, run):
+    """A running run with a lane a resume would put back on offer, and that is all a resume would do to it. A control file
+    nobody can read reads as stopping, and that is not running."""
+    rel = "runs/%s/control.json" % run
+    if bus.exists("runs/%s/STOP" % run) or (bus.exists(rel) and not isinstance(bus.json(rel), dict)):
+        return False
+    return bus.doc(rel).get("state", "running") == "running" and bool(back_on_offer(bus, run))
+
+
+def set_control(bus, run, state, reason, by, cool_only=False):
     """Move a run to state if that is a legal move. pause can never soften a stop, and nothing reopens a finished run.
     Returns whether it moved. A resume also refreshes working lanes' beats: nobody beats while paused, and those lanes
     must not look dead the moment the run starts again. It takes cooldowns off open lanes too, even on a running run,
-    where that alone counts as moving: it is a lone account's way to have its lane offered again."""
+    where that alone counts as moving: it is a lone account's way to have its lane offered again. cool_only: a run picked
+    for that alone, which a stop landing since must not lose to this."""
     moved = {}
 
     def mutate():
         current = bus.doc("runs/%s/control.json" % run).get("state", "running")
+        if cool_only and not has_cooled_lane(bus, run):
+            moved["ok"] = False
+            return {}
         moved["ok"] = current in TRANSITIONS[state]
         if not moved["ok"]:
             if state != "running" or current != "running":
@@ -725,20 +744,46 @@ def check_time(text):
         return None
 
 
-def standing_checks(rows):
-    """What still stands under each name: a row goes only if another of its name started after it ended. So a re-run
-    replaces what it re-ran. Rows that overlap, tie or have no time to compare all stay, and the worst of them decides:
-    two workflows can share a job name, and the one finishing last says nothing about the other."""
-    def ended(row):
-        return check_time(row.get("completed_at")) if row.get("status") == "completed" else None
+def check_family(row):
+    """What must match for one row to replace another: name, app and check suite. A re-run keeps its suite, and any other
+    suite may be another workflow with the same job name. A field no row has matches itself, as a test or a plain status
+    says nothing of it; a field that makes no sense matches nothing."""
+    def part(value, *keys):
+        if value is None:
+            return None
+        for key in keys:
+            got = value.get(key) if isinstance(value, dict) else None
+            if got is not None:
+                return got if isinstance(got, (int, str)) and not isinstance(got, bool) else object()
+        return object()
+    return row["name"], part(row.get("app"), "id", "slug"), part(row.get("check_suite"), "id")
 
-    newest = {}
+
+def check_times(row, now):
+    """A row's (began, ended), ended None until it finishes; or None if they cannot be believed: unreadable, ending before
+    they begin, or still to come. Nothing but its finish to go on counts as beginning then."""
+    done = row.get("status") == "completed"
+    ended = check_time(row.get("completed_at")) if done else None
+    began = ended if row.get("started_at") is None else check_time(row.get("started_at"))
+    if began is None or (done and ended is None):
+        return None
+    return (began, ended) if began <= (ended if done else began) <= now else None
+
+
+def standing_checks(rows):
+    """What still stands: a row goes only if a later one replaces it, and when in doubt it stays, since a failure wrongly
+    dropped tells everyone main is green. To replace, a row must be of the same family, have believable times, begin after
+    the other ended, and have a verdict to give or be on its way to one. Rows that overlap, tie or cannot be compared all
+    stay, and the worst of them decides. A row a re-dispatch made is in a new suite, so it stands beside the old failure."""
+    now = time.time()
+    newest, seen = {}, []
     for row in rows:
-        began = check_time(row.get("started_at"))
-        began = ended(row) if began is None else began
-        if began is not None:
-            newest[row["name"]] = max(began, newest.get(row["name"], began))
-    return [r for r in rows if ended(r) is None or newest.get(r["name"], ended(r)) <= ended(r)]
+        family, times = check_family(row), check_times(row, now)
+        seen.append((row, family, times))
+        said = row.get("conclusion") in MAIN_VERDICT if row.get("status") == "completed" else row.get("status") in CHECK_UNDERWAY
+        if times and said:
+            newest[family] = max(times[0], newest.get(family, times[0]))
+    return [r for r, family, times in seen if not (times and times[1] is not None and newest.get(family, times[1]) > times[1])]
 
 
 def main_checks(slug, base, only):
@@ -871,7 +916,7 @@ def unclaimed_alerts(bus, run, account, files, skip):
         doc = bus.doc(rel)
         if doc.get("told") != beat.get("at"):
             files[rel] = dumps(dict(doc, told=beat.get("at")))
-            add_message(files, run, account, "human", "needs-human", "Lane %s has had no taker for over %d minutes. On another account, /fast-builder:join --lane %s starts it here, or fb.py prompt --lane %s prints a prompt to paste. An account that lost it to going quiet is not offered it for %d hours, but /fast-builder:join --lane %s on that same account still takes it, and /fast-builder:resume puts it back on offer: with one account, those are the ways out." % (name, UNCLAIMED_MINUTES, name, name, COOLDOWN_MINUTES // 60, name))
+            add_message(files, run, account, "human", "needs-human", "Lane %s has had no taker for over %d minutes. On another account, /fast-builder:join --lane %s --run %s starts it here, or fb.py prompt --lane %s --run %s prints a prompt to paste. An account that lost it to going quiet is not offered it for %d hours, but /fast-builder:join --lane %s --run %s on that same account still takes it, and /fast-builder:resume --run %s puts it back on offer: with one account, those are the ways out." % (name, UNCLAIMED_MINUTES, name, run, name, run, COOLDOWN_MINUTES // 60, name, run, run))
 
 
 def hours_left(deadline):
@@ -922,7 +967,7 @@ def mark_requests_read(bus, run, ids):
         return {"runs/%s/%s" % (run, REQUESTS_FILE): dumps(dict(doc, read=doc["read"] + new))} if new else {}
     try:
         bus.commit(mutate, "read(%s): conductor requests" % run)
-    except FbError:
+    except (FbError, OSError):
         pass  # the reader has them: all this can cost is an alert saying it did not
 
 
@@ -2310,13 +2355,24 @@ def listen_install(args):
     same_account = config.get("account") in (None, account)
     if not same_account:  # a routine belongs to one login, so no repo keeps the previous name's
         for cfg in config.get("repos", {}).values():
-            cfg["routine_id"] = None
+            if isinstance(cfg, dict):
+                cfg["routine_id"] = None
     config["account"] = account
     remote = args.remote or cwd_remote()
     slug = repo_slug(remote)
-    held = config.setdefault("repos", {}).get(slug, {})
+    held = config.setdefault("repos", {}).get(slug)
+    held = held if isinstance(held, dict) else {}
     routine = args.routine_id or (held.get("routine_id") if same_account else None)
-    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": routine}
+    # A flag not given keeps what was chosen, except bypass: that takes saying so at the install that sets it
+    kept = held.get("permission_mode")
+    mode = args.permission_mode or (kept if kept in KEPT_MODES else "auto")
+    warning = None
+    if kept == BYPASS and not args.permission_mode:
+        warning = "WARNING: permission mode %s is not kept across a reinstall, and local lanes in %s now run in auto. To keep it, say so: listen-install --permission-mode %s" % (BYPASS, slug, BYPASS)
+        print(warning, file=sys.stderr)
+    cloud = held.get("cloud") is not False if args.cloud is None else args.cloud
+    local = held.get("local") is not False if args.local is None else args.local
+    config["repos"][slug] = {"remote": remote, "permission_mode": mode, "cloud": cloud, "local": local, "routine_id": routine}
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
@@ -2332,7 +2388,9 @@ def listen_install(args):
     claude = shutil.which(CLAUDE) or ""
     path = os.pathsep.join(p for p in [os.path.dirname(claude), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] if p)
     text = PLIST.format(label=LABEL, python=sys.executable, script=script, path=path, account=account, log=os.path.join(HOME_DIR, "listener.log"))
-    out = {"account": account, "repo": slug, "permission_mode": args.permission_mode, "plist": plist_path()}
+    out = {"account": account, "repo": slug, "permission_mode": mode, "cloud": cloud, "local": local, "plist": plist_path()}
+    if warning:
+        out["warning"] = warning
     if args.dry_run:
         out["plist_text"] = text
     else:
@@ -2341,7 +2399,7 @@ def listen_install(args):
         run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
         load_listener(domain)
         bus = Bus(remote, account)
-        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "routine": routine, "version": VERSION}
+        doc = {"account": account, "at": now_iso(), "cloud": cloud, "local": local, "routine": routine, "version": VERSION}
         announce_listener(bus, account, doc, proved=bool(args.routine_id))
     print(json.dumps(out, indent=2))
 
@@ -2541,6 +2599,8 @@ def cmd_tick(args):
         session["last_beat"] = time.time()
     if result["action"] in (GO, DRAIN):
         report = conduct(bus, session["run"], session["account"])
+        result = build_tick(bus, session)  # gh can hold a pass for a minute, and a stop may have landed. This is the checkout conduct just synced: no network
+        remember_control(path, result["action"])
         waiting = conductor_requests(bus, session["run"], session.get("conductor_seen", []))
         result["conductor"] = report["holder"]
         result["requests_for_conductor"] = len(waiting) if answers_conductor(bus, session, report["holder"]) else 0
@@ -2693,17 +2753,18 @@ def control_cmd(state, reason_default):
         bus = get_bus(args)
         if not bus.sync():
             raise FbError("no bus on this repo yet")
+        cool = [r for r in list_runs(bus) if has_cooled_lane(bus, r)] if state == "running" and (args.all or not (args.run or load_session()[0])) else []
         if args.all and state == "running":
-            runs = [r for r in list_runs(bus) if bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
+            runs = [r for r in list_runs(bus) if r in cool or bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
         elif args.all:
             runs = [r for r in list_runs(bus) if run_state(bus, r)["state"] not in ("finished", "stopped")]
         elif state == "running" and not args.run and not load_session()[0]:
-            runs = [r for r in list_runs(bus) if bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
+            runs = [r for r in list_runs(bus) if r in cool or bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
             if len(runs) != 1:
                 raise FbError("%d runs could resume: pass --run or --all (%s)" % (len(runs), ", ".join(runs)))
         else:
             runs = [pick_run(bus, args)]
-        moved = [r for r in runs if set_control(bus, r, state, args.reason or reason_default, bus.account)]
+        moved = [r for r in runs if set_control(bus, r, state, args.reason or reason_default, bus.account, cool_only=r in cool)]
         cleared = False
         if state == "running" and args.all:
             cleared = bus.commit(lambda: {"STOP": None}, "resume: clear the stop on every run")
@@ -3072,9 +3133,11 @@ def build_parser():
     add("poll", cmd_poll, help="one listener pass for a routine")
 
     p = add("listen-install", listen_install, help="install the always-on listener")
-    p.add_argument("--permission-mode", default="auto", choices=["acceptEdits", "auto", "bypassPermissions", "dontAsk"])
-    p.add_argument("--no-cloud", action="store_true")
-    p.add_argument("--no-local", action="store_true")
+    p.add_argument("--permission-mode", choices=list(KEPT_MODES) + [BYPASS], help="default: what this repo has, else auto. %s is never kept: it has to be given each time" % BYPASS)
+    for name in ("cloud", "local"):  # default: what this repo has, else on
+        pair = p.add_mutually_exclusive_group()
+        pair.add_argument("--" + name, dest=name, action="store_true", default=None)
+        pair.add_argument("--no-" + name, dest=name, action="store_false", default=None)
     p.add_argument("--routine-id", help="this account's listener routine, so the daemon can start cloud lanes")
     p.add_argument("--dry-run", action="store_true")
 

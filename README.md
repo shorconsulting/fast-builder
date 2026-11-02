@@ -43,7 +43,7 @@ work item rather than within a minute.
 |---|---|
 | `/fast-builder:status` | Every lane, account and heartbeat, and anything waiting on a person |
 | `/fast-builder:stop` | Stops every account. `--drain` lets lanes finish what is in hand. `--all` covers every run |
-| `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes back on offer |
+| `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes, and lanes that went quiet, back on offer |
 | `/fast-builder:send --to LANE "text"` | Sends a note to one lane or `all` |
 | `/fast-builder:join` | Takes an open lane in this session now |
 | `/fast-builder:switch` | Points this Mac user's listener at its current login |
@@ -64,9 +64,9 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   it survives any account running out of usage. Most of it is code: it only spends tokens on a judgement call.
 - **Red main.** The conductor reads the base branch's checks about every 5 minutes with `gh`. Lanes are told when main
   changes, the steward fixes it first, the rest keep building, and a person hears if it stays red over 2 hours. Green
-  takes every check passing, and a re-run replaces what it re-ran.
+  takes every check passing, and a re-run in place replaces what it re-ran.
 - **Lost lanes.** A lane freed for going quiet does not go back to that account for 3 hours, unless a person names it with
-  `/fast-builder:join --lane` or `/fast-builder:resume`. A claim no session joined is freed after 20 minutes, and a local
+  `/fast-builder:join --lane` or `/fast-builder:resume --run`. A claim no session joined is freed after 20 minutes, and a local
   lane out of restarts at once. A lane left open for 30 minutes tells a person.
 - **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
   the conductor, before it marks itself done, and a lane done early with time left raises a request by itself. A request
@@ -104,8 +104,14 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   known state. Red is a check ending in `failure`, `timed_out` or `startup_failure`. Green is every check ending in
   `success`, `neutral` or `skipped`, with at least one success and every name in `main_checks` seen. Anything else,
   including `cancelled`, `stale`, `action_required` and checks still running, leaves main as it was. Rows sharing a name
-  count one at a time only if the later one started after the earlier one ended; if they overlap, the worst of them
-  stands. A reading across two commits is thrown away. All of a head's pages must arrive in 60 seconds, about 3,000 rows,
+  count one at a time only if they share an app and a check suite, the later one started after the earlier one ended, and
+  it has a verdict to give or is still running; `skipped`, `neutral` and `cancelled` replace nothing, nor does a time that
+  is unreadable, ends before it begins or is in the future. Otherwise the worst of them stands, because a false green
+  tells everyone main recovered. So main reads red on what may be stale: a re-run in place keeps its suite and clears a
+  failure, but a workflow dispatched again gets a new suite, and these fields cannot tell that from another workflow with
+  the same job name. Its old failure stands until a commit lands or the job is re-run in place, and a scheduled workflow
+  that has failed on a quiet head can do this: `main_checks` leaves it out. Two jobs with one name in one suite, one after
+  the other, read as a re-run. A reading across two commits is thrown away. All of a head's pages must arrive in 60 seconds, about 3,000 rows,
   so a head larger than that reads `unknown`, and a person hears after about 2 hours of it. A deadline in free text, such as `Friday`, reads
   as no deadline.
 - The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end tests. Each account is a separate FB_HOME and FB_CACHE (and clone) against a local bare remote, so what
 passes here passed through real git pushes and real races. A shim stands in for the claude binary."""
+import atexit
 import concurrent.futures
 import glob
 import json
@@ -2138,6 +2139,17 @@ def passed(name="ci"):
     return {"name": name, "status": "completed", "conclusion": "success"}
 
 
+NOT_RUN = []  # a skip reads as nothing in the summary, and these are what stands between a live run and a new copy
+
+
+def say_what_did_not_run():
+    if NOT_RUN:
+        print("DID NOT RUN, needing old copy a4ead91b that this clone does not have (shallow? git fetch --unshallow, then run them): %s" % ", ".join(NOT_RUN), file=sys.stderr)
+
+
+atexit.register(say_what_did_not_run)
+
+
 class Hardening(World):
     def setUp(self):
         super().setUp()
@@ -2656,6 +2668,7 @@ class Hardening(World):
         if not os.path.exists(path):
             show = subprocess.run(["git", "show", "a4ead91b:scripts/fb.py"], cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if show.returncode != 0:
+                NOT_RUN.append(self._testMethodName)
                 self.skipTest("this clone has no a4ead91b")
             with open(path, "w") as handle:
                 handle.write(show.stdout)
@@ -3245,6 +3258,411 @@ class Hardening(World):
         self.assertEqual(json.load(open(path)), {})
         log = open(self.shim_log).read() if os.path.exists(self.shim_log) else ""
         self.assertNotIn("lane money", log)
+
+
+    # Review of the review: what reads green must have earned it
+
+    def in_suite(self, row, suite=1, app=7, slug="github-actions"):
+        return dict(row, check_suite={"id": suite}, app={"id": app, "slug": slug})
+
+    def timed(self, row, began, ended):
+        return dict(row, started_at=ago(began) if began is not None else None, completed_at=ago(ended) if ended is not None else None)
+
+    def test_a_row_of_another_suite_or_app_does_not_replace_a_failure(self):
+        fail, ok = self.timed(failed("test"), 60, 50), self.timed(passed("test"), 40, 30)
+        for only in ([], ["test"]):
+            for later in (self.in_suite(ok, suite=2), self.in_suite(ok, app=8, slug="other"), self.in_suite(ok, suite=2, app=8, slug="other")):
+                self.assertEqual(self.state_of(self.in_suite(fail), later, only=only), "red", later)
+            self.assertEqual(self.state_of(self.in_suite(fail), self.in_suite(ok), only=only), "green", "a genuine re-run")
+
+    def test_what_a_row_does_not_say_matches_only_what_another_does_not_say(self):
+        fail, ok = self.timed(failed("test"), 60, 50), self.timed(passed("test"), 40, 30)
+        self.assertEqual(self.state_of(fail, self.in_suite(ok)), "red", "no suite against a suite")
+        self.assertEqual(self.state_of(self.in_suite(fail), ok), "red")
+        self.assertEqual(self.state_of(dict(fail, app={"id": 7}), dict(ok, app={"slug": "github-actions"})), "red", "nothing says these are one app")
+        self.assertEqual(self.state_of(dict(fail, app={"slug": "a"}), dict(ok, app={"slug": "a"})), "green", "a slug is enough")
+        self.assertEqual(self.state_of(dict(fail, app={"id": 7, "slug": "a"}), dict(ok, app={"id": 7, "slug": "b"})), "green", "the id decides")
+        self.assertEqual(self.state_of(dict(fail, check_suite={"id": 1}), dict(ok, check_suite={"id": 1})), "green")
+        self.assertEqual(self.state_of(dict(fail, app=None, check_suite=None), dict(ok, app=None, check_suite=None)), "green")
+        for bad in (7, "x", [], {}, {"id": None}, {"id": [1]}, {"id": {}}, {"id": True}, {"id": 1.5}, {"slug": ["a"]}):
+            for field in ("app", "check_suite"):
+                self.assertEqual(self.state_of(dict(fail, **{field: bad}), dict(ok, **{field: bad})), "red", (field, bad))
+        self.assertEqual(self.state_of(dict(fail, check_suite={"id": 1}), dict(ok, check_suite={"id": "1"})), "red")
+
+    def test_a_row_with_no_verdict_replaces_nothing(self):
+        fail, lint = self.timed(failed("test"), 60, 50), self.timed(passed("lint"), 60, 50)
+        for word in ("skipped", "neutral", "cancelled", "stale", "action_required", "new-word", None, ["success"]):
+            later = dict(self.timed(passed("test"), 40, 30), conclusion=word)
+            for rows in ((fail, later, lint), (later, fail, lint), (self.in_suite(fail), self.in_suite(later), self.in_suite(lint))):
+                self.assertEqual(self.state_of(*rows), "red", word)
+        skipped = dict(self.timed(passed("test"), 40, 30), conclusion="skipped")
+        self.assertEqual(self.state_of(skipped, self.timed(passed("test"), 20, 10)), "green", "and it can itself be replaced")
+        self.assertEqual(self.state_of(fail, skipped, self.timed(passed("test"), 20, 10)), "green", "a real re-run still counts past it")
+        self.assertEqual(self.state_of(fail, dict(self.timed(passed("test"), 40, 30), status=["completed"], conclusion=None), lint), "red", "a status nobody knows")
+
+    def test_a_row_times_cannot_drop_it(self):
+        lint = self.timed(passed("lint"), 60, 50)
+        self.assertEqual(self.state_of(self.timed(failed("test"), 5, 60), lint), "red")
+        self.assertEqual(self.state_of(dict(failed("test"), started_at="2099-01-01T00:00:00Z", completed_at=ago(5)), lint), "red")
+        self.assertEqual(self.state_of(self.timed(failed("test"), 5, 60), self.timed(passed("test"), 3, 2)), "red", "an inverted failure can be read no way but standing")
+
+    def test_a_time_in_the_future_or_an_inverted_row_does_not_win(self):
+        fail = self.timed(failed("test"), 60, 50)
+        lint = self.timed(passed("lint"), 60, 50)
+        far = "2099-01-01T00:00:00Z"
+        for later in (dict(passed("test"), started_at=far, completed_at=far),
+                      dict(passed("test"), started_at=far, completed_at=None),
+                      dict(passed("test"), started_at=ago(40), completed_at=far),
+                      dict(passed("test"), started_at=far),
+                      dict(failed("test"), started_at=far, completed_at=far),
+                      self.timed(passed("test"), 5, 40),
+                      {"name": "test", "status": "in_progress", "conclusion": None, "started_at": far, "completed_at": None},
+                      {"name": "test", "status": "queued", "conclusion": None, "started_at": far, "completed_at": None},
+                      dict(passed("test"), started_at="soon", completed_at=ago(40)),
+                      dict(passed("test"), started_at={}, completed_at=ago(40))):
+            for rows in ((fail, later, lint), (later, fail, lint)):
+                self.assertEqual(self.state_of(*rows), "red", later)
+        ok = self.timed(passed("test"), 60, 50)
+        self.assertEqual(self.state_of(ok, dict(failed("test"), started_at=far, completed_at=far)), "red", "and a failure it cannot beat stands too")
+        self.assertEqual(self.state_of(ok, dict(passed("test"), started_at=far, completed_at=far)), "green", "nothing dropped, and nothing wrong")
+
+    def test_a_year_nobody_can_add_to_does_not_break_a_reading(self):
+        for stamp in ("9999-12-31T23:59:59-14:00", "0001-01-01T00:00:00+14:00", "2026-13-40T00:00:00Z", "", 7, None, [], {}):
+            rows = [self.timed(failed("test"), 60, 50), dict(passed("test"), started_at=stamp, completed_at=stamp)]
+            self.assertEqual(self.state_of(*rows), "red", stamp)
+
+    def test_no_shape_of_row_breaks_a_reading(self):
+        junk = (None, 7, "x", [], {}, ["completed"], {"id": {}}, True, 1.5)
+        for field in ("status", "conclusion", "started_at", "completed_at", "app", "check_suite"):
+            for value in junk:
+                rows = [dict(self.timed(failed("test"), 60, 50), **{field: value}), self.timed(passed("test"), 40, 30)]
+                self.assertIn(self.state_of(*rows), ("red", None, "green"), (field, value))
+                rows = [self.timed(failed("test"), 60, 50), dict(self.timed(passed("test"), 40, 30), **{field: value})]
+                self.assertIn(self.state_of(*rows), ("red", "green") if field not in ("status", "conclusion") else ("red",), (field, value))
+
+    def test_a_false_green_tells_nobody_main_recovered(self):
+        fail = self.in_suite(self.timed(failed("test"), 60, 50))
+        self.checks(fail, passed("lint"))
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        for later in (self.in_suite(self.timed(passed("test"), 40, 30), suite=2),
+                      self.in_suite(dict(self.timed(passed("test"), 40, 30), conclusion="skipped")),
+                      self.in_suite(dict(passed("test"), started_at="2099-01-01T00:00:00Z", completed_at="2099-01-01T00:00:00Z"))):
+            self.checks(fail, later, self.in_suite(passed("lint"), suite=3))
+            self.due()
+            tick = self.j("alpha", "tick")
+            self.assertEqual(tick["main"]["state"], "red", later)
+            self.assertIn("Fixing it comes before", tick["instruction"])
+        self.assertEqual(self.said("all", "green again"), [])
+        self.checks(fail, self.in_suite(self.timed(passed("test"), 40, 30)), self.in_suite(passed("lint"), suite=3))
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "green")
+        self.assertEqual(len(self.said("all", "green again")), 1)
+
+    # A tick says what is true when it returns
+
+    def tick_while_gh_hangs(self, account="alpha", *also):
+        self.checks(passed("lint"), sleep=8)
+        self.due(account)
+        started = len(self.gh_calls())
+        proc = subprocess.Popen([sys.executable, FB, "tick"] + list(also), cwd=self.clone(account), env=self.env(account), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        end = time.time() + 30
+        while len(self.gh_calls()) == started and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(len(self.gh_calls()), started + 1, "tick reached gh")
+        return proc, started
+
+    def test_a_stop_that_lands_while_gh_hangs_is_what_that_tick_says(self):
+        proc, started = self.tick_while_gh_hangs("alpha", "--exit-code")
+        self.j("bravo", "stop", "--run", RUN)
+        self.assertIsNone(proc.poll(), "the stop landed while the tick was in gh")
+        out, err = proc.communicate(timeout=60)
+        got = json.loads(out)
+        self.assertEqual(got["action"], "stop", err)
+        self.assertEqual(got["state"], "stopping")
+        self.assertEqual(got["instruction"], fb.INSTRUCTIONS["stop"])
+        self.assertEqual(proc.returncode, fb.EXIT_CODES["stop"])
+        self.assertEqual(len(self.gh_calls()), started + 1, "and no second gh call to find that out")
+        cache = os.path.join(self.clone("alpha"), ".git", "fast-builder", "control-cache.json")
+        self.assertEqual(json.load(open(cache))["action"], "stop", "the hook hears the same")
+
+    def test_a_pause_a_drain_and_a_lost_lane_are_what_that_tick_says_too(self):
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "pause", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "pause")
+        self.j("bravo", "resume", "--run", RUN)
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "stop", "--drain", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "drain")
+        self.j("bravo", "resume", "--run", RUN)
+        proc, _ = self.tick_while_gh_hangs()
+        self.edit({"claims/core.json": {"account": "zulu", "session": "z" * 32, "where": "cloud"}})
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "lost")
+
+    def test_a_stop_gone_again_by_the_time_gh_answers_is_not_said_either(self):
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "pause", "--run", RUN)
+        self.j("bravo", "resume", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "continue")
+
+    def test_a_tick_that_closes_the_run_says_so(self):
+        for lane, account in (("core", "alpha"), ("money", "bravo")):
+            self.fb(account, "lane-state", "done")
+        self.checks(passed("lint"))
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(11)}})
+        # a done lane's tick conducts, and that is what finishes the run
+        self.assertEqual(json.loads(self.fb("alpha", "tick").stdout)["action"], "finished")
+
+    # The alert's way out
+
+    def cool(self, run=RUN, lane="money"):
+        base = "" if run == RUN else "../%s/" % run
+        files = {base + "beats/%s.json" % lane: {"at": ago(5), "status": "open", "account": None, "note": "freed: bravo went quiet"},
+                 base + "freed/%s.json" % lane: {"lost": {"bravo": ago(5)}, "told": ago(5)}}
+        if self.on_bus("runs/%s/claims/%s.json" % (run, lane)) is not None:
+            files[base + "claims/%s.json" % lane] = None
+        self.edit(files)
+
+    def test_the_alert_names_a_command_that_works_as_written(self):
+        self.lost_and_told()
+        body = self.said("human", "no taker")[0]["body"]
+        self.assertIn("/fast-builder:resume --run %s" % RUN, body)
+        self.assertIn("/fast-builder:join --lane money --run %s" % RUN, body)
+        self.assertIn("fb.py prompt --lane money --run %s" % RUN, body)
+        self.assertEqual(self.j("zulu", "resume", "--run", RUN, "--remote", self.remote)["runs"], [RUN])
+        self.assertIsNone(self.doc("freed/money.json"))
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_both_selectors_find_a_running_run_with_a_cooled_lane(self):
+        for args in (("resume",), ("resume", "--all")):
+            self.cool()
+            got = self.j("zulu", *args, "--remote", self.remote)
+            self.assertEqual(got["runs"], [RUN], args)
+            self.assertIsNone(self.doc("freed/money.json"))
+            self.assertEqual(self.doc("beats/money.json")["note"], "back on offer after a resume")
+            self.assertEqual(self.doc("control.json").get("state", "running"), "running")
+
+    def test_a_running_run_with_nothing_cooled_is_not_something_to_resume(self):
+        got = self.fb("zulu", "resume", "--remote", self.remote, check=False)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("0 runs could resume", got.stderr)
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [])
+        self.edit({"freed/money.json": {"lost": {"bravo": ago(5)}}})  # money is held: back_on_offer leaves a held lane alone
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [])
+        self.assertTrue(self.doc("freed/money.json"))
+        self.assertEqual(self.doc("claims/money.json")["account"], "bravo")
+
+    def test_a_cooled_run_nobody_can_read_the_state_of_is_left_alone(self):
+        self.cool()
+        for bad in ("[]", "nonsense", '{"state": 5}', '{"state": "who-knows"}'):
+            self.edit({"control.json": bad})
+            self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [], bad)
+            self.assertTrue(self.doc("freed/money.json"), bad)
+            self.assertEqual(self.fb("zulu", "resume", "--remote", self.remote, check=False).returncode, 1, bad)
+
+    def test_a_cooled_lane_does_not_widen_what_may_be_resumed(self):
+        self.publish(accounts=2, today="2026-10-31")
+        other = "hph-10-31-26"
+        self.cool()
+        self.cool(other)
+        got = self.fb("zulu", "resume", "--remote", self.remote, check=False)
+        self.assertEqual(got.returncode, 1, "two candidates and nothing to choose by")
+        self.assertIn("2 runs could resume", got.stderr)
+        self.assertIn(RUN, got.stderr)
+        self.assertIn(other, got.stderr)
+        self.assertTrue(self.doc("freed/money.json"), "and it touched neither")
+        self.j("alpha", "stop", "--run", other)
+        self.edit({"../%s/control.json" % other: {"state": "stopped", "reason": "by someone", "by": "alpha", "at": ago(1)}})
+        got = self.j("zulu", "resume", "--all", "--remote", self.remote)
+        self.assertEqual(got["runs"], [RUN])
+        self.assertEqual(got["not_resumed_stopped"], [other], "a stopped run stays stopped under --all, cooled or not")
+        self.assertEqual(json.loads(self.on_bus("runs/%s/control.json" % other))["state"], "stopped")
+        self.assertTrue(json.loads(self.on_bus("runs/%s/freed/money.json" % other)))
+
+    def test_a_stop_landing_after_a_run_was_picked_for_its_cooled_lane_is_not_undone(self):
+        self.cool()
+        env = self.env("zulu")
+
+        def cool_only():
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]):
+                bus = fb.Bus(self.remote, "zulu")
+                try:
+                    return fb.set_control(bus, RUN, "running", "x", "zulu", cool_only=True)
+                finally:
+                    bus.release()
+        for state in ("stopping", "paused", "draining", "stopped", "finished"):
+            land = {"state": state, "reason": "someone", "by": "alpha", "at": ago(0)}
+            self.edit({"control.json": land})
+            self.assertFalse(cool_only(), state)
+            self.assertEqual(self.doc("control.json"), land)
+        self.edit({"control.json": {"state": "running", "reason": "", "by": "alpha", "at": ago(0)}, "STOP": ""})
+        self.assertFalse(cool_only())
+        self.assertIsNotNone(self.on_bus("runs/%s/STOP" % RUN))
+        self.assertTrue(self.doc("freed/money.json"))
+        self.edit({"STOP": None})
+        self.assertTrue(cool_only(), "and with no stop it does what it is for")
+        self.assertIsNone(self.doc("freed/money.json"))
+
+    def test_a_run_stop_file_is_not_a_cooled_lane_to_a_bare_resume(self):
+        self.cool()
+        self.edit({"STOP": ""})
+        self.assertEqual(self.fb("zulu", "resume", "--remote", self.remote, check=False).returncode, 1)
+        self.assertIsNotNone(self.on_bus("runs/%s/STOP" % RUN))
+        self.assertTrue(self.doc("freed/money.json"))
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [RUN], "--all has always cleared one")
+        self.assertIsNone(self.on_bus("runs/%s/STOP" % RUN))
+
+    def test_pause_and_stop_are_not_softened_by_a_cooled_lane(self):
+        self.cool()
+        self.j("alpha", "pause", "--run", RUN)
+        self.assertEqual(self.doc("control.json")["state"], "paused")
+        self.assertEqual(self.j("zulu", "pause", "--all", "--remote", self.remote)["runs"], [], "paused already: nothing new")
+        self.assertTrue(self.doc("freed/money.json"), "only a resume takes a cooldown off")
+        self.assertEqual(self.j("zulu", "stop", "--all", "--remote", self.remote)["runs"], [RUN])
+        self.assertEqual(self.doc("control.json")["state"], "stopping")
+        self.assertTrue(self.doc("freed/money.json"))
+
+    # A reinstall keeps what was chosen
+
+    def config_of(self, account="zulu"):
+        return json.load(open(os.path.join(self.env(account)["FB_HOME"], "config.json")))["repos"]["owner/app"]
+
+    def install(self, *flags, account="zulu"):
+        return self.fb(account, "listen-install", "--dry-run", "--remote", self.remote, *flags)
+
+    def test_a_bare_reinstall_keeps_what_was_chosen(self):
+        self.install("--no-local", "--no-cloud", "--permission-mode", "acceptEdits", "--routine-id", rid("123"))
+        got = json.loads(self.install().stdout)
+        self.assertEqual(got["permission_mode"], "acceptEdits")
+        held = self.config_of()
+        self.assertEqual((held["local"], held["cloud"], held["permission_mode"], held["routine_id"]), (False, False, "acceptEdits", rid("123")))
+
+    def test_a_flag_on_a_reinstall_changes_only_that_flag(self):
+        self.install("--no-local", "--permission-mode", "dontAsk")
+        self.install("--no-cloud")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"], self.config_of()["permission_mode"]), (False, False, "dontAsk"))
+        self.install("--local")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, False))
+        self.install("--cloud")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+        self.install("--permission-mode", "auto")
+        self.assertEqual(self.config_of()["permission_mode"], "auto")
+        self.assertEqual(self.fb("zulu", "listen-install", "--dry-run", "--remote", self.remote, "--local", "--no-local", check=False).returncode, 2)
+
+    def test_a_first_install_has_the_old_defaults(self):
+        got = json.loads(self.install().stdout)
+        self.assertEqual(got["permission_mode"], "auto")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+
+    def test_bypass_is_never_carried_by_a_reinstall_and_says_so(self):
+        proc = self.install("--permission-mode", "bypassPermissions")
+        self.assertEqual(self.config_of()["permission_mode"], "bypassPermissions", "said in as many words")
+        self.assertNotIn("WARNING", proc.stderr)
+        proc = self.install()
+        got = json.loads(proc.stdout)
+        self.assertEqual(got["permission_mode"], "auto")
+        self.assertEqual(self.config_of()["permission_mode"], "auto")
+        self.assertIn("bypassPermissions", proc.stderr)
+        self.assertIn("auto", proc.stderr)
+        self.assertIn("--permission-mode bypassPermissions", proc.stderr)
+        self.assertIn("bypassPermissions", got["warning"])
+        proc = self.install()
+        self.assertEqual(proc.stderr, "", "it was said once, and auto is now what is held")
+        self.install("--permission-mode", "bypassPermissions")
+        self.assertEqual(self.config_of()["permission_mode"], "bypassPermissions", "and it can be chosen again")
+
+    def test_a_config_saying_anything_else_cannot_bring_on_a_mode_by_itself(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        for bad in ("BypassPermissions", "bypassPermissions ", "plan", "", 7, None, [], {}, ["bypassPermissions"]):
+            config = json.load(open(path))
+            config["repos"]["owner/app"]["permission_mode"] = bad
+            with open(path, "w") as handle:
+                json.dump(config, handle)
+            proc = self.install()
+            self.assertEqual(json.loads(proc.stdout)["permission_mode"], "auto", bad)
+            self.assertEqual(self.config_of()["permission_mode"], "auto", bad)
+
+    def test_a_config_entry_that_is_not_a_table_costs_no_reinstall(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        for bad in ([], 7, "x", None):
+            config = json.load(open(path))
+            config["repos"]["owner/app"] = bad
+            with open(path, "w") as handle:
+                json.dump(config, handle)
+            self.assertEqual(json.loads(self.install().stdout)["permission_mode"], "auto", bad)
+            self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True), bad)
+
+    def test_a_flag_that_is_not_a_yes_or_no_reads_as_what_a_first_install_gives(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        config = json.load(open(path))
+        config["repos"]["owner/app"].update(local="no", cloud=0)
+        with open(path, "w") as handle:
+            json.dump(config, handle)
+        self.install()
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+
+    # Bad bus files and missing history
+
+    def test_a_directory_where_requests_json_should_be_costs_no_requests(self):
+        self.ask_conductor()
+        self.edit({"requests.json/x": "y"})
+        got = self.j("alpha", "inbox", "--run", RUN, "--who", "conductor", "--mark")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.doc("requests.json")["read"], [got[0]["id"]], "it takes a real file's place, as a bad file's reading does")
+        self.assertEqual(self.j("bravo", "inbox", "--run", RUN, "--who", "conductor"), [])
+
+    def test_a_directory_where_requests_json_should_be_costs_no_conductor_pass(self):
+        self.ask_conductor(at=ago(fb.REQUEST_UNREAD_MINUTES + 1))
+        self.edit({"requests.json/x": "y"})
+        self.next_pass()
+        self.assertEqual(len(self.unread_said()), 1)
+        self.next_pass()
+        self.assertEqual(len(self.unread_said()), 1, "told once")
+        self.assertTrue(self.doc("requests.json")["told"])
+
+    def test_a_write_or_removal_over_a_directory_on_the_bus_costs_no_commit(self):
+        self.edit({"junk.json/deep/x": "y"})
+        env = self.env("alpha")
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]):
+            bus = fb.Bus(self.remote, "alpha")
+            self.addCleanup(bus.release)
+            self.assertTrue(bus.commit(lambda: {"runs/%s/junk.json" % RUN: "{}"}, "write"))
+            self.assertEqual(self.on_bus("runs/%s/junk.json" % RUN), "{}")
+            self.edit({"junk.json": None, "junk2.json/x": "y"})
+            self.assertTrue(bus.commit(lambda: {"runs/%s/junk2.json" % RUN: None}, "remove"))
+            self.assertIsNone(self.on_bus("runs/%s/junk2.json/x" % RUN))
+
+    def test_a_failed_mark_still_hands_over_what_it_read(self):
+        for error in (OSError("disk"), fb.FbError("bus is too busy")):
+            with unittest.mock.patch.object(fb.Bus, "commit", side_effect=error) as commit:
+                fb.mark_requests_read(fb.Bus(self.remote, "alpha"), RUN, ["x"])
+            self.assertEqual(commit.call_count, 1)
+
+    def test_a_clone_without_the_old_copy_says_which_tests_did_not_run(self):
+        repo = tempfile.mkdtemp(dir=self.root)
+        os.makedirs(os.path.join(repo, "scripts"))
+        for name in ("fb.py", "test_fb.py"):
+            shutil.copy(os.path.join(HERE, name), os.path.join(repo, "scripts", name))
+        sh(["git", "init", "-q", repo])
+        sh(["git", "add", "-A"], cwd=repo)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"], cwd=repo)
+        name = "Hardening.test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit"
+        proc = subprocess.run([sys.executable, "-I", "scripts/test_fb.py", name], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("skipped=1", proc.stderr)
+        last = proc.stderr.strip().splitlines()[-1]
+        self.assertIn("DID NOT RUN", last, "the last thing said, after the summary")
+        self.assertIn("a4ead91b", last)
+        self.assertIn("git fetch --unshallow", last)
+        self.assertIn("test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit", last)
 
 
 class CloudBootstrap(World):

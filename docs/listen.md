@@ -29,6 +29,10 @@ Local lanes run with the permission mode chosen here, default `auto`, and anythi
 than left hanging. Only use `bypassPermissions` if the user says so in as many words: a local lane would then run
 whatever the plan on the bus leads it to, under this Mac user, with nothing asking. Say that before installing with it.
 
+On a reinstall, leave out `--permission-mode` and the cloud and local flags unless the user named them: the repo keeps
+what it has. `--cloud` and `--local` turn back on what `--no-cloud` and `--no-local` turned off. `bypassPermissions` alone
+is not kept. A reinstall without it goes back to `auto` and prints a line saying so: show the user that line.
+
 A local lane that hangs is still alive when its lane is freed. Before starting that lane again the listener ends the old
 process and waits 10 seconds. If it will not stop, the lane is given back with a blocker, and no second process starts in
 that clone.

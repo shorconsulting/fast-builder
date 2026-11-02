@@ -61,4 +61,5 @@ that `listen-install` copied to the Mac. Cloud lanes cannot, so they run the bus
 repo's write access matters. A bus file that is not the object it should be reads as empty, except `control.json`, which
 then reads as stopping, as an unknown state does. One bad run cannot stop another run's stop being handled. A lane's
 model reads the plan, so a hostile plan could still mislead it. That is why the listener's local permission mode
-defaults to `auto` and `bypassPermissions` has to be chosen when it is installed.
+defaults to `auto` and `bypassPermissions` has to be chosen each time it is installed: a reinstall that does not name it
+goes back to `auto` and says so.
