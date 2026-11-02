@@ -6,17 +6,17 @@ writes the plan, and starts the build through the repo so every listening accoun
 
 ## Set up each account, once per repo
 
-1. Add the plugin to each Mac user:
+1. Add the plugin to each OS user, on macOS, Windows or Linux:
 
        /plugin marketplace add shorconsulting/marketplace
        /plugin install fast-builder@shorconsulting
 
 2. In a clone of the repo: `/fast-builder:listen`
 
-That installs a launchd listener, which uses no tokens while idle, and an hourly cloud routine that wakes at once when
+That installs a background listener, which uses no tokens while idle, and an hourly cloud routine that wakes at once when
 the listener sees a run.
 
-If you move a Mac user between Claude logins, set each account up once. After that the listener finds the current login
+If you move an OS user between Claude logins, set each account up once. After that the listener finds the current login
 itself, and `/fast-builder:switch` updates it straight away. See "Swapping logins" in [docs/listen.md](docs/listen.md).
 Keep each routine's name and its `poll --account NAME` line as that page gives them: they are what proves whose it is.
 
@@ -46,7 +46,7 @@ work item rather than within a minute.
 | `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes back on offer |
 | `/fast-builder:send --to LANE "text"` | Sends a note to one lane or `all` |
 | `/fast-builder:join` | Takes an open lane in this session now |
-| `/fast-builder:switch` | Points this Mac user's listener at its current login |
+| `/fast-builder:switch` | Points this OS user's listener at its current login |
 
 To stop everything with no Claude at hand, add a file named `STOP` to the `fast-builder/bus` branch on GitHub, from a phone
 if you like. `STATUS.md` on that branch shows the state.
@@ -70,10 +70,10 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 
 ## What it runs and sends
 
-- **A launchd agent** on macOS, `com.shorconsulting.fast-builder.listener`, runs `~/.config/fast-builder/fb.py` while the Mac
+- **A background job** (the launchd agent `com.shorconsulting.fast-builder.listener`, a Windows task or a systemd user service) runs `~/.config/fast-builder/fb.py` while the OS
   user is logged in. `/fast-builder:listen --off` removes it. It runs `git ls-remote` against your repo once a minute.
 - **Headless `claude` sessions.** The listener starts `claude -p` for local lanes, with the permission mode you chose
-  (default `auto`), and a short Haiku call to start a routine. Local lanes run on your Mac under your user.
+  (default `auto`), and a short Haiku call to start a routine. Local lanes run on your computer under your user.
 - **A cloud routine** on each account, created with your approval. It runs hourly and costs one short session each time,
   whether or not there is work. New routines get every connector on the account, so setup clears them.
 - **Git pushes to your own repo.** Plans, lane rules, claims, heartbeats, handoffs, messages and routine ids go to the
@@ -84,14 +84,16 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 
 ## Limits
 
-- macOS only for the daemon, because it uses launchd. `--routine` needs no Mac.
-- Local listeners run while the Mac is on and that Mac user is logged in.
-- Each account needs a routine for instant cloud starts, created under the same login as that Mac user's `claude` CLI,
+- The daemon runs on macOS (launchd), Windows (Task Scheduler) and Linux (a systemd user service). `--routine` needs no computer at all.
+- To check a Windows or Linux computer, run `scripts/platform_check.py --real-service`. It uses a throwaway repo and spends no tokens.
+- A repo set up with `/fast-builder:install-repo` before 0.1.9 has a hook that cannot start on Windows, so run that command again.
+- Local listeners run while the computer is on and that OS user is logged in, and on Linux only with `loginctl enable-linger` once they log out.
+- Each account needs a routine for instant cloud starts, created under the same login as that OS user's `claude` CLI,
   and its GitHub connection must reach the repo. `routine-check` proves the first.
 - Claude usage limits are per account. A lane that runs dry goes quiet, and is freed after 45 minutes.
 - The guard hook sees Claude's tools, and `check-diff` catches a shell edit at push time. It is a guardrail for
   well-meaning builders, not a sandbox: a determined shell command can get past it.
-- Cloud lanes fetch `fb.py` from the bus, because cloud sessions get no user plugins. Local lanes use the copy on the Mac.
+- Cloud lanes fetch `fb.py` from the bus, because cloud sessions get no user plugins. Local lanes use the copy on the computer.
 - Anyone who can push to the bus can start work on listening accounts, read every routine id on it, and change the `fb.py`
   that cloud lanes run. Listen only to repos whose write access you control.
 - A bus writer can list routine ids, but that alone cannot rename a healthy listener or start another routine, and a

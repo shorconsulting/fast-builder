@@ -6,3 +6,5 @@ argument-hint: "[--run RUN | --all] [--reason TEXT]"
 # /fast-builder:pause
 
 Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fb.py" pause $ARGUMENTS`, then report which runs paused.
+
+On Windows, use `py -3` in place of `python3`.

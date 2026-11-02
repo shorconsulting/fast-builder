@@ -81,3 +81,5 @@ took within a minute or two, run `python3 "$FB" prompt` and give the user the pa
 Unless the user said this account should only plan, join the steward lane and follow `lane-lead.md`:
 
     python3 "$FB" join --lane STEWARD
+
+On Windows, use `py -3` in place of `python3`, unless this is a lane a listener started, which has its own `python3`.
