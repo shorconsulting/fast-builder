@@ -148,3 +148,5 @@ still building. Before you mark it done:
        python3 "$FB" lane-state done --note "one line"
 
 Everything left blocked: `lane-state blocked --note "what on"`. The run closes when every lane is done or blocked.
+
+On Windows, use `py -3` in place of `python3`, unless this is a lane a listener started, which has its own `python3`.

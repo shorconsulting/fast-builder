@@ -3739,5 +3739,255 @@ class CloudBootstrap(World):
         self.assertEqual(sh(["git", "status", "--porcelain"], cwd=repo).stdout, "")
 
 
+class OtherSystems(World):
+    """What can be proved from any computer. platform_check.py proves the rest on a real Windows or Linux one."""
+
+    def test_the_windows_task_keeps_running_and_survives_odd_paths(self):
+        import xml.etree.ElementTree as ET
+        folder = os.path.join(self.root, "Py & Co")
+        os.makedirs(folder)
+        python = os.path.join(folder, "python.exe")
+        text = fb.windows_task(python, r"C:\Users\A & B\fb.py", "HOST\\a&b")
+        ns = "{http://schemas.microsoft.com/windows/2004/02/mit/task}"
+        task = ET.fromstring(text.encode("utf-16"))
+        self.assertEqual(task.find(ns + "Actions/" + ns + "Exec/" + ns + "Command").text, python, "no pythonw to use here")
+        self.assertEqual(task.find(ns + "Actions/" + ns + "Exec/" + ns + "Arguments").text, r'"C:\Users\A & B\fb.py" listen')
+        self.assertEqual(task.find(ns + "Principals/" + ns + "Principal/" + ns + "UserId").text, "HOST\\a&b")
+        self.assertEqual(task.find(ns + "Triggers/" + ns + "LogonTrigger/" + ns + "UserId").text, "HOST\\a&b", "any other user's logon needs an administrator")
+        self.assertEqual(task.find(ns + "Settings/" + ns + "ExecutionTimeLimit").text, "PT0S", "the default ends it after 3 days")
+        self.assertEqual(task.find(ns + "Settings/" + ns + "DisallowStartIfOnBatteries").text, "false")
+        self.assertEqual(task.find(ns + "Settings/" + ns + "StopIfGoingOnBatteries").text, "false")
+        self.assertEqual(task.find(ns + "Settings/" + ns + "MultipleInstancesPolicy").text, "IgnoreNew")
+        self.assertEqual(task.find(ns + "Triggers/" + ns + "TimeTrigger/" + ns + "Repetition/" + ns + "Interval").text, "PT5M", "nothing else brings a dead listener back")
+        open(os.path.join(folder, "pythonw.exe"), "w").close()
+        task = ET.fromstring(fb.windows_task(python, "fb.py", "u").encode("utf-16"))
+        self.assertEqual(task.find(ns + "Actions/" + ns + "Exec/" + ns + "Command").text, os.path.join(folder, "pythonw.exe"))
+
+    def test_the_systemd_unit_leaves_lanes_running_and_expands_nothing(self):
+        import configparser
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.optionxform = str
+        parser.read_string(fb.systemd_unit("/o p/python3", "/home/a%b/fb.py", "/bin:/$x", "bravo", "/home/a%b/l.log"))
+        service = parser["Service"]
+        self.assertEqual(service["ExecStart"], '"/o p/python3" "/home/a%%b/fb.py" listen')
+        self.assertEqual(service["Environment"], '"PATH=/bin:/$x" "FB_ACCOUNT=bravo"', "systemd only expands $ in a command")
+        self.assertIn("$$", fb.systemd_unit("/o/py$1", "fb.py", "/bin", "bravo", "/l").split("ExecStart=")[1].split("\n")[0])
+        self.assertEqual(service["KillMode"], "process", "stopping the listener must not end its lanes")
+        self.assertEqual(service["Restart"], "always")
+        self.assertEqual(service["StandardOutput"], "append:/home/a%%b/l.log")
+        self.assertEqual(parser["Install"]["WantedBy"], "default.target")
+
+    def test_a_dry_run_shows_this_systems_job(self):
+        text = self.j("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--account", "bravo")["service_text"]
+        self.assertIn(os.path.join(self.env("bravo")["FB_HOME"], "fb.py"), text)
+
+    def hook_ran(self, ostype, command, **more):
+        """Which interpreter a hook command starts, as (stub name, its arguments)."""
+        bin_dir = tempfile.mkdtemp(dir=self.root)
+        for name in ("python3", "py", "python"):
+            with open(os.path.join(bin_dir, name), "w") as handle:
+                handle.write('#!/bin/sh\necho %s "$@"\n' % name)
+            os.chmod(os.path.join(bin_dir, name), 0o755)
+        env = dict({"PATH": bin_dir + os.pathsep + "/usr/bin:/bin", "CLAUDE_PLUGIN_ROOT": "C:\\Users\\A B\\plugin"}, **more)
+        return subprocess.run(["bash", "-c", "OSTYPE=%s; %s" % (ostype, command)], env=env, stdout=subprocess.PIPE, universal_newlines=True, check=True).stdout.strip()
+
+    def test_a_hook_finds_python_where_python3_is_a_stub(self):
+        command = fb.hook_command("${CLAUDE_PLUGIN_ROOT}/scripts/fb.py", "guard")
+        self.assertEqual(self.hook_ran("darwin25", command), "python3 C:\\Users\\A B\\plugin/scripts/fb.py hook guard")
+        self.assertEqual(self.hook_ran("linux-gnu", command).split()[0], "python3")
+        self.assertEqual(self.hook_ran("msys", command).split()[0], "py")
+        self.assertEqual(self.hook_ran("cygwin", command).split()[0], "py")
+        self.assertEqual(self.hook_ran("msys", command, FB_PYTHON="python").split()[0], "python", "a listener's lane knows which works")
+        self.assertEqual(self.hook_ran("darwin25", command, FB_PYTHON="python").split()[0], "python3")
+
+    def test_the_plugin_hooks_are_the_same_command(self):
+        with open(os.path.join(HERE, "..", "hooks", "hooks.json")) as handle:
+            hooks = json.load(handle)["hooks"]
+        for event, name in (("SessionStart", "session-start"), ("PreToolUse", "guard"), ("Stop", "stop")):
+            self.assertEqual(hooks[event][0]["hooks"][0]["command"], fb.hook_command("${CLAUDE_PLUGIN_ROOT}/scripts/fb.py", name))
+            self.assertEqual(hooks[event][0]["hooks"][0]["onFailure"], "continue", "or a PC with no Git Bash has every tool refused")
+        self.assertEqual(hooks["PreToolUse"][0]["matcher"], fb.GUARD_MATCHER)
+
+    def test_the_guard_sees_powershell(self):
+        self.assertIn("PowerShell", fb.GUARD_MATCHER.split("|"))
+        self.publish(accounts=2)
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.fb("alpha", "stop", "--reason", "enough")
+        repo = self.clone("alpha")
+        for root, _, names in os.walk(os.path.join(repo, ".git")):
+            if "control-cache.json" in names:
+                os.remove(os.path.join(root, "control-cache.json"))
+
+        def said(command):
+            payload = json.dumps({"tool_name": "PowerShell", "tool_input": {"command": command}, "cwd": repo})
+            return self.fb("alpha", "hook", "guard", stdin=payload).stdout
+        self.assertIn('"deny"', said("Remove-Item src/auth/login.ts"))
+        self.assertEqual(said("git status"), "", "a stopped lane can still read")
+
+    def test_a_push_in_a_windows_spelling_is_still_a_push(self):
+        for command in ("git push", "git.exe push origin HEAD", '"C:/Program Files/Git/cmd/git.exe" push origin HEAD', "/mingw64/bin/git.exe push",
+                        "gh.exe pr create --fill", "GIT PUSH", "git -c a=b push"):
+            self.assertTrue(fb.PUSH_BASH.search(command), command)
+        for command in ("git status", "gitpush", "git.exe log --grep push-ups", "echo pushed"):
+            self.assertFalse(fb.PUSH_BASH.search(command), command)
+
+    def test_the_guard_refuses_windows_spellings_it_cannot_place(self):
+        for odd in ("\\\\?\\C:\\repo\\.git\\x", "\\\\localhost\\C$\\repo\\a", "//localhost/C$/a", "\\repo\\a", "/c/repo/a", "C:a.ts", "C:\\repo\\a.ts:hidden", "a.ts::$DATA"):
+            self.assertTrue(fb.odd_windows_path(odd), odd)
+        for fine in ("C:\\repo\\a.ts", "c:/repo/a.ts", "src\\a.ts", "src/a.ts", "..\\a.ts"):
+            self.assertFalse(fb.odd_windows_path(fine), fine)
+
+    def test_a_bus_that_will_not_check_out_stops_the_lane(self):
+        """Anyone who can push could stop the run anyway, and otherwise a stop pushed after this never arrives."""
+        class Broken:
+            lock_seconds = 0
+
+            def __init__(self, *_):
+                pass
+
+            def head(self, timeout=0):
+                return "new"
+
+            def sync(self):
+                raise fb.BusUnreadable("invalid path")
+        path = os.path.join(self.root, "session.json")
+        saved = fb.Bus
+        fb.Bus = Broken
+        try:
+            self.assertEqual(fb.control_action({"remote": "r", "account": "a"}, path), fb.UNREADABLE)
+        finally:
+            fb.Bus = saved
+
+    def test_only_a_name_windows_cannot_hold_counts_as_unreadable(self):
+        for bad in ("x:y.json", "runs/aux.json", "runs/con/a", "a?b", 'a"b', "a.", "a ", "com1.txt", "a\\b", "a\x01b", "git~1/config", "conin$.json"):
+            self.assertTrue(fb.windows_cannot_hold(bad), bad)
+        for fine in ("runs/r/msgs/20261102T101010Z-a-00ff.json", "kit/fb.py", "auxiliary.json", "aux-1.json", "console/a.md", "a.b.c", "com.json", ""):
+            self.assertFalse(fb.windows_cannot_hold(fine), fine)
+
+    def bus_git_folder(self, account):
+        found = [p for p in glob.glob(os.path.join(self.env(account)["FB_CACHE"], "**", ".git"), recursive=True) if os.sep + "work" + os.sep not in p]
+        self.assertEqual(len(found), 1, found)
+        return found[0]
+
+    def test_a_lock_a_killed_git_left_cannot_keep_a_stop_out(self):
+        self.publish(accounts=1)
+        lock = os.path.join(self.bus_git_folder("alpha"), "shallow.lock")
+        open(lock, "w").close()
+        os.utime(lock, (time.time() - 600, time.time() - 600))
+        self.fb("alpha", "status")
+        self.assertFalse(os.path.exists(lock), "stale, so it should go")
+        open(lock, "w").close()
+        self.fb("alpha", "status", check=False)
+        self.assertTrue(os.path.exists(lock), "a git may still be working behind a fresh one")
+
+    def test_a_halted_lanes_powershell_cannot_hide_a_second_command(self):
+        for bad in ('echo "a\\" ; Remove-Item x ; # "', 'ls "\\"; iex $env:P ; # "', 'echo "a\u201c ; rm x ; #"', "echo @{a=1}", "ls | rm", "echo %x%", 'py -3 "$FB" leave',
+                    "echo a\rRemove-Item x", "ls\rRemove-Item -Recurse src", "git status\rgit push"):
+            self.assertFalse(fb.allowed_when_halted("PowerShell", bad), bad)
+        for good in ("git status", "ls src", 'py -3 "C:\\Users\\a b\\fb.py" lane-state stopped', "py -3 C:\\x\\fb.py leave"):
+            self.assertTrue(fb.allowed_when_halted("PowerShell", good), good)
+        self.assertTrue(fb.allowed_when_halted("Bash", 'py -3 "$FB" leave'), "Bash has its own rules")
+
+    def test_windows_will_not_start_a_lane_it_cannot_guard(self):
+        saved = fb.WINDOWS, fb.git_bash, fb.CACHE_DIR
+        fb.WINDOWS = True
+        try:
+            fb.git_bash = lambda: None
+            self.assertIn("Git Bash", fb.windows_problem())
+            fb.git_bash = lambda: "C:/Git/bin/bash.exe"
+            self.assertIsNone(fb.windows_problem())
+            fb.CACHE_DIR = "\\\\server\\home\\cache"
+            self.assertIn("network share", fb.windows_problem())
+        finally:
+            fb.WINDOWS, fb.git_bash, fb.CACHE_DIR = saved
+        self.assertIsNone(fb.windows_problem())
+
+    def test_names_windows_keeps_for_devices_are_refused(self):
+        for name in ("aux", "con", "nul", "prn", "com1", "lpt9"):
+            self.assertFalse(fb.NAME_RE.match(name), name)
+            self.assertFalse(fb.RUN_RE.match(name), name)
+        for name in ("aux-1", "console", "auxiliary", "core", "com", "null"):
+            self.assertTrue(fb.NAME_RE.match(name), name)
+
+    def test_git_settings_add_to_what_is_there_and_only_once(self):
+        env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.name", "GIT_CONFIG_VALUE_0": "x"}
+        fb.add_git_settings(env)
+        fb.add_git_settings(env)
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual((env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"], env["GIT_CONFIG_VALUE_1"]), ("user.name", "core.autocrlf", "false"))
+        fresh = {}
+        fb.add_git_settings(fresh)
+        self.assertEqual(fresh["GIT_CONFIG_COUNT"], "2")
+
+    def test_claude_cmd_is_refused_a_path_cmd_exe_would_act_on(self):
+        cmd = os.path.join(self.root, "claude.cmd")
+        open(cmd, "w").close()
+        saved = fb.WINDOWS, fb.CLAUDE
+        fb.WINDOWS, fb.CLAUDE = True, cmd
+        try:
+            self.assertEqual(fb.claude_call("p", "--plugin-dir", "C:/ok")[0][0], cmd)
+            with self.assertRaises(fb.FbError):
+                fb.claude_call("p", "--plugin-dir", "C:/A&B/plugin")
+        finally:
+            fb.WINDOWS, fb.CLAUDE = saved
+
+    def test_install_repo_replaces_the_hook_it_used_to_write(self):
+        repo = self.clone("alpha")
+        older = 'python3 "$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py" hook guard'
+        os.makedirs(os.path.join(repo, ".claude"))
+        with open(os.path.join(repo, ".claude", "settings.json"), "w") as handle:
+            json.dump({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": older}]},
+                                                {"matcher": "Edit", "hooks": [{"type": "command", "command": "mine"}]}]}}, handle)
+        self.fb("alpha", "install-repo")
+        self.fb("alpha", "install-repo")
+        with open(os.path.join(repo, ".claude", "settings.json")) as handle:
+            rows = json.load(handle)["hooks"]["PreToolUse"]
+        commands = [h["command"] for row in rows for h in row["hooks"]]
+        self.assertEqual(commands, ["mine", fb.hook_command("$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py", "guard")])
+
+    def test_a_halted_lane_may_run_the_kit_through_the_windows_launcher(self):
+        for good in ('py -3 "$FB" lane-state stopped', 'py "$FB" leave', 'py -3 C:\\x\\fb.py leave'):
+            self.assertTrue(fb.allowed_when_halted("Bash", good), good)
+        for bad in ('py -c "import os"', 'py -3 -c "import os"', "py -3 evil.py", 'py -3 "$FB" leave && rm x', 'pyx "$FB" leave'):
+            self.assertFalse(fb.allowed_when_halted("Bash", bad), bad)
+
+    def test_the_windows_call_puts_the_prompt_on_stdin_and_finds_the_full_path(self):
+        unix = fb.claude_call("line one\nline & two", "--model", "x")
+        self.assertEqual(unix, ([fb.CLAUDE, "-p", "line one\nline & two", "--model", "x"], None))
+        saved = fb.WINDOWS, fb.CLAUDE
+        fb.WINDOWS, fb.CLAUDE = True, self.shim
+        try:
+            self.assertEqual(fb.claude_call("line one\nline & two", "--model", "x"), ([self.shim, "-p", "--model", "x"], "line one\nline & two"))
+        finally:
+            fb.WINDOWS, fb.CLAUDE = saved
+
+    def test_a_lane_started_with_its_prompt_on_stdin_receives_all_of_it(self):
+        reader = os.path.join(self.root, "reader")
+        said = os.path.join(self.root, "said")
+        with open(reader, "w") as handle:
+            handle.write('#!/bin/sh\necho "$@" > "%s.args"\ncat > "%s"\n' % (said, said))
+        os.chmod(reader, 0o755)
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        self.publish(accounts=2, where="local")
+        code = "import fb, sys\nfb.claude_call = lambda prompt, *rest: ([%r, '-p'] + list(rest), prompt)\nsys.argv = ['fb.py', 'listen', '--once']\nfb.main()\n" % reader
+        sh([sys.executable, "-c", code], cwd=self.clone("bravo"), env=dict(self.env("bravo"), PYTHONPATH=HERE))
+        end = time.time() + 10
+        while time.time() < end and not (os.path.exists(said) and os.path.getsize(said)):
+            time.sleep(0.1)
+        with open(said) as handle:
+            text = handle.read()
+        self.assertGreater(text.count("\n"), 3, "the whole brief, not its first line")
+        self.assertIn("lane", text)
+        with open(said + ".args") as handle:
+            self.assertNotIn("\n", handle.read().strip())
+
+    def test_text_is_utf8_with_lf_whatever_the_system_prefers(self):
+        path = os.path.join(self.root, "t.json")
+        fb.write_file(path, '{"note": "caf\u00e9 \u2014 ok"}\n')
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), '{"note": "caf\u00e9 \u2014 ok"}\n'.encode("utf-8"))
+        self.assertEqual(fb.read_json(path)["note"], "caf\u00e9 \u2014 ok")
+
+
 if __name__ == "__main__":
     unittest.main()
