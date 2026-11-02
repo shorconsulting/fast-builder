@@ -41,9 +41,9 @@ work item rather than within a minute.
 
 | Command | Does |
 |---|---|
-| `/fast-builder:status` | Every lane, account and heartbeat, and anything waiting on a person |
+| `/fast-builder:status` | Where the main session is, every lane, account and heartbeat, and anything waiting on a person |
 | `/fast-builder:stop` | Stops every account. `--drain` lets lanes finish what is in hand. `--all` covers every run |
-| `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes, and lanes that went quiet, back on offer |
+| `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes, lanes that went quiet, and accounts marked out of usage back on offer |
 | `/fast-builder:send --to LANE "text"` | Sends a note to one lane or `all` |
 | `/fast-builder:join` | Takes an open lane in this session now |
 | `/fast-builder:switch` | Points this OS user's listener at its current login |
@@ -116,6 +116,8 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   the other, read as a re-run. A reading across two commits is thrown away. All of a head's pages must arrive in 60 seconds, about 3,000 rows,
   so a head larger than that reads `unknown`, and a person hears after about 2 hours of it. A deadline in free text, such as `Friday`, reads
   as no deadline.
+- An account that hits a limit frees its lane at once, through Claude Code's `StopFailure` hook, which spends no tokens. Its current branch and that lane's changed files go to a new branch under `fast-builder/wip/`, and it is offered no lanes for 3 hours unless a person runs `/fast-builder:resume`. A brief 429 looks the same, so that is the way back. Files that look like secrets, other lanes' files, huge files and separate repos stay on that computer, and so does a subagent's worktree. The lane's handoff names what stayed. These branches are not cleaned up. A repo set up with `/fast-builder:install-repo` needs it run again for cloud lanes to do this, and the hook has not yet been seen firing on a real limit.
+- The main session is whichever account published the run. If that account runs out while holding a lane, a person is told. A session that only planned and holds no lane has nothing to report this, and moving the role to another account is not built yet.
 - The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another
   account too, and its old process stays until it ticks or the run stops. With no other account, a person hears at 30 minutes.
 - Nothing restarts a lane marked done, so a request raised for a done lane whose session has ended needs a person.

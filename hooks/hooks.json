@@ -9,6 +9,12 @@
         "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook guard", "timeout": 15, "onFailure": "continue" } ]
       }
     ],
+    "StopFailure": [
+      {
+        "matcher": "rate_limit|billing_error",
+        "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook stop-failure", "timeout": 300, "onFailure": "continue" } ]
+      }
+    ],
     "Stop": [
       { "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook stop", "timeout": 15, "onFailure": "continue" } ] }
     ]

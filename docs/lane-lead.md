@@ -124,6 +124,10 @@ path to `fb.py`. A command that sets `$FB` first or chains anything is refused.
 It holds open PRs (number, head sha, state, sequence number), position in the work, next three slices, blockers and
 lessons. It is what a replacement account starts from if this one runs out of usage, so write it for a stranger.
 
+If you are that replacement and the handoff ends with a section saying an account ran out of usage, it names a branch under
+`fast-builder/wip/` holding what that account left, and lists what could not be saved. It is a snapshot nobody has reviewed:
+start from it as it says, check it builds, and do not land it as it stands.
+
 At about 300k context, save the handoff and end the session: the listener or the steward restarts the lane fresh.
 
 ## Finishing

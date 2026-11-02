@@ -28,6 +28,8 @@ Layout of the bus:
   runs/<run>/conductor.json       lease on the cross-account orchestrator role
   runs/<run>/main.json            the base branch's last known check state
   runs/<run>/freed/<lane>.json    which accounts lost this lane to going quiet, and when
+  runs/<run>/desk.json            which account and computer hold the session a person talks to
+  accounts/<account>.json         when this account ran out of usage
   runs/<run>/msgs/<id>.json       messages between lanes, the conductor and the human
 
 See docs/protocol.md. Everything is a subcommand: fb.py --help.
@@ -43,6 +45,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -75,7 +78,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -675,6 +678,13 @@ def cooling(bus, run, lane, account):
     return abs(age_minutes(at)) < COOLDOWN_MINUTES
 
 
+def out_of_usage(bus, account):
+    """When this account ran out of usage, if that was recent enough to still count. The same cooldown as a lost lane, and a
+    time far ahead of the clock cannot lock an account out."""
+    at = bus.doc("accounts/%s.json" % account).get("out_of_usage") if NAME_RE.match(str(account)) else None
+    return at if at and abs(age_minutes(at)) < COOLDOWN_MINUTES else None
+
+
 def lost_lane(bus, run, lane, account):
     """The file saying account lost this lane. Its own file: the next claim overwrites a beat, and old copies never read it."""
     rel = "runs/%s/freed/%s.json" % (run, lane)
@@ -769,6 +779,11 @@ def back_on_offer(bus, run):
         if beat.get("status") == "open" and (held or str(beat.get("note", "")).startswith("freed: ")):
             files["runs/%s/beats/%s.json" % (run, name)] = dumps(dict(beat, at=now_iso(), note="back on offer after a resume"))
     return files
+
+
+def accounts_back_in(bus):
+    """A person's resume is how a brief 429, or an account that was topped up, gets lanes again."""
+    return {"accounts/" + name: None for name in bus.listdir("accounts") if name.endswith(".json") and out_of_usage(bus, name[:-5])}
 
 
 def has_cooled_lane(bus, run):
@@ -1173,6 +1188,34 @@ def _stale(bus, run, stale_minutes):
     return out
 
 
+def main_session(bus, run):
+    """Where the session a person talks to is. Everything else in a run can move by itself, but that conversation can't."""
+    desk = bus.doc("runs/%s/desk.json" % run)
+
+    def plain(key):  # anyone can push anything, and this is read out to a person and to the model summarising for them
+        return re.sub(r"[^\w.:-]", "", str(desk.get(key) or ""))[:64] or None
+    account = plain("account") if NAME_RE.match(str(desk.get("account"))) else None
+    return {"account": account, "computer": plain("computer"), "since": plain("since"), "out_of_usage": out_of_usage(bus, account) if account else None}
+
+
+def who_runs_it(bus, run):
+    """The lines that say who to go to when something needs a person."""
+    main = main_session(bus, run)
+    if main["account"]:
+        where = " on %s" % main["computer"] if main["computer"] else ""
+        line = "Main session: **%s**%s, since %s." % (main["account"], where, main["since"])
+        if main["out_of_usage"]:
+            line += " **That account ran out of usage at %s: continue from another account.**" % main["out_of_usage"]
+    else:
+        line = "Main session: not recorded for this run."
+    holder = bus.doc("runs/%s/conductor.json" % run).get("holder")
+    lines = [line, "Conductor: %s." % (holder if NAME_RE.match(str(holder)) else "none yet")]
+    dry = sorted(n[:-5] for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5]))
+    if dry:
+        lines.append("Out of usage: %s. No lanes are offered to these accounts for %d hours." % (", ".join(dry), COOLDOWN_MINUTES // 60))
+    return lines
+
+
 def render_status(bus, fresh=None):
     """fresh: main.json docs this very commit is about to write, by run."""
     lines = ["# fast-builder status", "", "Updated %s." % now_iso(), ""]
@@ -1183,6 +1226,7 @@ def render_status(bus, fresh=None):
         job = bus.doc("runs/%s/job.json" % run)
         state = run_state(bus, run)
         lines += ["## %s: %s" % (run, state["state"]), "", job.get("goal", ""), ""]
+        lines += who_runs_it(bus, run) + [""]
         main = main_view(bus, run, (fresh or {}).get(run))
         if main["state"] != "unknown":
             lines += ["Main is %s at %s since %s.%s" % (main["state"], main["sha"][:7], main["since"], " Failing: %s." % ", ".join(main["failing"]) if main["failing"] else ""), ""]
@@ -1687,6 +1731,19 @@ UNREADABLE = "bus-unreadable"  # the guard's alone: a tick cannot report it, sin
 UNREADABLE_NOTE = ("fast-builder: the bus has a file name Windows cannot check out, so this lane cannot hear a stop or send anything. Stop work "
                    "and tell a person: the listener's log names the file, and it has to come off the bus. The run itself has not been stopped.")
 GUARD_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Agent|Task"
+STOP_FAILURE_MATCHER = "rate_limit|billing_error"
+OUT_OF_USAGE_ERRORS = STOP_FAILURE_MATCHER.split("|")
+# A snapshot goes up unreviewed. These go by what a file is, whatever it is called otherwise. SECRET_NAME_RE is only a name,
+# so a source file is let through: SecretaryService.ts and CredentialForm.tsx are work, and leaving them out strands it.
+SECRET_RE = re.compile(r"""(?ix) (?:^|/)\.env(?:$|[./]) | \.env$ | (?:^|/)\.envrc$ | (?:^|/)\.dev\.vars$ | \.(?:pem|key|p12|pfx|jks|keystore|tfvars|tfstate)$
+    | (?:^|/)id_(?:rsa|dsa|ecdsa|ed25519) | (?:^|/)(?:\.git-credentials|[._]netrc|\.npmrc|\.pypirc|\.pgpass|auth\.json)$ | (?:^|/)(?:secrets?|credentials?)(?:/|\.[^/]*$|$)
+    | (?:^|/)\.(?:kube|aws|ssh|gnupg)/ | settings\.local\.json$ | (?:^|/)\.claude/worktrees/""")
+SECRET_NAME_RE = re.compile(r"(?i)(?:^|/)[^/]*(?:secret|credential|service[-_]?account)[^/]*$")
+SOURCE_RE = re.compile(r"(?i)\.(?:ts|tsx|js|jsx|mjs|cjs|py|rb|go|java|kt|rs|php|swift|cs|c|h|cpp|vue|svelte|css)$")
+WIP_MAX_BYTES = 50000000  # GitHub refuses a whole push for one file over 100 MB, and warns at 50
+WIP_NAMES_SHOWN = 15
+LIVE_BEATS = ("working", "claimed")
+STOP_FAILURE_LOCK_SECONDS = 45
 SHELL_TOOLS = ("Bash", "PowerShell")  # Claude Code can offer PowerShell on Windows with no change on this computer
 # is_simple reads a command as a POSIX shell would. PowerShell ends a string at \" or a curly quote where that sees one going
 # on, and a lone carriage return ends a line there, so a halted lane's PowerShell gets no character that could start
@@ -1732,6 +1789,9 @@ def hook_guard(payload):
     session, path = load_session(cwd)
     if not session:
         return
+    if payload.get("session_id") and not session.get("claude_session"):  # join starts a new file, so this is the lane's own
+        session["claude_session"] = payload["session_id"]
+        save_session(path, session)
     try:
         guard_lane_call(payload, cwd, session, path)
     except Exception as exc:
@@ -2337,7 +2397,10 @@ def supervise(bus, repo_cfg, account, stops_only=False):
 def pick_lane(bus, run, account):
     """The lane this account should take now, if any. A lane freed from an account that went quiet or stopped is fair
     game for an account already in the run; a fresh lane is not, so one account never ends up carrying a whole run.
-    A lane this account just lost to going quiet is neither: it probably has no usage left to run it with."""
+    A lane this account just lost to going quiet is neither: it probably has no usage left to run it with. An account that
+    said it has none gets no lane at all, or it would start one, stop at once and free it, one lane after another."""
+    if out_of_usage(bus, account):
+        return None
     table = lane_table(bus, run)
     open_lanes = [r["lane"] for r in table if r["account"] is None and not cooling(bus, run, r["lane"], account)]
     if not open_lanes:
@@ -2878,7 +2941,8 @@ def cmd_publish(args):
         prefix = "runs/%s/" % run
         files = {prefix + "job.json": read_text(os.path.join(args.draft, "job.json")), prefix + "lanes.json": read_text(os.path.join(args.draft, "lanes.json")),
                  prefix + job["plan_file"]: read_text(os.path.join(args.draft, job["plan_file"])),
-                 prefix + "control.json": dumps({"state": "running", "reason": "kickoff", "by": bus.account, "at": now_iso()})}
+                 prefix + "control.json": dumps({"state": "running", "reason": "kickoff", "by": bus.account, "at": now_iso()}),
+                 prefix + "desk.json": dumps({"account": bus.account, "computer": socket.gethostname(), "since": now_iso()})}
         for name in os.listdir(os.path.join(args.draft, "lanes")):
             files[prefix + "lanes/" + name] = read_text(os.path.join(args.draft, "lanes", name))
         files.update(kit_files())
@@ -2901,6 +2965,8 @@ def cmd_join(args):
     bus.account = account
     if not bus.sync():
         raise FbError("no bus on this repo yet")
+    if args.lane in (None, "any", "<any open lane>") and out_of_usage(bus, account):
+        raise FbError("%s ran out of usage at %s, so it is offered no lanes: name one with --lane, or have a person run resume" % (account, out_of_usage(bus, account)))
     run = pick_run(bus, argparse.Namespace(run=None if args.run in (None, "any") else args.run))
     lane = None if args.lane in (None, "any", "<any open lane>") else args.lane
     if lane and not NAME_RE.match(lane):
@@ -3107,6 +3173,9 @@ def control_cmd(state, reason_default):
         bus = get_bus(args)
         if not bus.sync():
             raise FbError("no bus on this repo yet")
+        back_in = sorted(n[9:-5] for n in accounts_back_in(bus)) if state == "running" else []
+        if back_in:  # about accounts, not any one run, so it holds whichever run this goes on to pick or fails to
+            bus.commit(lambda: accounts_back_in(bus), "resume: accounts back in")
         cool = [r for r in list_runs(bus) if has_cooled_lane(bus, r)] if state == "running" and (args.all or not (args.run or load_session()[0])) else []
         if args.all and state == "running":
             runs = [r for r in list_runs(bus) if r in cool or bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
@@ -3114,7 +3183,7 @@ def control_cmd(state, reason_default):
             runs = [r for r in list_runs(bus) if run_state(bus, r)["state"] not in ("finished", "stopped")]
         elif state == "running" and not args.run and not load_session()[0]:
             runs = [r for r in list_runs(bus) if r in cool or bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
-            if len(runs) != 1:
+            if len(runs) != 1 and (runs or not back_in):
                 raise FbError("%d runs could resume: pass --run or --all (%s)" % (len(runs), ", ".join(runs)))
         else:
             runs = [pick_run(bus, args)]
@@ -3123,6 +3192,8 @@ def control_cmd(state, reason_default):
         if state == "running" and args.all:
             cleared = bus.commit(lambda: {"STOP": None}, "resume: clear the stop on every run")
         result = {"state": state, "runs": moved, "unchanged": [r for r in runs if r not in moved]}
+        if back_in:
+            result["accounts_back_in"] = back_in
         if state == "running" and args.all:
             result["not_resumed_stopped"] = [r for r in list_runs(bus) if r not in runs and run_state(bus, r)["state"] == "stopped"]
         if state == "running":
@@ -3152,9 +3223,10 @@ def cmd_status(args):
     for run in runs:
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
-                       "main": main_view(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
+                       "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
-    out({"runs": report, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
+    dry = [{"account": n[:-5], "at": out_of_usage(bus, n[:-5])} for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5])]
+    out({"runs": report, "out_of_usage": dry, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
 
 
 def cmd_report(args):
@@ -3257,13 +3329,171 @@ def hook_command(script, name):
     return 'P=python3; case "$OSTYPE" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; "$P" "%s" hook %s' % (script, name)
 
 
+def looks_secret(path):
+    return bool(SECRET_RE.search(path) or (SECRET_NAME_RE.search(path) and not SOURCE_RE.search(path)))
+
+
+def save_snapshot(session, session_file, lanes):
+    """Put this lane's unfinished work on a branch of its own, for a replacement on another account who cannot read this
+    clone. Returns what happened, for the handoff. It spends no tokens and leaves the clone as it was: the snapshot is built
+    in a throwaway index, and status reads the real one, so a file hidden with --skip-worktree stays hidden. Only this lane's
+    own files go, since it is unreviewed, and each firing gets a new branch, so nothing can overwrite an earlier save.
+    Names go to update-index, which takes them literally: a file called * must not read as a pattern."""
+    git_dir = os.path.dirname(os.path.dirname(session_file))
+    top = os.path.dirname(git_dir)
+    plain = dict(os.environ, GIT_CONFIG_COUNT="0")  # this clone's own line endings, or every file would read as changed
+
+    def snap(args, timeout=15, env=plain, **kw):
+        return run_cmd(["git", "-c", "safe.directory=*", "-c", "core.longpaths=true", "--no-optional-locks"] + args, cwd=top, env=env, timeout=timeout, **kw).stdout.rstrip("\n")
+
+    head = snap(["rev-parse", "--verify", "HEAD"])
+    saved, left = [], []
+    for entry in snap(["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"], timeout=45).split("\0"):
+        name = entry[3:]
+        if not name:
+            continue
+        full = os.path.join(top, name)
+        apart = os.path.isdir(full) and not os.path.islink(full)  # a nested repo or a submodule: only a pointer could go up
+        too_big = os.path.isfile(full) and os.path.getsize(full) > WIP_MAX_BYTES
+        if apart or name.endswith("/") or "�" in name or too_big or looks_secret(name) or not (lanes and may_touch(name, session["lane"], lanes)):
+            left.append(name)
+        else:
+            saved.append(name)
+    notes = []
+    if snap(["rev-list", "--count", "--branches", "--not", "--remotes", head]) != "0":
+        notes.append("Other local branches there have commits that were never pushed.")
+    if snap(["worktree", "list", "--porcelain"]).count("worktree ") > 1:
+        notes.append("It has other worktrees, such as a subagent's, and none of them was looked at.")
+    if any(os.path.exists(os.path.join(git_dir, marker)) for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")):
+        notes.append("It was in the middle of a rebase or merge, so this is not all of that work, and it may hold conflict markers.")
+    result = {"branch": None, "left": left, "notes": notes}
+    pushed = bool(snap(["branch", "-r", "--contains", head]))
+    if pushed and not saved:
+        return result
+    parent, suspect = head, []
+    if not pushed:  # every commit, not the net change: a secret added and then removed is still in the history
+        try:
+            base = snap(["merge-base", head, "origin/" + session.get("base", "main")])
+        except FbError:
+            raise FbError("its branch shares no history with origin/%s, so its commits could not be checked for secrets" % session.get("base", "main"))
+        suspect = sorted(set(n for n in snap(["log", "--format=", "--name-only", "-z", "--no-renames", "--diff-merges=first-parent", "%s..%s" % (base, head)]).split("\0") if n.strip() and looks_secret(n.strip())))
+        if suspect:  # so the history cannot go, but the work can
+            parent = base
+            result["left"] = left + suspect
+            notes.append("Its unpushed commits touch files that look like secrets, so they did not go up as they are: anything on a snapshot branch is squashed into one commit without those files.")
+    folder = tempfile.mkdtemp(prefix="fb-wip-")
+    try:
+        env = dict(plain, GIT_INDEX_FILE=os.path.join(folder, "index"))
+        snap(["read-tree", head], env=env)
+        if suspect:
+            snap(["reset", "-q", base, "--pathspec-from-file=-", "--pathspec-file-nul"], env=dict(env, GIT_LITERAL_PATHSPECS="1"), stdin_text="\0".join(suspect))
+        if saved:
+            snap(["update-index", "--add", "--remove", "--replace", "-z", "--stdin"], timeout=45, env=env, stdin_text="\0".join(saved) + "\0")
+        tree = snap(["write-tree"], env=env)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+    sha = parent
+    if tree != snap(["rev-parse", parent + "^{tree}"]):
+        who = ["-c", "user.name=fast-builder", "-c", "user.email=fast-builder@noreply.local"]
+        sha = snap(who + ["commit-tree", tree, "-p", parent, "-m", "wip: %s stopped when its account ran out of usage" % session["lane"]])
+    elif pushed or suspect:
+        return result  # staged and then undone, or commits of nothing but secrets: nothing here that the remote lacks
+    branch = "fast-builder/wip/%s/%s/%s-%s" % (session["run"], session["lane"], session["account"], utcnow().strftime("%Y%m%dT%H%M%SZ"))
+    snap(["push", "-q", "--no-verify", "origin", "%s:refs/heads/%s" % (sha, branch)], timeout=45)  # never --force
+    result["branch"] = branch
+    return result
+
+
+def snapshot_note(account, saved):
+    """The part of a handoff that says what a replacement has to go on, and exactly what it does not have."""
+    lines = ["", "", "## %s ran out of usage at %s" % (account, now_iso()), ""]
+    if saved.get("failed"):
+        lines.append("Its unfinished work could not be pushed: %s. Anything uncommitted or unpushed is still in its clone." % saved["failed"])
+    elif saved.get("branch"):
+        lines.append("Its work, limited to this lane's files, is on `%s`. Nobody has reviewed it, and it is a snapshot of whatever was there, so check it builds before you trust it. Start from it with `git fetch origin %s && git switch -c LANE-BRANCH FETCH_HEAD`." % (saved["branch"], saved["branch"]))
+    else:
+        lines.append("There is no snapshot branch, because nothing could be saved beyond what is already pushed.")
+    if saved.get("left"):
+        names = [re.sub(r"[^\w./ -]", "?", name)[:120] for name in saved["left"][:WIP_NAMES_SHOWN]]
+        more = len(saved["left"]) - len(names)
+        lines.append("Not saved, so still only on that computer, because they are another lane's, look like secrets, are very large or are separate repos: %s%s." % (", ".join(names), " and %d more" % more if more > 0 else ""))
+    lines += saved.get("notes", [])
+    return "\n".join(lines) + "\n"
+
+
+def already_told(bus, run, lane, account):
+    """Whether the handoff already covers this account's latest loss of this lane. By the loss and not by any old note: an
+    account can get a lane back, and leave new work the second time."""
+    doc = bus.doc("runs/%s/freed/%s.json" % (run, lane))
+    told, lost = doc.get("told"), doc.get("lost")
+    return isinstance(told, dict) and account in told and told[account] == (lost.get(account) if isinstance(lost, dict) else None)
+
+
+def hook_stop_failure(payload):
+    """StopFailure: this account has run out, so a replacement should not have to wait out the silence. It runs with no
+    tokens, which is why it can do this after the lane no longer can. If it fails, going quiet still frees the lane. A
+    session file outlives its run and any session can sit in this clone, so nothing happens unless the bus agrees this
+    clone's session holds the lane, and this is the session the guard first saw there. A subagent's failure is not its
+    lead's."""
+    if payload.get("error") not in OUT_OF_USAGE_ERRORS or payload.get("agent_id"):
+        return
+    session, session_file = load_session(payload.get("cwd") or os.getcwd())
+    if not session or session.get("claude_session") not in (None, payload.get("session_id")):
+        return
+    run, lane, account = session["run"], session["lane"], session["account"]
+    bus = Bus(session["remote"], account)
+    bus.lock_seconds = STOP_FAILURE_LOCK_SECONDS  # a listener's pass holds it a while, and nothing else will free this lane soon
+    if not bus.sync() or run_state(bus, run)["action"] == FINISHED:
+        return
+    claim, beat = bus.doc("runs/%s/claims/%s.json" % (run, lane)), beat_of(bus, run, lane)
+    mine = holds_claim(claim, session)
+    if not mine and (claim.get("account") == account or already_told(bus, run, lane, account)):
+        return  # a session this account has moved past, or the same news about this lane a second time
+    lost = bus.doc("runs/%s/freed/%s.json" % (run, lane)).get("lost")
+    if not mine and not (beat.get("note") == "freed: %s went quiet" % account or (isinstance(lost, dict) and account in lost)):
+        return
+    saved = None
+    if not mine or beat.get("status") in LIVE_BEATS:
+        bus.release()  # a large push should not keep this account's other lanes off the bus
+        try:
+            saved = save_snapshot(session, session_file, read_json(os.path.join(os.path.dirname(session_file), "lanes.json")))
+        except Exception as exc:  # whatever is wrong with the lane's files, it still has to move on, and lanes.json came off the bus
+            saved = {"failed": str(exc)[:200]}
+
+    def mutate():
+        files = {"accounts/%s.json" % account: dumps({"out_of_usage": now_iso()})}
+        now_claim, now_beat = bus.doc("runs/%s/claims/%s.json" % (run, lane)), beat_of(bus, run, lane)
+        freeing = holds_claim(now_claim, session) and now_beat.get("status") in LIVE_BEATS
+        if freeing:
+            reason = "freed: %s ran out of usage" % account
+            files.update(lost_lane(bus, run, lane, account))
+            files["runs/%s/claims/%s.json" % (run, lane)] = None
+            files["runs/%s/beats/%s.json" % (run, lane)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": reason})
+            add_message(files, run, account, "all", "note", "Lane %s %s." % (lane, reason))
+        first_word = not out_of_usage(bus, account)
+        if saved is not None and (freeing or not already_told(bus, run, lane, account)):  # the plugin's hook and a repo's can both fire
+            handoff = "runs/%s/handoffs/%s.md" % (run, lane)
+            files[handoff] = (bus.read(handoff) or "") + snapshot_note(account, saved)
+            rel = "runs/%s/freed/%s.json" % (run, lane)
+            doc = json.loads(files[rel]) if rel in files else bus.doc(rel)
+            told = doc.get("told") if isinstance(doc.get("told"), dict) else {}
+            lost = doc.get("lost") if isinstance(doc.get("lost"), dict) else {}
+            files[rel] = dumps(dict(doc, told=dict(told, **{account: lost.get(account)})))
+            if now_claim.get("account") not in (None, account):
+                add_message(files, run, account, lane, "note", "%s left unfinished work on this lane when it ran out of usage. The lane's handoff says where." % account)
+        if main_session(bus, run)["account"] == account and first_word:
+            add_message(files, run, account, "human", "needs-human", "%s ran out of usage, and it holds the main session of %s. Continue from another account with status and the plan on the bus." % (account, run))
+        return files
+    bus.commit(mutate, "out of usage(%s): %s" % (run, account))
+
+
 def cmd_hook(args):
     try:
         payload = json.load(sys.stdin)
     except ValueError:
         payload = {}
     try:
-        {"guard": hook_guard, "stop": hook_stop, "session-start": hook_session_start}[args.event](payload)
+        {"guard": hook_guard, "stop": hook_stop, "session-start": hook_session_start, "stop-failure": hook_stop_failure}[args.event](payload)
     except Exception:  # a hook failing must never take a working session down with it
         pass
 
@@ -3331,7 +3561,7 @@ def cmd_install_repo(args):
     settings = read_json(settings_path) or {}
     hooks = settings.setdefault("hooks", {})
 
-    def wire(event, matcher, name):
+    def wire(event, matcher, name, timeout=None):
         command = hook_command("$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py", name)
         rows = hooks.setdefault(event, [])
         older = 'python3 "$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py" hook %s' % name
@@ -3339,13 +3569,14 @@ def cmd_install_repo(args):
             row["hooks"] = [h for h in row.get("hooks", []) if h.get("command") != older]
         rows[:] = [row for row in rows if row["hooks"]]
         if not any(h.get("command") == command for row in rows for h in row.get("hooks", [])):
-            entry = {"hooks": [{"type": "command", "command": command, "onFailure": "continue"}]}  # see hooks.json
+            entry = {"hooks": [dict({"type": "command", "command": command, "onFailure": "continue"}, **({"timeout": timeout} if timeout else {}))]}  # see hooks.json
             if matcher:
                 entry["matcher"] = matcher
             rows.append(entry)
 
     wire("PreToolUse", GUARD_MATCHER, "guard")
     wire("Stop", None, "stop")
+    wire("StopFailure", STOP_FAILURE_MATCHER, "stop-failure", 300)
     write_file(settings_path, dumps(settings))
     written = [".claude/fast-builder/fb.py", ".claude/settings.json"]
     for path in sorted(globlib.glob(os.path.join(HERE, "..", "agents", "*.md"))):
@@ -3518,7 +3749,7 @@ def build_parser():
 
     p = sub.add_parser("hook", help="called by the plugin's hooks")
     p.set_defaults(func=cmd_hook)
-    p.add_argument("event", choices=["guard", "stop", "session-start"])
+    p.add_argument("event", choices=["guard", "stop", "session-start", "stop-failure"])
 
     p = add("routine-check", cmd_routine_check, help="prove the daemon can reach a routine")
     p.add_argument("--routine-id", required=True)
