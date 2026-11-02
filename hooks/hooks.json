@@ -1,16 +1,16 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook session-start", "timeout": 10 } ] }
+      { "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook session-start", "timeout": 10, "onFailure": "continue" } ] }
     ],
     "PreToolUse": [
       {
-        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task",
-        "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook guard", "timeout": 15 } ]
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Agent|Task",
+        "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook guard", "timeout": 15, "onFailure": "continue" } ]
       }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook stop", "timeout": 15 } ] }
+      { "hooks": [ { "type": "command", "command": "P=python3; case \"$OSTYPE\" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; \"$P\" \"${CLAUDE_PLUGIN_ROOT}/scripts/fb.py\" hook stop", "timeout": 15, "onFailure": "continue" } ] }
     ]
   }
 }

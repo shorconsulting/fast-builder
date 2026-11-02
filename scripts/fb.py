@@ -32,7 +32,6 @@ See docs/protocol.md. Everything is a subcommand: fb.py --help.
 """
 import argparse
 import datetime
-import fcntl
 import glob as globlib
 import hashlib
 import json
@@ -47,8 +46,33 @@ import sys
 import tempfile
 import time
 import uuid
+from xml.sax.saxutils import escape
 
-VERSION = "0.1.7"
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+
+def add_git_settings(env):
+    """For every git from here on, lanes' included: a bus file stays byte for byte what it was, and a deep repo checks out.
+    Added to any the environment already has, and a lane's own fb.py finds these already there."""
+    count = int(env.get("GIT_CONFIG_COUNT") or 0)
+    held = [env.get("GIT_CONFIG_KEY_%d" % i) for i in range(count)]
+    for key, value in (("core.autocrlf", "false"), ("core.longpaths", "true")):
+        if key not in held:
+            env["GIT_CONFIG_KEY_%d" % count], env["GIT_CONFIG_VALUE_%d" % count] = key, value
+            count += 1
+    env["GIT_CONFIG_COUNT"] = str(count)
+
+
+if WINDOWS:
+    add_git_settings(os.environ)
+NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
+DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
+
+VERSION = "0.1.9"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -100,8 +124,12 @@ EFFORTS = {"opus": "high", "sonnet": "medium", "haiku": "low"}
 GO, PAUSE, DRAIN, STOP, LOST, FINISHED = "continue", "pause", "drain", "stop", "lost", "finished"
 EXIT_CODES = {GO: 0, PAUSE: 10, DRAIN: 11, STOP: 20, LOST: 21, FINISHED: 22}
 
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\Z")
-RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,60}\Z")
+# Not a name Windows keeps for a device: nothing named aux or con, with any extension, can be checked out there.
+NOT_A_DEVICE = r"(?!(?:con|prn|aux|nul|com[0-9]|lpt[0-9])\Z)"
+DEVICE_RE = re.compile(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9]|conin\$|conout\$|git~1)\Z")  # git~1 is .git by its short name
+STALE_LOCK_SECONDS = 180  # longer than any git this runs in the bus checkout may take
+NAME_RE = re.compile(r"^" + NOT_A_DEVICE + r"[a-z0-9][a-z0-9-]{0,40}\Z")
+RUN_RE = re.compile(r"^" + NOT_A_DEVICE + r"[a-z0-9][a-z0-9-]{0,60}\Z")
 TRIGGER_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}\Z")
 BUS_TRIGGER_RE = re.compile(r"^trig_[A-Za-z0-9]{24}\Z")  # an id goes into a prompt, so one from the bus gets no room to say anything
 VOLATILE_RE = re.compile(r"\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b|\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}\S*|\b\d{1,2}:\d{2}(?::\d{2})?\b|\b(?:req|msg|toolu|cse|session)_[\w-]+|\b[0-9a-f]{16,}\b", re.I)
@@ -117,6 +145,10 @@ HOOK_LOCK_SECONDS = 4
 
 class FbError(Exception):
     """A failure to report in one line rather than as a traceback."""
+
+
+class BusUnreadable(FbError):
+    """The bus fetched but will not check out here, which a file name Windows cannot hold does for good."""
 
 
 class Taken(FbError):
@@ -153,10 +185,31 @@ def dumps(obj):
     return json.dumps(obj, indent=2, sort_keys=True) + "\n"
 
 
-def run_cmd(args, cwd=None, check=True, timeout=60, env=None):
+def run_cmd_windows(args, cwd, check, timeout, env, stdin_text):
+    """subprocess.run after a timeout waits there for the pipes to close, which ssh or node left holding them never do,
+    so a hook would sit past its own limit and a stop would be lost."""
     try:
-        proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                              universal_newlines=True, timeout=timeout, env=env)
+        proc = subprocess.Popen(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace", env=env,
+                                stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE, **NO_WINDOW)
+    except OSError as exc:
+        raise FbError("cannot run %s: %s" % (args[0], exc))
+    try:
+        stdout, stderr = proc.communicate(stdin_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **NO_WINDOW)
+        raise FbError("timed out: " + " ".join(args[:4]))
+    if check and proc.returncode != 0:
+        raise FbError("%s failed: %s" % (" ".join(args[:4]), (stderr or stdout).strip()[:300]))
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+
+
+def run_cmd(args, cwd=None, check=True, timeout=60, env=None, stdin_text=None):
+    if WINDOWS:
+        return run_cmd_windows(args, cwd, check, timeout, env, stdin_text)
+    feed = {"stdin": subprocess.DEVNULL} if stdin_text is None else {"input": stdin_text}
+    try:
+        proc = subprocess.run(args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=env, **feed, **NO_WINDOW)
     except subprocess.TimeoutExpired:
         raise FbError("timed out: " + " ".join(args[:4]))
     except OSError as exc:
@@ -172,7 +225,7 @@ def git(args, cwd=None, check=True, timeout=60):
 
 def read_json(path, default=None):
     try:
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (OSError, ValueError, RecursionError):
         return default
@@ -181,9 +234,33 @@ def read_json(path, default=None):
 def write_file(path, text):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp = "%s.tmp.%d" % (path, os.getpid())
-    with open(tmp, "w") as handle:
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
-    os.replace(tmp, path)
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows refuses while anything has the file open, which a reader only does for a moment
+            if not WINDOWS or attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
+def windows_cannot_hold(path):
+    """A bus path that git on Windows will never check out, whichever computer pushed it."""
+    for part in path.split("/"):
+        if re.search(r'[<>:"|?*\\\x00-\x1f]', part) or part.endswith((".", " ")) or DEVICE_RE.match(part.split(".")[0].lower()):
+            return True
+    return False
+
+
+def lock_file(handle):
+    """Take this open file's lock, or raise OSError if another process holds it."""
+    if WINDOWS:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def repo_slug(remote):
@@ -332,11 +409,11 @@ class Bus:
         if self.lock_handle:
             return
         os.makedirs(os.path.dirname(self.dir), exist_ok=True)
-        handle = open(self.dir + ".lock", "w")
+        handle = open(self.dir + ".lock", "a")
         end = time.time() + self.lock_seconds
         while True:
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(handle)
                 self.lock_handle = handle
                 return
             except OSError:
@@ -347,6 +424,9 @@ class Bus:
 
     def release(self):
         if self.lock_handle:
+            if WINDOWS:  # closing lets it go too, but only when the system gets to it
+                self.lock_handle.seek(0)
+                msvcrt.locking(self.lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
             self.lock_handle.close()
             self.lock_handle = None
 
@@ -360,6 +440,7 @@ class Bus:
     def sync(self):
         """Bring the cache to the remote's bus branch. False when the branch does not exist yet."""
         self.lock()
+        self.clear_stale_locks()
         if not os.path.isdir(os.path.join(self.dir, ".git")):
             os.makedirs(self.dir, exist_ok=True)
             git(["init", "-q"], cwd=self.dir)
@@ -368,11 +449,27 @@ class Bus:
             return False
         spec = "+refs/heads/%s:refs/remotes/origin/bus" % BUS_BRANCH
         git(["fetch", "-q", "--depth", "50", "origin", spec], cwd=self.dir, timeout=120)
-        git(["checkout", "-q", "-f", "-B", "bus", "refs/remotes/origin/bus"], cwd=self.dir)
+        checkout = git(["checkout", "-q", "-f", "-B", "bus", "refs/remotes/origin/bus"], cwd=self.dir, check=False)
+        if checkout.returncode != 0:
+            names = git(["ls-tree", "-r", "--name-only", "-z", "refs/remotes/origin/bus"], cwd=self.dir, check=False).stdout.split("\0")
+            if WINDOWS and any(windows_cannot_hold(name) for name in names):
+                raise BusUnreadable("the bus holds a file name Windows cannot check out: %s" % ", ".join(n for n in names if windows_cannot_hold(n))[:300])
+            raise FbError("cannot check out the bus: %s" % checkout.stderr.strip()[:300])
         git(["clean", "-qfdx"], cwd=self.dir)
         if any(line.startswith("120000") for line in git(["ls-files", "-s"], cwd=self.dir).stdout.splitlines()):
             raise FbError("refusing a bus with a symlink on it")
         return True
+
+    def clear_stale_locks(self):
+        """A git killed mid-command leaves its lock behind, and every fetch or checkout after it fails, so a stop would never
+        arrive. The bus lock is held here, so no other fb.py is at work, and the age allows for a git a killed hook left running."""
+        for rel in ("index.lock", "shallow.lock", "HEAD.lock", "config.lock", "packed-refs.lock", "refs/heads/bus.lock", "refs/remotes/origin/bus.lock"):
+            full = self.path(".git", *rel.split("/"))
+            try:
+                if time.time() - os.path.getmtime(full) > STALE_LOCK_SECONDS:
+                    os.remove(full)
+            except OSError:
+                pass
 
     def path(self, *parts):
         return os.path.join(self.dir, *parts)
@@ -382,7 +479,7 @@ class Bus:
 
     def read(self, rel, default=None):
         try:
-            with open(self.path(rel)) as handle:
+            with open(self.path(rel), encoding="utf-8") as handle:
                 return handle.read()
         except OSError:
             return default
@@ -806,7 +903,7 @@ def job_errors(job):
 
 def read_text(path):
     try:
-        with open(path) as handle:
+        with open(path, encoding="utf-8") as handle:
             return handle.read()
     except OSError:
         return None
@@ -1089,7 +1186,7 @@ Then read {kit}/docs/lane-lead.md and do what it says. `join` printed the plan a
 
 def lane_prompt(run, lane, account, local=False):
     """The session's first message. A cloud session has no plugin, so it fetches the kit from the bus, trusting the
-    repo's writers. A local lane uses the copy listen-install made, so the bus never gets to run code on this Mac."""
+    repo's writers. A local lane uses the copy listen-install made, so the bus never gets to run code on this computer."""
     if local:
         return LOCAL_BOOTSTRAP.format(run=run, lane=lane, account=account, kit=HOME_DIR)
     return BOOTSTRAP.format(run=run, lane=lane or "<any open lane>", account=account, bus=BUS_BRANCH)
@@ -1173,6 +1270,8 @@ def control_action(session, path):
             session["last_beat"] = time.time()
             save_session(path, session)
         return action
+    except BusUnreadable:  # no blip: it stays this way, and a stop pushed after it could never reach this lane
+        return UNREADABLE
     except FbError:
         return held.get("action", GO)
 
@@ -1180,10 +1279,18 @@ def control_action(session, path):
 # Hooks
 
 
-GUARD_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|Agent|Task"
+UNREADABLE = "bus-unreadable"  # the guard's alone: a tick cannot report it, since it could not read the bus to run
+UNREADABLE_NOTE = ("fast-builder: the bus has a file name Windows cannot check out, so this lane cannot hear a stop or send anything. Stop work "
+                   "and tell a person: the listener's log names the file, and it has to come off the bus. The run itself has not been stopped.")
+GUARD_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell|Agent|Task"
+SHELL_TOOLS = ("Bash", "PowerShell")  # Claude Code can offer PowerShell on Windows with no change on this computer
+# is_simple reads a command as a POSIX shell would. PowerShell ends a string at \" or a curly quote where that sees one going
+# on, and a lone carriage return ends a line there, so a halted lane's PowerShell gets no character that could start
+# another command, quoted or not.
+PLAIN_POWERSHELL = re.compile(r"""^[\w \t.,:=/\\"'-]*\Z""")
 READ_ONLY_BASH = re.compile(r"^\s*(git\s+(status|log|diff|show|fetch)|ls|cat|grep|rg|head|tail|wc|pwd|echo)\b")
-KIT_BASH = re.compile(r"""^\s*python3?\s+(?:"\$FB"|\$FB|"[^"-][^"]*fb\.py"|'[^'-][^']*fb\.py'|(?:[^\s"'-][^\s"']*)?fb\.py)\s""")
-PUSH_BASH = re.compile(r"\bgit\b(?:\s+-\S+(?:\s+\S+)?)*\s+push\b|\bgh\s+pr\s+create\b")
+KIT_BASH = re.compile(r"""^\s*(?:python3?|py(?:\s+-3)?)\s+(?:"\$FB"|\$FB|"[^"-][^"]*fb\.py"|'[^'-][^']*fb\.py'|(?:[^\s"'-][^\s"']*)?fb\.py)\s""")
+PUSH_BASH = re.compile(r"""\bgit(?:\.exe)?\b["']?(?:\s+-\S+(?:\s+\S+)?)*\s+push\b|\bgh(?:\.exe)?\b["']?\s+pr\s+create\b""", re.I)
 
 
 def is_simple(command):
@@ -1203,7 +1310,9 @@ def allowed_when_halted(tool, command):
     """What a stopped or paused lane may still run: reading, and fb.py itself so it can save a handoff and wait."""
     if tool in ("Read", "Grep", "Glob"):
         return True
-    if tool != "Bash" or not is_simple(command):
+    if tool not in SHELL_TOOLS or not is_simple(command):
+        return False
+    if tool == "PowerShell" and not PLAIN_POWERSHELL.match(command):
         return False
     return bool(KIT_BASH.match(command) or READ_ONLY_BASH.match(command))
 
@@ -1219,19 +1328,38 @@ def hook_guard(payload):
     session, path = load_session(cwd)
     if not session:
         return
+    try:
+        guard_lane_call(payload, cwd, session, path)
+    except Exception as exc:
+        if not WINDOWS:
+            raise
+        deny("fast-builder: this call could not be checked, so it is refused: %r" % exc)
+
+
+def odd_windows_path(target):
+    r"""A spelling the checks cannot line up with the repo: \\?\ and \\server forms, a drive with no slash, a rooted
+    path with no drive, and a stream (a.ts:b)."""
+    rest = re.sub(r"^[A-Za-z]:[\\/]", "", target)
+    return rest.startswith(("\\", "/")) or ":" in rest
+
+
+def guard_lane_call(payload, cwd, session, path):
     tool, tool_input = payload.get("tool_name", ""), payload.get("tool_input") or {}
-    command = tool_input.get("command", "") if tool == "Bash" else ""
+    command = tool_input.get("command", "") if tool in SHELL_TOOLS else ""
     action = control_action(session, path)
     if action == FINISHED:
         return
     target = tool_input.get("file_path") or tool_input.get("notebook_path")
     writes = bool(target) and tool in ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    if writes and WINDOWS and odd_windows_path(target):
+        deny("fast-builder: write to this file with a full path that starts with a drive letter, like C:\\repo\\src\\a.ts.")
+        return
     if writes and inside_git_dir(target, cwd, path):
         deny("fast-builder: no edits inside .git: a lane's rules live there.")
         return
     # A halted lane still has to write its handoff somewhere, so a file outside the repo stays open.
-    if action in (STOP, LOST, PAUSE) and not allowed_when_halted(tool, command) and not (writes and repo_relative(target, cwd, path) is None and outside_tree(target, cwd)):
-        deny("fast-builder: run %s says %s. %s %s" % (session["run"], action, INSTRUCTIONS[action], halted_help(action)))
+    if action in (STOP, LOST, PAUSE, UNREADABLE) and not allowed_when_halted(tool, command) and not (writes and repo_relative(target, cwd, path) is None and outside_tree(target, cwd)):
+        deny(UNREADABLE_NOTE if action == UNREADABLE else "fast-builder: run %s says %s. %s %s" % (session["run"], action, INSTRUCTIONS[action], halted_help(action)))
         return
     if action == DRAIN and tool in ("Agent", "Task"):
         deny("fast-builder: run is draining, so no new work. " + INSTRUCTIONS[DRAIN])
@@ -1254,13 +1382,14 @@ def halted_help(action):
     """A lane that chains its handoff or sets $FB in the same command is refused, and then loses the handoff."""
     script = shlex.quote(os.path.abspath(__file__))
     rule = "Only single commands get through now, with no chaining and no $(...). "
+    python = "py -3" if WINDOWS and not os.environ.get("FB_PYTHON") else "python3"  # a listener's lane has its own python3
     if action == LOST:
-        return rule + "Run: python3 %s leave" % script
+        return rule + "Run: %s %s leave" % (python, script)
     if action == PAUSE:
         return (rule + "Write the handoff with the Write tool to a file outside the repo, then run these as separate commands: "
-                "python3 %s handoff FILE, and python3 %s wait --until-resumed --seconds 540." % (script, script))
+                "%s %s handoff FILE, and %s %s wait --until-resumed --seconds 540." % (python, script, python, script))
     return (rule + "Write the handoff with the Write tool to a file outside the repo, then run these as separate commands: "
-            "python3 %s handoff FILE, and python3 %s lane-state stopped." % (script, script))
+            "%s %s handoff FILE, and %s %s lane-state stopped." % (python, script, python, script))
 
 
 def inside_git_dir(target, cwd, session_file):
@@ -1282,6 +1411,8 @@ def repo_relative(target, cwd, session_file):
     full = os.path.realpath(target if os.path.isabs(target) else os.path.join(cwd, target))
     folder = os.path.dirname(full)
     while folder and not os.path.isdir(folder):
+        if os.path.dirname(folder) == folder:  # a drive that is not there is its own parent
+            return None
         folder = os.path.dirname(folder)
     proc = git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], cwd=folder, check=False, timeout=5)
     lines = proc.stdout.split("\n")
@@ -1289,7 +1420,7 @@ def repo_relative(target, cwd, session_file):
         return None
     if os.path.realpath(lines[1]) != os.path.realpath(os.path.dirname(os.path.dirname(session_file))):
         return None
-    return os.path.relpath(full, os.path.realpath(lines[0]))
+    return os.path.relpath(full, os.path.realpath(lines[0])).replace(os.sep, "/")  # lanes own paths written with /
 
 
 def out_of_lane(cwd, session, lanes):
@@ -1381,8 +1512,35 @@ def children_path():
     return os.path.join(HOME_DIR, "children.json")
 
 
+def win_process(pid):
+    """Is this pid running, and since when, as (alive, start), from the Win32 API. os.kill cannot ask: there, signal 0
+    is a Ctrl+C sent to the process, and any other number kills it."""
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel.OpenProcess(0x101000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:  # another user's process counts as not alive, as it does for os.kill elsewhere
+        return False, None
+    try:
+        if kernel.WaitForSingleObject(handle, 0) != 0x102:  # WAIT_TIMEOUT means it has not exited
+            return False, None
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return True, None
+        return True, str(times[0].dwHighDateTime << 32 | times[0].dwLowDateTime)
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def alive(pid):
     """Reaps the pid first: an exited child of this process otherwise still answers signal 0."""
+    if WINDOWS:
+        return win_process(pid)[0]
     try:
         if os.waitpid(pid, os.WNOHANG)[0] == pid:
             return False
@@ -1397,7 +1555,7 @@ def alive(pid):
 
 def work_clone(remote, run, lane, base):
     """A private clone per lane, on the run's base branch: lanes never share a checkout, and no checkout belongs to
-    another Mac user."""
+    another OS user."""
     key = hashlib.sha1(remote.encode()).hexdigest()[:10]
     path = os.path.join(CACHE_DIR, "work", key, "%s-%s" % (run, lane))
     if not os.path.isdir(os.path.join(path, ".git")):
@@ -1411,14 +1569,29 @@ def work_clone(remote, run, lane, base):
 def process_start(pid):
     """When a process began, or None if `ps` cannot say. In UTC and the C locale, so the same process reads the same after
     a change of time zone. The command line would not do: a live CLI claude shows in `ps` as bare `claude`."""
+    if WINDOWS:
+        return win_process(pid)[1]
     try:
         return run_cmd(["ps", "-o", "lstart=", "-p", str(pid)], check=False, timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC")).stdout.strip() or None
     except FbError:
         return None
 
 
+def end_tree(pid):
+    """End a lane and what it started, or raise OSError if that cannot be asked. Whether it worked is for alive() to say."""
+    if not WINDOWS:
+        os.killpg(pid, signal.SIGTERM)
+        return
+    # ponytail: /F because a process with no window has no SIGTERM. /T misses a child whose parent already exited, and a
+    # job object would catch that one if it ever matters.
+    try:
+        run_cmd(["taskkill", "/T", "/F", "/PID", str(pid)], check=False, timeout=30)
+    except FbError as exc:
+        raise OSError(str(exc))
+
+
 def child_state(child):
-    """Is this entry still our process? A pid outlives its process, and a Mac that restarted hands the same numbers out
+    """Is this entry still our process? A pid outlives its process, and a computer that restarted hands the same numbers out
     again, so a live pid alone proves nothing. "gone": dead, or another process with its number, so not ours to touch.
     "ours": the start time recorded at launch still matches. "unsure": alive, but with no recorded time, from an older
     version, or none to read now. That gets no signal, and nothing starts beside it."""
@@ -1448,7 +1621,7 @@ def end_child(key, remote):
     if state == "unsure":
         raise FbError(unsure_note(key, child))
     try:
-        os.killpg(child["pid"], signal.SIGTERM)
+        end_tree(child["pid"])
     except OSError:
         pass
     end = time.time() + LANE_STOP_SECONDS
@@ -1456,6 +1629,33 @@ def end_child(key, remote):
         time.sleep(0.1)
     if alive(child["pid"]):
         raise FbError("its last process, pid %d, will not stop, so no second one was started in its clone" % child["pid"])
+
+
+def claude_call(prompt, *rest):
+    """A claude command, and the prompt if it has to go on stdin. npm's claude.cmd runs through cmd.exe, which ends an
+    argument at a newline and acts on & and |. Windows also finds only an .exe without the full path."""
+    if WINDOWS:
+        found = shutil.which(CLAUDE) or CLAUDE
+        if found.lower().endswith((".cmd", ".bat")) and any(set(arg) & set('&|<>^%"') for arg in [found] + list(rest)):
+            raise FbError("a path here has a character cmd.exe would act on, so npm's claude.cmd cannot be used safely: move the folder, or install claude natively")
+        return [found, "-p"] + list(rest), prompt
+    return [CLAUDE, "-p", prompt] + list(rest), None
+
+
+def console_python():
+    """This Python with a console, since the listener itself runs under pythonw, which prints nothing."""
+    folder, name = os.path.split(sys.executable)
+    return os.path.join(folder, "python.exe") if name.lower() == "pythonw.exe" else sys.executable
+
+
+def lane_env(account):
+    env = dict(os.environ, FB_ACCOUNT=account, FB=os.path.join(HOME_DIR, "fb.py"))
+    if WINDOWS:  # a lane's brief says python3, which there is missing or the Store's stub. Its Bash tool is Git Bash.
+        shim = os.path.join(HOME_DIR, "bin")
+        write_file(os.path.join(shim, "python3"), '#!/bin/sh\nexec "%s" "$@"\n' % console_python().replace("\\", "/"))
+        env["PATH"] = shim + os.pathsep + env.get("PATH", "")
+        env["FB_PYTHON"] = console_python()  # for hooks: this one is known to work, whatever else is installed
+    return env
 
 
 def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
@@ -1471,16 +1671,23 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     bus.sync()
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
     log = open(os.path.join(HOME_DIR, "logs", "%s-%s.log" % (run, lane)), "a")
-    args = [CLAUDE, "-p", lane_prompt(run, lane, account, local=True), "--model", job.get("lane_model", "opus"), "--permission-mode", repo_cfg.get("permission_mode", "auto"),
-            "--permission-prompts", "none", "--name", "fb %s %s" % (run, lane)]
+    rest = ["--model", job.get("lane_model", "opus"), "--permission-mode", repo_cfg.get("permission_mode", "auto"), "--permission-prompts", "none", "--name", "fb %s %s" % (run, lane)]
     if os.path.isdir(plugin_copy()):
-        args += ["--plugin-dir", plugin_copy()]
+        rest += ["--plugin-dir", plugin_copy()]
+    args, prompt = claude_call(lane_prompt(run, lane, account, local=True), *rest)
+    stdin = subprocess.DEVNULL
+    if prompt is not None:
+        stdin = tempfile.TemporaryFile("w+", encoding="utf-8")
+        stdin.write(prompt)
+        stdin.seek(0)
     try:
-        proc = subprocess.Popen(args, cwd=clone, stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=dict(os.environ, FB_ACCOUNT=account, FB=os.path.join(HOME_DIR, "fb.py")), start_new_session=True)
+        proc = subprocess.Popen(args, cwd=clone, stdout=log, stderr=log, stdin=stdin, env=lane_env(account), **DETACHED)
     except OSError as exc:
         raise FbError("cannot start claude: %s" % exc)
     finally:
         log.close()
+        if prompt is not None:
+            stdin.close()
     children = read_json(children_path()) or {}
     children["%s/%s" % (run, lane)] = {"pid": proc.pid, "started": process_start(proc.pid), "remote": bus.remote, "attempt": attempt, "at": now_iso()}
     write_file(children_path(), dumps(children))
@@ -1552,9 +1759,9 @@ def routine_call(trigger, action):
     if not TRIGGER_RE.match(trigger):
         raise FbError("bad routine id")
     prompt = "Use the RemoteTrigger tool once, with action %s and trigger_id %s. Then reply with only the word done." % (action, trigger)
-    args = [CLAUDE, "-p", prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4", "--output-format", "stream-json", "--verbose"]
+    args, stdin_text = claude_call(prompt, "--model", "haiku", "--allowedTools", "RemoteTrigger", "--permission-prompts", "none", "--max-turns", "4", "--output-format", "stream-json", "--verbose")
     os.makedirs(HOME_DIR, exist_ok=True)
-    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120)
+    proc = run_cmd(args, cwd=HOME_DIR, check=False, timeout=120, stdin_text=stdin_text)
     reply = tool_reply(proc.stdout or "", trigger, action)
     if proc.returncode != 0 and reply[0] not in ("200", STEERED):
         raise FbError("could not reach routine %s: %s" % (trigger, exit_note(proc.stdout or "", proc.returncode)))
@@ -1587,7 +1794,7 @@ def routine_owner(trigger, slug):
 
 def routine_roster(bus, account, own=None, first=None):
     """Routine ids to try, this account's own first whatever the bus says, then the row for `first` or this account.
-    Logins get swapped on a Mac user, and a routine belongs to its login, so the bus is what lets any Mac user find the
+    Logins get swapped on an OS user, and a routine belongs to its login, so the bus is what lets any OS user find the
     routine for whoever is signed in now. It can list anything, so no id comes twice, one has to look like a real routine
     id, and the list stops at MAX_ROSTER. Returns the rows and how many it left off."""
     rows, cut, seen = [(account, own)] if own else [], 0, {own}
@@ -1604,11 +1811,11 @@ def routine_roster(bus, account, own=None, first=None):
 
 
 def wake_roster(rows, own, slug, cut=0):
-    """Start the routine of whichever account this Mac user is signed in to, and return (account, routine). `claude
+    """Start the routine of whichever account this OS user is signed in to, and return (account, routine). `claude
     --cloud` needs a real terminal and can stop at interactive dialogs, so a daemon cannot use it. A routine on another
     login answers 404 or 400 and starts nothing, so walking the roster finds the login without trusting a cached profile.
 
-    The bus only suggests ids. `own` came from this Mac user's config and goes first, so a healthy listener tries nothing
+    The bus only suggests ids. `own` came from this OS user's config and goes first, so a healthy listener tries nothing
     from the bus. Any other row must first prove with `get` that it is a listener for this repo, and that routine, not the
     bus, says whose it is. About half a cent of Haiku a call. The third value is False for a steered session: the routine
     started, and nothing else that session said can be relied on."""
@@ -1642,7 +1849,7 @@ def adopt_login(account, routines):
     save_config(config)
 
 
-ROUTINE_HELP = ": this Mac user's claude login owns none of the routines on the bus, see claude auth status, or set this login up once with /fast-builder:listen"
+ROUTINE_HELP = ": this OS user's claude login owns none of the routines on the bus, see claude auth status, or set this login up once with /fast-builder:listen"
 
 
 def roster_help(cut):
@@ -1670,7 +1877,7 @@ def supervise(bus, repo_cfg, account):
                 if time.time() - child["term_at"] > 120:
                     try:
                         if state == "ours":
-                            os.killpg(child["pid"], signal.SIGTERM)
+                            end_tree(child["pid"])
                         else:
                             post_once(bus, run, account, unsure_note(key, child))
                     except (OSError, FbError):
@@ -1877,21 +2084,173 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 </dict>
 </plist>
 """
+# The repeating trigger brings a dead listener back, as launchd and systemd would: RestartOnFailure is only for a task that
+# could not start, and IgnoreNew makes it do nothing while the listener runs.
+TASK = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>fast-builder listener</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger>
+    <TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>PT5M</Interval></Repetition></TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>{python}</Command><Arguments>"{script}" listen</Arguments></Exec></Actions>
+</Task>
+"""
+# KillMode=process: stopping the listener must leave its lanes running, and a systemd default would end them with it.
+UNIT = """[Unit]
+Description=fast-builder listener
+
+[Service]
+ExecStart="{python}" "{script}" listen
+Environment="PATH={path}" "FB_ACCOUNT={account}"
+Restart=always
+RestartSec=30
+KillMode=process
+StandardOutput=append:{log}
+StandardError=append:{log}
+
+[Install]
+WantedBy=default.target
+"""
 LABEL = "com.shorconsulting.fast-builder.listener"
+UNIT_NAME = "fast-builder-listener.service"
 
 
 def plugin_copy():
     return os.path.join(HOME_DIR, "plugin")
 
 
-def plist_path():
-    return os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", LABEL + ".plist")
+def service_file():
+    """Where this operating system's job for the listener is kept."""
+    home = os.path.expanduser("~")
+    if WINDOWS:
+        return os.path.join(HOME_DIR, "listener-task.xml")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "LaunchAgents", LABEL + ".plist")
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "systemd", "user", UNIT_NAME)
+
+
+def task_name():
+    """Scheduled tasks share one list per computer, so each Windows user needs a name of their own."""
+    return "fast-builder-listener-" + re.sub(r"[^\w.-]", "-", os.environ.get("USERNAME", "user"))
+
+
+def git_bash():
+    """Git Bash, which Claude Code runs hooks and Bash in on Windows. Without it they run in PowerShell, which cannot parse
+    the hooks, so every edit would be refused while the PowerShell tool ran on."""
+    usual = [os.path.join(os.environ.get(name, default), "Git", "bin", "bash.exe") for name, default in (("ProgramFiles", r"C:\Program Files"), ("ProgramFiles(x86)", r"C:\Program Files (x86)"))]
+    for path in [os.environ.get("CLAUDE_CODE_GIT_BASH_PATH") or ""] + usual:  # where Claude Code looks first
+        if path and os.path.exists(path):
+            return path
+    folder = os.path.dirname(shutil.which("git") or "")
+    for _ in range(3):  # Git\cmd\git.exe or Git\mingw64\bin\git.exe. WSL's bash in System32 is another thing.
+        path = os.path.join(folder, "bin", "bash.exe")
+        if os.path.exists(path):
+            return path
+        folder = os.path.dirname(folder)
+    return None
+
+
+def windows_problem():
+    """What stops a lane being guarded on this computer, if anything."""
+    if not WINDOWS:
+        return None
+    if not git_bash():
+        return "Git Bash was not found, and lanes need it for their hooks: install Git for Windows, or set CLAUDE_CODE_GIT_BASH_PATH"
+    if any(folder.startswith("\\\\") for folder in (HOME_DIR, CACHE_DIR, os.getcwd())):
+        return "a folder here is on a network share, which the guard cannot check paths on: set FB_HOME and FB_CACHE to a local drive, and clone there"
+    return None
+
+
+def windows_task(python, script, user):
+    folder, name = os.path.split(python)
+    quiet = os.path.join(folder, "pythonw.exe")  # no console window for as long as the listener runs
+    if name.lower() == "python.exe" and os.path.exists(quiet):
+        python = quiet
+    return TASK.format(user=escape(user), python=escape(python), script=escape(script))
+
+
+def systemd_unit(python, script, path, account, log):
+    def plain(text):  # systemd expands % everywhere
+        return text.replace("%", "%%")
+
+    def command(text):  # and $ only in a command
+        return plain(text).replace("$", "$$")
+    return UNIT.format(python=command(python), script=command(script), path=plain(path), account=account, log=plain(log))
+
+
+def service_text(account):
+    script, log = os.path.join(HOME_DIR, "fb.py"), os.path.join(HOME_DIR, "listener.log")
+    claude = shutil.which(CLAUDE) or ""
+    if WINDOWS:
+        user = "%s\\%s" % (os.environ.get("USERDOMAIN", ""), os.environ.get("USERNAME", ""))
+        return windows_task(sys.executable, script, user)
+    if sys.platform == "darwin":
+        path = os.pathsep.join(p for p in [os.path.dirname(claude), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] if p)
+        return PLIST.format(label=LABEL, python=sys.executable, script=script, path=path, account=account, log=log)
+    path = os.pathsep.join(p for p in [os.path.dirname(claude), os.environ.get("PATH", "")] if p)  # a user service starts with almost none
+    return systemd_unit(sys.executable, script, path, account, log)
+
+
+def start_service(text):
+    """Install the listener's job and start it now. A reinstall replaces the old one and leaves its lanes running."""
+    if WINDOWS:
+        if windows_problem():
+            raise FbError(windows_problem())
+        os.makedirs(HOME_DIR, exist_ok=True)
+        with open(service_file(), "w", encoding="utf-16", newline="\r\n") as handle:  # schtasks wants what the XML declares
+            handle.write(text)
+        run_cmd(["schtasks", "/End", "/TN", task_name()], check=False)
+        proc = run_cmd(["schtasks", "/Create", "/TN", task_name(), "/XML", service_file(), "/F"], check=False)
+        if proc.returncode != 0:
+            raise FbError("Task Scheduler refused the listener: %s. If this says access denied, run this once from a terminal opened as administrator." % (proc.stderr or proc.stdout).strip()[:300])
+        run_cmd(["schtasks", "/Run", "/TN", task_name()])
+    elif sys.platform == "darwin":
+        write_file(service_file(), text)
+        domain = "gui/%d" % os.getuid()
+        run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
+        load_listener(domain)
+    else:
+        write_file(service_file(), text)
+        for step in (["daemon-reload"], ["enable", UNIT_NAME], ["restart", UNIT_NAME]):
+            proc = run_cmd(["systemctl", "--user"] + step, check=False)
+            if proc.returncode != 0:
+                raise FbError("systemctl --user %s failed: %s. The listener needs a systemd user session, which WSL only has with systemd on in /etc/wsl.conf." % (step[0], (proc.stderr or proc.stdout).strip()[:300]))
+
+
+def stop_service():
+    if WINDOWS:
+        run_cmd(["schtasks", "/End", "/TN", task_name()], check=False)
+        run_cmd(["schtasks", "/Delete", "/TN", task_name(), "/F"], check=False)
+        if run_cmd(["schtasks", "/Query", "/TN", task_name()], check=False).returncode == 0:
+            raise FbError("the task %s is still there, so run this from a terminal opened as administrator" % task_name())
+    elif sys.platform == "darwin":
+        run_cmd(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], check=False)
+    else:
+        run_cmd(["systemctl", "--user", "disable", "--now", UNIT_NAME], check=False)
+    if os.path.exists(service_file()):
+        os.remove(service_file())
+    if not WINDOWS and sys.platform != "darwin":
+        run_cmd(["systemctl", "--user", "daemon-reload"], check=False)
 
 
 def load_listener(domain):
     """launchd refuses a bootstrap for a moment after a bootout, so a reinstall has to retry."""
     for attempt in range(10):
-        proc = run_cmd(["launchctl", "bootstrap", domain, plist_path()], check=False)
+        proc = run_cmd(["launchctl", "bootstrap", domain, service_file()], check=False)
         if proc.returncode == 0:
             return
         time.sleep(1)
@@ -1914,7 +2273,7 @@ def announce_listener(bus, account, doc, proved=False):
 
 
 def listen_install(args):
-    """Register a repo for this account and install the launchd listener, so it survives reboots and costs no tokens."""
+    """Register a repo for this account and install the listener's background job, so it survives reboots and costs no tokens."""
     account = account_name(args)
     config = load_config()
     same_account = config.get("account") in (None, account)
@@ -1930,7 +2289,7 @@ def listen_install(args):
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
-    if os.path.abspath(__file__) != script:
+    if os.path.abspath(__file__) != os.path.abspath(script):
         shutil.copyfile(os.path.abspath(__file__), script)
     for path in globlib.glob(os.path.join(docs_dir(), "*.md")):
         write_file(os.path.join(HOME_DIR, "docs", os.path.basename(path)), read_text(path))
@@ -1939,17 +2298,12 @@ def listen_install(args):
         # Headless lanes load this copy, so the guard runs even on an account that never installed the plugin.
         shutil.rmtree(plugin_copy(), ignore_errors=True)
         shutil.copytree(root, plugin_copy(), ignore=shutil.ignore_patterns(".git", "__pycache__", "*.zip"))
-    claude = shutil.which(CLAUDE) or ""
-    path = os.pathsep.join(p for p in [os.path.dirname(claude), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] if p)
-    text = PLIST.format(label=LABEL, python=sys.executable, script=script, path=path, account=account, log=os.path.join(HOME_DIR, "listener.log"))
-    out = {"account": account, "repo": slug, "permission_mode": args.permission_mode, "plist": plist_path()}
+    text = service_text(account)
+    out = {"account": account, "repo": slug, "permission_mode": args.permission_mode, "service": service_file()}
     if args.dry_run:
-        out["plist_text"] = text
+        out["service_text"] = text
     else:
-        write_file(plist_path(), text)
-        domain = "gui/%d" % os.getuid()
-        run_cmd(["launchctl", "bootout", domain + "/" + LABEL], check=False)
-        load_listener(domain)
+        start_service(text)
         bus = Bus(remote, account)
         doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "routine": routine, "version": VERSION}
         announce_listener(bus, account, doc, proved=bool(args.routine_id))
@@ -1963,9 +2317,7 @@ def listen_uninstall(args):
         config.get("repos", {}).pop(slug, None)
         save_config(config)
     if not config.get("repos") or args.all:
-        run_cmd(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), LABEL)], check=False)
-        if os.path.exists(plist_path()):
-            os.remove(plist_path())
+        stop_service()
     print(json.dumps({"repos_left": sorted(config.get("repos", {}))}))
 
 
@@ -2094,6 +2446,8 @@ def cmd_publish(args):
 
 
 def cmd_join(args):
+    if windows_problem():
+        raise FbError(windows_problem())
     bus = get_bus(args)
     account = account_name(args)
     bus.account = account
@@ -2394,6 +2748,9 @@ def cmd_settings(args):
 
 
 def cmd_listen(args):
+    if sys.stdout is None:  # pythonw has nowhere to print, and launchd and systemd are told where this goes
+        os.makedirs(HOME_DIR, exist_ok=True)
+        sys.stdout = sys.stderr = open(os.path.join(HOME_DIR, "listener.log"), "a", buffering=1, encoding="utf-8")
     listen_loop(args)
 
 
@@ -2417,6 +2774,14 @@ def cmd_poll(args):
     print("NOTHING")
 
 
+def hook_command(script, name):
+    """python3 on a Windows PC is missing, or the Store's stub that only prints a hint, and a hook that cannot start blocks
+    nothing. Claude Code runs hooks there in Git Bash, which sets OSTYPE. With no Git Bash they run in PowerShell, which
+    cannot parse this and would refuse every tool in every session, not just a lane's, unless onFailure says to continue.
+    join and the listener refuse to start a lane on such a computer."""
+    return 'P=python3; case "$OSTYPE" in msys*|cygwin*) P=${FB_PYTHON:-$(command -v py || echo python)};; esac; "$P" "%s" hook %s' % (script, name)
+
+
 def cmd_hook(args):
     try:
         payload = json.load(sys.stdin)
@@ -2429,7 +2794,7 @@ def cmd_hook(args):
 
 
 def cmd_routine_check(args):
-    """Prove this Mac user's headless claude can reach the routine, which is what a daemon's wake depends on."""
+    """Prove this OS user's headless claude can reach the routine, which is what a daemon's wake depends on."""
     status = ask_routine_api(args.routine_id, "get")
     out({"routine": args.routine_id, "reachable": status == "200", "status": status, "help": "" if status == "200" else ROUTINE_HELP.lstrip(": ")})
     if status != "200":
@@ -2437,7 +2802,7 @@ def cmd_routine_check(args):
 
 
 def cmd_switch(args):
-    """Point this Mac user's listener at the account its claude login now belongs to, after a swap. Names one, or with no
+    """Point this OS user's listener at the account its claude login now belongs to, after a swap. Names one, or with no
     name finds it, by asking which routine on the bus this login can see. The bus only suggests ids: `get` proves this
     login has the routine, and the routine says whose it is. One repo that cannot be read costs that repo, not the switch."""
     config = load_config()
@@ -2492,10 +2857,14 @@ def cmd_install_repo(args):
     hooks = settings.setdefault("hooks", {})
 
     def wire(event, matcher, name):
-        command = 'python3 "$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py" hook %s' % name
+        command = hook_command("$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py", name)
         rows = hooks.setdefault(event, [])
+        older = 'python3 "$CLAUDE_PROJECT_DIR/.claude/fast-builder/fb.py" hook %s' % name
+        for row in rows:
+            row["hooks"] = [h for h in row.get("hooks", []) if h.get("command") != older]
+        rows[:] = [row for row in rows if row["hooks"]]
         if not any(h.get("command") == command for row in rows for h in row.get("hooks", [])):
-            entry = {"hooks": [{"type": "command", "command": command}]}
+            entry = {"hooks": [{"type": "command", "command": command, "onFailure": "continue"}]}  # see hooks.json
             if matcher:
                 entry["matcher"] = matcher
             rows.append(entry)
@@ -2512,7 +2881,9 @@ def cmd_install_repo(args):
 
 
 def cmd_doctor(args):
-    checks = {"git": bool(shutil.which("git")), "python": sys.version.split()[0], "claude": shutil.which(CLAUDE), "gh": bool(shutil.which("gh")), "account": load_config().get("account"), "listener_plist": os.path.exists(plist_path())}
+    checks = {"git": bool(shutil.which("git")), "python": sys.version.split()[0], "claude": shutil.which(CLAUDE), "gh": bool(shutil.which("gh")), "account": load_config().get("account"), "platform": sys.platform, "listener_installed": os.path.exists(service_file())}
+    if WINDOWS:
+        checks["git_bash"] = git_bash()
     try:
         remote = cwd_remote()
         bus = Bus(remote)
@@ -2676,7 +3047,7 @@ def build_parser():
     p.add_argument("--routine-id", required=True)
 
     add("install-repo", cmd_install_repo, help="write the repo-side hooks that cloud sessions need")
-    p = add("switch", cmd_switch, help="point the listener at this Mac user's current claude login")
+    p = add("switch", cmd_switch, help="point the listener at this OS user's current claude login")
     p.add_argument("name", nargs="?", help="the account to switch to (default: find it)")
 
     add("doctor", cmd_doctor, help="check this account's setup")
@@ -2684,6 +3055,9 @@ def build_parser():
 
 
 def main():
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if stream and hasattr(stream, "reconfigure"):  # Windows defaults to its old code page, and pythonw has none of them
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args()
     try:
         args.func(args)

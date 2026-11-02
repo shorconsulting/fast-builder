@@ -1,5 +1,5 @@
 ---
-description: Point this Mac user's listener at the account its claude login now belongs to
+description: Point this OS user's listener at the account its claude login now belongs to
 argument-hint: "[NAME]"
 ---
 
@@ -11,3 +11,5 @@ Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/fb.py" switch $ARGUMENTS` and show t
 `unreachable`. With no name it finds the login by asking which routine on the bus this login can see. It takes a name only
 from the routine's own definition. If it fails, this login has never been set up: follow
 `${CLAUDE_PLUGIN_ROOT}/docs/listen.md` for it once. See "Swapping logins" there.
+
+On Windows, use `py -3` in place of `python3`.
