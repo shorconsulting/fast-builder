@@ -51,6 +51,29 @@ work item rather than within a minute.
 To stop everything with no Claude at hand, add a file named `STOP` to the `fast-builder/bus` branch on GitHub, from a phone
 if you like. `STATUS.md` on that branch shows the state.
 
+### Finding a lane after a takeover
+
+When a lane or the conductor moves to another account, one message names the old account, the new account, the lane and
+how to open it. It shows in `/fast-builder:status`, in `report`, and under a **Who holds what** table at the top of
+`STATUS.md`. That table is the one place that covers every account, and you can bookmark it:
+`https://github.com/OWNER/REPO/blob/fast-builder/bus/STATUS.md`. It can lag the bus by up to 10 minutes, except right after
+a join or a move.
+
+| Where it runs | How to open it | Can it be pinned? |
+|---|---|---|
+| Cloud lane, in a routine | The session link in the table, signed in as that account. Or Routines | No. Routine runs have no sidebar row, and the app refuses to pin one |
+| Local lane, `claude -p` | `open "claude://resume?session=ID"` on that account's login, which adds a row to its sidebar. On Windows, `start` (not tried there) | By hand, on that login, once per takeover: the next account's lane is a new session |
+| Conductor | Nothing of its own: it is a lease, so the table points at the holder's lane | No |
+| A lane you start with `/fast-builder:join` in a desktop session | It is that session | Yes, but a person has to start it, so a takeover cannot do this alone |
+
+Read a local lane's row, but do not type in it while the lane runs. The row shows as idle even while the lane works, and
+a message there starts a second writer on the same session. `claude --desktop --resume ID` refuses a running lane for this
+reason, and works once it has stopped.
+
+To keep the run under Pinned, pin one watch session. In a desktop session in a clone of the repo, on the login you use:
+pin it, then run `/loop 10m /fast-builder:status`. One is enough, since the bus covers every account. It reads the run and
+holds no lease, so if that login runs out of usage the run carries on and `STATUS.md` still works.
+
 ## How it works
 
 Accounts cannot message each other, so the repo is the bus: an orphan branch that holds every run's plan, lane rules,

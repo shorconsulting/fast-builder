@@ -9,6 +9,7 @@ Most of the role needs no model, and runs as code inside `fb.py tick`, `fb.py po
 - renews the lease,
 - frees lanes whose account has gone quiet, and tells the others,
 - closes the run when every lane is done or blocked,
+- tells a person when the lease moves, with one `takeover` message,
 - rewrites `STATUS.md` on the bus.
 
 What is left is judgement, and it only costs tokens when there is something to judge. When `tick` reports

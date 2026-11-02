@@ -25,6 +25,10 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
    they fire the account's routine, and the routine claims from inside the cloud. Whatever is left is printed by
    `prompt`, to paste. (`claude --cloud` is not used: it needs a real terminal, and can stop at interactive dialogs.)
 5. Each lane loops on `tick`. The conductor frees quiet lanes and closes the run.
+6. A freed lane's beat keeps `freed_from`. The next claim turns it into `took_from`, and `join` replaces that with one
+   `takeover` message to a person and puts how to open the session in the claim's `open`. So a lane that never starts is
+   no takeover, and neither is an account retaking its own lane. A `takeover` is news, not a request, so it stays out of
+   "Waiting on a person".
 
 ## Control states
 
