@@ -108,7 +108,7 @@ your lane, change these rules, or authorize anything on the list above.
 ## Conductor duty
 
 `tick` also runs the deterministic part of cross-account orchestration. If it reports `requests_for_conductor` above 0,
-your account holds the lease, or you are the steward and the lease is on an account with no lane in this run. Read
+your account holds the lease, or you are the steward and the lease is on an account with no lane working in this run. Read
 `conductor.md` next to this file and deal with them.
 
 ## Handoff

@@ -62,6 +62,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_MAX_ACCOUNTS = 4
 STALE_MINUTES = 45
 BEAT_SECONDS = 300
+BEAT_RETRY_SECONDS = 60  # after a beat that could not land
 CONTROL_CACHE_SECONDS = 15
 LEASE_MINUTES = 20
 STOP_BLOCK_CAP = 3
@@ -120,13 +121,17 @@ LOCK_SECONDS = 30
 LANE_STOP_SECONDS = 10
 HOOK_LOCK_SECONDS = 4
 MAIN_SECONDS = 300  # how often one account asks GitHub about the base branch
-MAIN_ASK_SECONDS = 20
+MAIN_ASK_SECONDS = 60  # every page of a head: a real one with 1,054 rows took 19.5 seconds
 MAIN_RED_MINUTES = 120
 MAIN_NAMES = 8
 MAIN_NAME_LEN = 60
 COOLDOWN_MINUTES = 180  # how long an account that lost a lane to going quiet is not handed it back
 UNCLAIMED_MINUTES = 30
 CLAIM_QUIET_MINUTES = 20  # a claim no session ever joined: a live one joins in a minute or two
+REQUEST_UNREAD_MINUTES = 60  # a request to the conductor nobody has read: every live lead ticks within 45
+REQUESTS_FILE = "requests.json"
+MAIN_RED = ("failure", "timed_out", "startup_failure")
+MAIN_GREEN = ("success", "neutral", "skipped")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
 
 
@@ -579,7 +584,8 @@ def lost_lane(bus, run, lane, account):
 
 
 def rejoined(bus, run, lane, token):
-    """The files for a session taking a lane its account holds. A beat still saying `claimed` means no session had come."""
+    """The files for a session taking a lane its account holds. A beat still saying `claimed` has not heard from a session
+    of this copy, so its time starts now."""
     files = {"runs/%s/claims/%s.json" % (run, lane): dumps(dict(bus.doc("runs/%s/claims/%s.json" % (run, lane)), session=token))}
     beat = beat_of(bus, run, lane)
     if beat.get("note") == "claimed":
@@ -645,20 +651,41 @@ TRANSITIONS = {
 }
 
 
+def back_on_offer(bus, run):
+    """The files for a person's resume to take a cooldown off every open lane that has one, whichever account and whether
+    it is in freed/ or only in an old copy's beat note. The alert's marker goes too and the beat's time starts over, so
+    a lane still left open tells a person again."""
+    files = {}
+    for name in lane_names(bus, run):
+        if bus.exists("runs/%s/claims/%s.json" % (run, name)):
+            continue
+        rel, beat = "runs/%s/freed/%s.json" % (run, name), beat_of(bus, run, name)
+        held = os.path.isfile(bus.path(rel))
+        if held:
+            files[rel] = None
+        if beat.get("status") == "open" and (held or str(beat.get("note", "")).startswith("freed: ")):
+            files["runs/%s/beats/%s.json" % (run, name)] = dumps(dict(beat, at=now_iso(), note="back on offer after a resume"))
+    return files
+
+
 def set_control(bus, run, state, reason, by):
     """Move a run to state if that is a legal move. pause can never soften a stop, and nothing reopens a finished run.
     Returns whether it moved. A resume also refreshes working lanes' beats: nobody beats while paused, and those lanes
-    must not look dead the moment the run starts again."""
+    must not look dead the moment the run starts again. It takes cooldowns off open lanes too, even on a running run,
+    where that alone counts as moving: it is a lone account's way to have its lane offered again."""
     moved = {}
 
     def mutate():
         current = bus.doc("runs/%s/control.json" % run).get("state", "running")
         moved["ok"] = current in TRANSITIONS[state]
         if not moved["ok"]:
-            if state == "running" and current == "running" and bus.exists("runs/%s/STOP" % run):
-                moved["ok"] = True
-                return {"runs/%s/STOP" % run: None}
-            return {}
+            if state != "running" or current != "running":
+                return {}
+            files = back_on_offer(bus, run)
+            if bus.exists("runs/%s/STOP" % run):
+                files["runs/%s/STOP" % run] = None
+            moved["ok"] = bool(files)
+            return files
         files = {"runs/%s/control.json" % run: dumps({"state": state, "reason": reason, "by": by, "at": now_iso()})}
         if state == "running":
             files["runs/%s/STOP" % run] = None
@@ -667,8 +694,11 @@ def set_control(bus, run, state, reason, by):
                 if beat.get("status") == "stopped":
                     files["runs/%s/claims/%s.json" % (run, name)] = None
                     files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "stopped lane back on offer"})
+                    if os.path.isfile(bus.path("runs/%s/freed/%s.json" % (run, name))):
+                        files["runs/%s/freed/%s.json" % (run, name)] = None
                 elif beat.get("status") == "working":
                     files["runs/%s/beats/%s.json" % (run, name)] = dumps(dict(beat, at=now_iso()))
+            files.update(back_on_offer(bus, run))
         return files
 
     bus.commit(mutate, "control(%s): %s" % (run, state))
@@ -686,9 +716,38 @@ def clean_names(names):
     return out
 
 
+def check_time(text):
+    """A time on a check run in seconds, or None if it cannot be read. No offset means UTC."""
+    try:
+        when = datetime.datetime.fromisoformat(re.sub(r"[Zz]\Z", "+00:00", text))
+        return (when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def standing_checks(rows):
+    """What still stands under each name: a row goes only if another of its name started after it ended. So a re-run
+    replaces what it re-ran. Rows that overlap, tie or have no time to compare all stay, and the worst of them decides:
+    two workflows can share a job name, and the one finishing last says nothing about the other."""
+    def ended(row):
+        return check_time(row.get("completed_at")) if row.get("status") == "completed" else None
+
+    newest = {}
+    for row in rows:
+        began = check_time(row.get("started_at"))
+        began = ended(row) if began is None else began
+        if began is not None:
+            newest[row["name"]] = max(began, newest.get(row["name"], began))
+    return [r for r in rows if ended(r) is None or newest.get(r["name"], ended(r)) <= ended(r)]
+
+
 def main_checks(slug, base, only):
     """What the checks on the base branch's head say: red, green, or None for nothing to go on. REST, because cloud
-    sessions refuse GraphQL. The slug comes from this clone's remote and not from the bus."""
+    sessions refuse GraphQL. The slug comes from this clone's remote and not from the bus.
+
+    Red: a check that stands ended in MAIN_RED. Green: every one that stands ended in MAIN_GREEN, at least one of them
+    a success, and every name in `only` was seen. Anything else says nothing about this head. Raises FbError if gh runs
+    out of time, and every page of a very large head has to fit in that time: look_at_main says so."""
     if not (isinstance(base, str) and SLUG_RE.match(slug) and BRANCH_RE.match(base) and shutil.which("gh")):
         return None
     proc = run_cmd(["gh", "api", "--paginate", "repos/%s/commits/%s/check-runs?per_page=100" % (slug, urllib.parse.quote(base, safe=""))], check=False, timeout=MAIN_ASK_SECONDS)
@@ -699,24 +758,29 @@ def main_checks(slug, base, only):
         page, at = json.JSONDecoder().raw_decode(text, at)
         rows += page["check_runs"]
         at += len(text[at:]) - len(text[at:].lstrip())
-    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("name"), str) and (not only or r["name"] in only)]
+    rows = [r for r in rows if isinstance(r, dict)]
     sha = rows[0].get("head_sha") if rows else None
-    if not (isinstance(sha, str) and SHA_RE.match(sha)):
-        return None
-    done = [r for r in rows if r.get("status") == "completed"]
-    failing = [r["name"] for r in done if r.get("conclusion") in ("failure", "timed_out")]
+    if not (isinstance(sha, str) and SHA_RE.match(sha)) or any(r.get("head_sha") != sha for r in rows):
+        return None  # main moved between two pages, and a reading across commits is of neither. Before `only`, which could hide it
+    rows = standing_checks([r for r in rows if isinstance(r.get("name"), str) and (not only or r["name"] in only)])
+    failing = [r["name"] for r in rows if r.get("status") == "completed" and r.get("conclusion") in MAIN_RED]
     if failing:
         return {"state": "red", "sha": sha, "failing": clean_names(sorted(failing))}
-    if len(done) == len(rows) and any(r.get("conclusion") == "success" for r in done):
+    if (all(r.get("status") == "completed" and r.get("conclusion") in MAIN_GREEN for r in rows) and any(r.get("conclusion") == "success" for r in rows)
+            and all(any(r["name"] == name for r in rows) for name in only)):
         return {"state": "green", "sha": sha, "failing": []}
-    return None  # still running, or only cancelled and skipped: neither says anything about this head
+    return None
 
 
-def look_at_main(bus, run, account):
+def look_at_main(bus, run, account, asked=None):
     """A fresh reading of main if this pass is the one to take it, else None. Outside the commit: a retry must not ask
     again, and gh must not hold the bus checkout. The throttle is a local file, so a reading with no news costs the bus
-    no commit, and a gh that keeps failing costs a tick nothing. Whatever goes wrong here is only an unknown."""
+    no commit, and a gh that keeps failing costs a tick nothing. Whatever goes wrong here is only an unknown, except gh
+    running out of time on every try for as long as main may stay red: that comes back as state `slow`, to tell a person.
+    asked: what this pass has learned about gh, so that a gh that hung once costs the pass that once and not once per run."""
     try:
+        if asked and asked.get("hung"):
+            return None
         lease = bus.doc("runs/%s/conductor.json" % run)
         if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
             return None
@@ -730,7 +794,18 @@ def look_at_main(bus, run, account):
         only = job.get("main_checks")
         only = [c for c in only if isinstance(c, str)] if isinstance(only, list) else []
         bus.release()
-        return main_checks(repo_slug(bus.remote), job.get("base", "main"), only)
+        slow = "%s.slow-%s" % (bus.dir, run)
+        try:
+            seen = main_checks(repo_slug(bus.remote), job.get("base", "main"), only)
+        except FbError:  # counted and not timed: a lease that was away for days must not make one slow answer look like days
+            if asked is not None:
+                asked["hung"] = True
+            tries = (read_json(slow) or 0) + 1
+            write_file(slow, str(tries))
+            return {"state": "slow"} if tries >= MAIN_RED_MINUTES * 60 // MAIN_SECONDS else None
+        if os.path.exists(slow):
+            os.remove(slow)
+        return seen
     except Exception:  # bad JSON, a timeout, anything: a conductor pass must not die from this
         return None
 
@@ -756,6 +831,12 @@ def add_message(files, run, frm, to, kind, body):
 def main_update(bus, run, account, seen):
     """The files a fresh reading of main calls for, from the bus as it now is, so a lost race just works it out again and
     a transition is told once. A note on a change, and one needs-human for each red spell that outlasts the limit."""
+    if seen["state"] == "slow":  # says nothing about main, so main.json stays as it is. The text is the marker
+        body = "Main's checks could not be read within %d seconds on any try for about %d hours, so main stays at its last known state or unknown, and nobody will be told if it goes red. A head with a very large number of check rows does this, as does a gh that hangs. Look at the checks by hand." % (MAIN_ASK_SECONDS, MAIN_RED_MINUTES // 60)
+        files = {}
+        if not any(m.get("body") == body for m in messages_for(bus, run, "human")):
+            add_message(files, run, account, "human", "needs-human", body)
+        return files
     rel = "runs/%s/main.json" % run
     held = bus.doc(rel)
     was = main_view(bus, run)
@@ -790,7 +871,7 @@ def unclaimed_alerts(bus, run, account, files, skip):
         doc = bus.doc(rel)
         if doc.get("told") != beat.get("at"):
             files[rel] = dumps(dict(doc, told=beat.get("at")))
-            add_message(files, run, account, "human", "needs-human", "Lane %s has had no taker for over %d minutes. On another account, /fast-builder:join --lane %s starts it here, or fb.py prompt --lane %s prints a prompt to paste." % (name, UNCLAIMED_MINUTES, name, name))
+            add_message(files, run, account, "human", "needs-human", "Lane %s has had no taker for over %d minutes. On another account, /fast-builder:join --lane %s starts it here, or fb.py prompt --lane %s prints a prompt to paste. An account that lost it to going quiet is not offered it for %d hours, but /fast-builder:join --lane %s on that same account still takes it, and /fast-builder:resume puts it back on offer: with one account, those are the ways out." % (name, UNCLAIMED_MINUTES, name, name, COOLDOWN_MINUTES // 60, name))
 
 
 def hours_left(deadline):
@@ -820,14 +901,67 @@ def overflow_requests(bus, run, account, files, skip):
             add_message(files, run, account, "conductor", "request", body)
 
 
-def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
+def requests_doc(bus, run):
+    """requests.json: which requests to the conductor were read, and which a person was told of. On the bus, because a
+    session's own list of what it has seen reaches nobody else. Anything but a list of ids reads as empty: the worst
+    that does is an extra alert."""
+    doc = bus.doc("runs/%s/%s" % (run, REQUESTS_FILE))
+    return {key: [i for i in doc[key] if isinstance(i, str)] if isinstance(doc.get(key), list) else [] for key in ("read", "told")}
+
+
+def conductor_requests(bus, run, seen=()):
+    """What is asked of the conductor and not yet read by anyone."""
+    skip = set(seen) | set(requests_doc(bus, run)["read"])
+    return [m for m in messages_for(bus, run, "conductor", skip) if m.get("kind") in ("request", "blocker")]
+
+
+def mark_requests_read(bus, run, ids):
+    def mutate():
+        doc = requests_doc(bus, run)
+        new = [i for i in ids if i not in doc["read"]]
+        return {"runs/%s/%s" % (run, REQUESTS_FILE): dumps(dict(doc, read=doc["read"] + new))} if new else {}
+    try:
+        bus.commit(mutate, "read(%s): conductor requests" % run)
+    except FbError:
+        pass  # the reader has them: all this can cost is an alert saying it did not
+
+
+def lane_is_live(bus, run, name):
+    """Whether a session looks to be on this lane: joined, working and beating. A lane marked done still has its claim,
+    and its account's listener still renews the lease, with nobody left to read anything."""
+    beat = beat_of(bus, run, name)
+    return bool(bus.doc("runs/%s/claims/%s.json" % (run, name)).get("session")) and beat.get("status") == "working" and abs(age_minutes(beat.get("at"))) < STALE_MINUTES
+
+
+def unread_requests(bus, run, account, files, skip):
+    """One needs-human when a request to the conductor is reaching nobody: at once if the steward lane is done and this
+    holder has no live lane, else when one has sat unread past the limit, which also covers an old copy's steward that
+    never looks. Its marker lands in the same commit. Ids only: what a lane wrote stays out of a person's status page."""
+    doc = requests_doc(bus, run)
+    waiting = conductor_requests(bus, run, doc["told"])
+    if not waiting:
+        return
+    names = lane_names(bus, run)
+    nobody = any(is_steward(bus, run, n) and beat_of(bus, run, n).get("status") == "done" for n in names) and not any(
+        n not in skip and bus.doc("runs/%s/claims/%s.json" % (run, n)).get("account") == account and lane_is_live(bus, run, n) for n in names)
+    due = waiting if nobody else [m for m in waiting if abs(age_minutes(m.get("at"))) >= REQUEST_UNREAD_MINUTES]
+    if not due:
+        return
+    ids = [m["id"] for m in due]
+    files["runs/%s/%s" % (run, REQUESTS_FILE)] = dumps(dict(doc, told=doc["told"] + ids))
+    why = "The steward lane is done and the lease holder has no lane working, so nobody is left to read it." if nobody else "It has sat unread for over %d minutes." % REQUEST_UNREAD_MINUTES
+    add_message(files, run, account, "human", "needs-human", "%d %s to the conductor unread (%s). %s Read with fb.py inbox --who conductor --mark, or /fast-builder:join --lane the steward to answer." % (
+        len(ids), "request" if len(ids) == 1 else "requests", ", ".join(clean_names(ids)), why))
+
+
+def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     """The deterministic half of the cross-account orchestrator. Needs no model, so a listener can run it too.
 
     Takes or renews the lease; frees lanes whose account went quiet, so another account takes them over; closes
     the run once every lane is done; watches main, unclaimed lanes and lanes done early; rewrites STATUS.md. Returns
     what it did and what needs judgement."""
     report = {"run": run, "holder": None, "freed": [], "finished": False}
-    seen = look_at_main(bus, run, account)
+    seen = look_at_main(bus, run, account, asked)
 
     def mutate():
         files = {}
@@ -852,15 +986,18 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
         if state["action"] == GO:
             for name in _stale(bus, run, stale_minutes):
                 claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
+                limit = quiet_limit(claim, stale_minutes)
+                said = "%s went quiet for over %d minutes" % (claim.get("account"), limit) if claim.get("session") else "%s claimed it, and no session joined within %d minutes" % (claim.get("account"), limit)
                 files.update(lost_lane(bus, run, name, claim.get("account")))
                 files["runs/%s/claims/%s.json" % (run, name)] = None
                 files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "freed: %s went quiet" % claim.get("account")})
-                note = message(account, "all", "note", "Lane %s freed: %s went quiet for over %d minutes." % (name, claim.get("account"), stale_minutes))
+                note = message(account, "all", "note", "Lane %s freed: %s." % (name, said))
                 files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
                 report["freed"].append(name)
             files.update(main)
             unclaimed_alerts(bus, run, account, files, report["freed"])
             overflow_requests(bus, run, account, files, report["freed"])
+            unread_requests(bus, run, account, files, report["freed"])
             statuses = [beat_of(bus, run, n).get("status") for n in names]
             if names and all(s in ("done", "blocked") for s in statuses):
                 blocked = statuses.count("blocked")
@@ -879,12 +1016,17 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
     return report
 
 
+def quiet_limit(claim, stale_minutes):
+    """How long a lane may go without a beat. A claim no session joined gets less. The token is what says so and not the
+    beat's note: an old copy's join sets the token and leaves the note `claimed` until its first tick."""
+    return stale_minutes if claim.get("session") else min(stale_minutes, CLAIM_QUIET_MINUTES)
+
+
 def _stale(bus, run, stale_minutes):
     out = []
     for name in lane_names(bus, run):
         beat = beat_of(bus, run, name)
-        limit = min(stale_minutes, CLAIM_QUIET_MINUTES) if beat.get("note") == "claimed" else stale_minutes
-        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and age_minutes(beat.get("at")) >= limit:
+        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and age_minutes(beat.get("at")) >= quiet_limit(bus.doc("runs/%s/claims/%s.json" % (run, name)), stale_minutes):
             out.append(name)
     return out
 
@@ -1675,6 +1817,21 @@ def end_child(key, remote):
         raise FbError("its last process, pid %d, will not stop, so no second one was started in its clone" % child["pid"])
 
 
+def start_joining_clock(bus, run, lane, account):
+    """A claim's time to be joined starts when a session can start. A first clone can take most of it. Only ever this
+    account's own claim that nobody joined: the clone may have outlasted it."""
+    def mutate():
+        beat = beat_of(bus, run, lane)
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
+        if claim.get("account") != account or claim.get("session") or beat.get("status") != "working":
+            return {}
+        return {"runs/%s/beats/%s.json" % (run, lane): dumps(dict(beat, at=now_iso()))}
+    try:
+        bus.commit(mutate, "beat(%s): %s starting" % (run, lane))
+    except FbError:
+        pass  # only a clock: it must not cost the lane its start
+
+
 def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     """Start a local lane under this account, in its own clone. The prompt is a fixed template: nothing from the bus
     reaches a command line."""
@@ -1686,6 +1843,7 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     end_child("%s/%s" % (run, lane), bus.remote)
     clone = work_clone(bus.remote, run, lane, job.get("base", "main"))
     bus.sync()
+    start_joining_clock(bus, run, lane, account)
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
     log = open(os.path.join(HOME_DIR, "logs", "%s-%s.log" % (run, lane)), "a")
     args = [CLAUDE, "-p", lane_prompt(run, lane, account, local=True), "--model", job.get("lane_model", "opus"), "--permission-mode", repo_cfg.get("permission_mode", "auto"),
@@ -1869,9 +2027,10 @@ def roster_help(cut):
     return ": %d more routines on the bus went untried past the limit of %d, so this login may own one of them: remove the rows that do not belong from listeners/ on the bus, or run /fast-builder:switch NAME" % (cut, MAX_ROSTER)
 
 
-def supervise(bus, repo_cfg, account):
+def supervise(bus, repo_cfg, account, stops_only=False):
     """Restart a local lane whose claude exited with its lane unfinished, up to a cap, and end children of a stopped
-    run after giving them time to write a handoff. Cloud lanes are not children: the conductor covers those."""
+    run after giving them time to write a handoff. Cloud lanes are not children: the conductor covers those.
+    stops_only: just the second half, for before conducting, which must come first for the restarts."""
     children = read_json(children_path()) or {}
     changed = False
     for key, child in list(children.items()):
@@ -1897,7 +2056,7 @@ def supervise(bus, repo_cfg, account):
                 del children[key]
                 changed = True
             continue
-        if running or action != GO:
+        if stops_only or running or action != GO:
             continue
         status = beat_of(bus, run, lane).get("status")
         claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
@@ -2030,10 +2189,12 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     if not sha or (sha == last.get("sha") and not beat_due and not conduct_due and not (read_json(children_path()) or {})):
         return actions
     bus.sync()
-    if conduct_due:  # before supervise: a dead lane it frees must not be restarted there and started again below
+    if conduct_due:  # before restarts: a dead lane it frees must not be restarted there and started again below
+        supervise(bus, repo_cfg, account, stops_only=True)  # and after stops: asking gh can take a minute
+        asked = {}
         for run in active_runs(bus):
             try:
-                report = conduct(bus, run, account)
+                report = conduct(bus, run, account, asked=asked)
             except Exception as exc:  # one bad run must not cost another run's stop
                 actions.append({"did": "conduct-failed", "run": run, "error": repr(exc)[:200]})
                 continue
@@ -2360,12 +2521,12 @@ def is_steward(bus, run, lane):
 
 
 def answers_conductor(bus, session, holder):
-    """Whether this lane reads the conductor's inbox: the lease holder's does, or the steward's when the holder has no lane
-    in this run. A listener holds the lease as long as it runs, even on an account with no usage left, and no session
-    of its own would ever read a request."""
+    """Whether this lane reads the conductor's inbox: the lease holder's does, or the steward's when the holder has no live
+    lane in this run. A listener holds the lease as long as it runs, even on an account with no usage left or whose lane
+    is done, and no session of its own would ever read a request. If both read, the first to mark it read has it."""
     if holder == session["account"]:
         return True
-    return is_steward(bus, session["run"], session["lane"]) and not any(r["account"] == holder for r in lane_table(bus, session["run"]))
+    return is_steward(bus, session["run"], session["lane"]) and not any(r["account"] == holder and lane_is_live(bus, session["run"], r["lane"]) for r in lane_table(bus, session["run"]))
 
 
 def cmd_tick(args):
@@ -2380,7 +2541,7 @@ def cmd_tick(args):
         session["last_beat"] = time.time()
     if result["action"] in (GO, DRAIN):
         report = conduct(bus, session["run"], session["account"])
-        waiting = [m for m in messages_for(bus, session["run"], "conductor", set(session.get("conductor_seen", []))) if m.get("kind") in ("request", "blocker")]
+        waiting = conductor_requests(bus, session["run"], session.get("conductor_seen", []))
         result["conductor"] = report["holder"]
         result["requests_for_conductor"] = len(waiting) if answers_conductor(bus, session, report["holder"]) else 0
         result["freed"] = report["freed"]
@@ -2399,7 +2560,7 @@ def beat_status(bus, session):
     return beat_of(bus, session["run"], session["lane"]).get("status", "working")
 
 
-def write_beat(bus, session, status, note):
+def write_beat(bus, session, status, note, attempts=10):
     """Write the lane's heartbeat, but only while this session still holds the lane: a session that lost it must not
     be able to mark the new holder's lane done."""
     run, lane = session["run"], session["lane"]
@@ -2410,7 +2571,7 @@ def write_beat(bus, session, status, note):
             raise Lost("this session no longer holds lane %s" % lane)
         return {"runs/%s/beats/%s.json" % (run, lane): dumps(doc)}
 
-    bus.commit(mutate, "beat(%s): %s %s" % (run, lane, status))
+    bus.commit(mutate, "beat(%s): %s %s" % (run, lane, status), attempts=attempts)
 
 
 def cmd_lane_state(args):
@@ -2451,9 +2612,14 @@ def cmd_wait(args):
         time.sleep(min(args.poll, max(0.0, end - time.time())))
         try:
             if time.time() - last_beat >= BEAT_SECONDS:  # first: a wake below returns, and a lane that keeps waking must still beat
-                write_beat(bus, session, beat_status_fresh(bus, session), session.get("note", ""))
-                last_beat = session["last_beat"] = time.time()
-                save_session(path, session)
+                try:
+                    write_beat(bus, session, beat_status_fresh(bus, session), session.get("note", ""), attempts=3)
+                    last_beat = session["last_beat"] = time.time()
+                    save_session(path, session)
+                except Lost:
+                    raise
+                except Exception:  # its own try: a beat that cannot land must not cost a stop or a message their wake
+                    last_beat = time.time() - BEAT_SECONDS + BEAT_RETRY_SECONDS
             sha = bus.head()
             if sha != seen:
                 bus.sync()
@@ -2494,11 +2660,14 @@ def cmd_inbox(args):
     bus = get_bus(args)
     bus.sync()
     session, path = load_session()
-    seen = set((session or {}).get("conductor_seen", [])) if args.who == "conductor" else set()
-    got = messages_for(bus, pick_run(bus, args), args.who, seen)
-    if args.mark and session and args.who == "conductor" and got:
-        session["conductor_seen"] = (session.get("conductor_seen", []) + [m["id"] for m in got])[-1000:]
-        save_session(path, session)
+    run = pick_run(bus, args)
+    seen = set((session or {}).get("conductor_seen", [])) | set(requests_doc(bus, run)["read"]) if args.who == "conductor" else set()
+    got = messages_for(bus, run, args.who, seen)
+    if args.mark and args.who == "conductor" and got:
+        if session:
+            session["conductor_seen"] = (session.get("conductor_seen", []) + [m["id"] for m in got])[-1000:]
+            save_session(path, session)
+        mark_requests_read(bus, run, [m["id"] for m in got])
     out(got)
 
 
@@ -2649,8 +2818,9 @@ def cmd_poll(args):
     if not bus.sync():
         print("NOTHING")
         return
+    asked = {}
     for run in active_runs(bus):
-        conduct(bus, run, account)
+        conduct(bus, run, account, asked=asked)
         if run_state(bus, run)["action"] != GO:
             continue
         lane = pick_lane(bus, run, account)

@@ -63,12 +63,14 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   lane when its account goes quiet, closes the run, and answers requests between lanes. It is a lease, not an account, so
   it survives any account running out of usage. Most of it is code: it only spends tokens on a judgement call.
 - **Red main.** The conductor reads the base branch's checks about every 5 minutes with `gh`. Lanes are told when main
-  changes, the steward fixes it first, the rest keep building, and a person hears if it stays red over 2 hours.
+  changes, the steward fixes it first, the rest keep building, and a person hears if it stays red over 2 hours. Green
+  takes every check passing, and a re-run replaces what it re-ran.
 - **Lost lanes.** A lane freed for going quiet does not go back to that account for 3 hours, unless a person names it with
-  `/fast-builder:join --lane`. A claim no session joined is freed after 20 minutes, and a local lane out of restarts at
-  once. A lane left open for 30 minutes tells a person.
+  `/fast-builder:join --lane` or `/fast-builder:resume`. A claim no session joined is freed after 20 minutes, and a local
+  lane out of restarts at once. A lane left open for 30 minutes tells a person.
 - **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
-  the conductor, before it marks itself done, and a lane done early with time left raises a request by itself.
+  the conductor, before it marks itself done, and a lane done early with time left raises a request by itself. A request
+  nobody is left to read, or nobody has read in an hour, tells a person.
 - **Tokens.** `fb.py route` picks the model for every task: Opus for security-sensitive work and design, Sonnet for
   pattern work, Haiku for mechanical work, never Fable. Listening and waiting on CI use no tokens.
 - **Autopilot.** On `full` no lane stops to ask. Reversible decisions are logged under "Decided without you". Deleting
@@ -99,13 +101,20 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - A lead with subagents must loop on `fb.py wait` or it looks quiet too. That is the lead's own instructions, not something
   the tool can enforce: a lead stuck on a foreground subagent in a cloud session without the repo hook beats nothing.
 - Red main is only seen by a lease holder with `gh` logged in. Without one, main reads `unknown`, or stays at its last
-  known state. Only `failure` and `timed_out` count as red. A deadline in free text, such as `Friday`, reads as no deadline.
+  known state. Red is a check ending in `failure`, `timed_out` or `startup_failure`. Green is every check ending in
+  `success`, `neutral` or `skipped`, with at least one success and every name in `main_checks` seen. Anything else,
+  including `cancelled`, `stale`, `action_required` and checks still running, leaves main as it was. Rows sharing a name
+  count one at a time only if the later one started after the earlier one ended; if they overlap, the worst of them
+  stands. A reading across two commits is thrown away. All of a head's pages must arrive in 60 seconds, about 3,000 rows,
+  so a head larger than that reads `unknown`, and a person hears after about 2 hours of it. A deadline in free text, such as `Friday`, reads
+  as no deadline.
 - The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another
   account too, and its old process stays until it ticks or the run stops. With no other account, a person hears at 30 minutes.
 - Nothing restarts a lane marked done, so a request raised for a done lane whose session has ended needs a person.
 - All of this is in the copy of `fb.py` each account runs. A listener gets it at `/fast-builder:listen`, and cloud lanes at
   the next kickoff. While an older copy holds the conductor lease, main goes unwatched and nothing is raised, and an older
-  listener ignores the 3-hour rule.
+  listener ignores the 3-hour rule. An older session reads requests without marking them read, so a person can hear of one
+  it did read.
 - The guard hook sees Claude's tools, and `check-diff` catches a shell edit at push time. It is a guardrail for
   well-meaning builders, not a sandbox: a determined shell command can get past it.
 - Cloud lanes fetch `fb.py` from the bus, because cloud sessions get no user plugins. Local lanes use the copy on the Mac.

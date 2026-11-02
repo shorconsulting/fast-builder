@@ -14,11 +14,14 @@ Most of the role needs no model, and runs as code inside `fb.py tick`, `fb.py po
 - keeps a lane from going back to the account that just lost it to going quiet, for 3 hours, and posts one `needs-human`
   if a lane that was held sits open for 30 minutes,
 - raises one request here for a lane marked done while another is working and over an hour of the deadline is left,
+- posts one `needs-human` for a request nobody has read in an hour, or at once if the steward lane is done and the holder
+  has no lane working,
 - rewrites `STATUS.md` on the bus.
 
 What is left is judgement, and it only costs tokens when there is something to judge. A listener can hold the lease with
-no session of its own, so `tick` reports `requests_for_conductor` to the steward lane when the holder has no lane in the
-run. When it reports above 0, spawn the `cross-orchestrator` agent, or a general-purpose agent with `model: sonnet`,
+no session of its own, or a lane marked done, so `tick` reports `requests_for_conductor` to the steward lane too when the
+holder has no lane working in the run. `--mark` records on the bus that they were read, so one reader is enough. When it
+reports above 0, spawn the `cross-orchestrator` agent, or a general-purpose agent with `model: sonnet`,
 and give it this file and the output of:
 
     python3 "$FB" inbox --who conductor --mark
