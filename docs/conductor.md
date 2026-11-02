@@ -9,6 +9,7 @@ Most of the role needs no model, and runs as code inside `fb.py tick`, `fb.py po
 - renews the lease,
 - frees lanes whose account has gone quiet, and tells the others,
 - closes the run when every lane is done or blocked,
+- tells a person when the lease moves, with one `takeover` message,
 - reads the base branch's checks about every 5 minutes into `main.json`, tells all lanes when main changes, and posts one
   `needs-human` if it stays red over 2 hours,
 - keeps a lane from going back to the account that just lost it to going quiet, for 3 hours, and posts one `needs-human`

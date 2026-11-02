@@ -84,6 +84,7 @@ CLAUDE = os.environ.get("FB_CLAUDE", "claude")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 DEFAULT_MAX_ACCOUNTS = 4
+ROUTE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 STALE_MINUTES = 45
 BEAT_SECONDS = 300
 BEAT_RETRY_SECONDS = 60  # after a beat that could not land
@@ -623,7 +624,7 @@ def lane_table(bus, run):
         rows.append({
             "lane": name, "account": claim.get("account") if claim else None, "status": beat.get("status", "open" if not claim else "claimed"),
             "beat": beat.get("at"), "beat_age_min": None if not beat.get("at") else round(age_minutes(beat["at"]), 1),
-            "note": str(beat.get("note", "")), "where": claim.get("where") if claim else None,
+            "note": str(beat.get("note", "")), "where": claim.get("where") if claim else None, "open": claim.get("open") if claim else None,
         })
     return rows
 
@@ -634,6 +635,27 @@ def make_id(account):
 
 def message(frm, to, kind, body):
     return {"from": frm, "to": to, "kind": kind, "body": body, "at": now_iso()}
+
+
+def open_route(account, where):
+    """How a person opens the session running this, from what the session can see of itself. Text for people, never run."""
+    cloud = os.environ.get("CLAUDE_CODE_REMOTE_SESSION_ID", "")
+    local = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if ROUTE_ID_RE.match(cloud):
+        return "https://claude.ai/code/session_%s, signed in as %s" % (re.sub(r"^(cse|session)_", "", cloud), account)
+    if where == "cloud":
+        return "Routines, the fast-builder listener routine, signed in as %s" % account
+    if ROUTE_ID_RE.match(local):
+        return "open claude://resume?session=%s on %s, to read only while it runs" % (local, account)
+    return "no session id: look on %s" % account
+
+
+def conductor_route(bus, run, holder):
+    """The conductor is a lease, not a session: the nearest thing to open is the holder's own lane in this run."""
+    for row in lane_table(bus, run):
+        if row["account"] == holder and row["open"]:
+            return row["open"]
+    return "nothing to open: it runs in the ticks of %s's listener" % holder
 
 
 def post(bus, run, frm, to, kind, body):
@@ -738,6 +760,9 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
             raise Taken("no open lane in " + run)
         won["lane"] = open_lanes[0]
         doc = {"account": account, "at": now_iso(), "session": token, "where": where or bus.doc("runs/%s/job.json" % run).get("where", "cloud")}
+        took = beat_of(bus, run, won["lane"]).get("freed_from")
+        if took and took != account:
+            doc["took_from"] = took  # join tells a person, so a lane that never starts is no takeover
         beat = {"at": now_iso(), "status": "working", "account": account, "note": "joined" if token else "claimed"}
         return {"runs/%s/claims/%s.json" % (run, won["lane"]): dumps(doc),
                 "runs/%s/beats/%s.json" % (run, won["lane"]): dumps(beat)}
@@ -808,8 +833,9 @@ def set_control(bus, run, state, reason, by, cool_only=False):
             for name in lane_names(bus, run):
                 beat = beat_of(bus, run, name)
                 if beat.get("status") == "stopped":
+                    claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
                     files["runs/%s/claims/%s.json" % (run, name)] = None
-                    files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "stopped lane back on offer"})
+                    files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "stopped lane back on offer", "freed_from": claim.get("took_from") or claim.get("account")})
                     if os.path.isfile(bus.path("runs/%s/freed/%s.json" % (run, name))):
                         files["runs/%s/freed/%s.json" % (run, name)] = None
                 elif beat.get("status") == "working":
@@ -1102,12 +1128,12 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     Takes or renews the lease; frees lanes whose account went quiet, so another account takes them over; closes
     the run once every lane is done; watches main, unclaimed lanes and lanes done early; rewrites STATUS.md. Returns
     what it did and what needs judgement."""
-    report = {"run": run, "holder": None, "freed": [], "finished": False}
+    report = {"run": run, "holder": None, "freed": [], "finished": False, "moved_from": None}
     seen = look_at_main(bus, run, account, asked)
 
     def mutate():
         files = {}
-        report.update(freed=[], finished=False)
+        report.update(freed=[], finished=False, moved_from=None)
         lease = bus.doc("runs/%s/conductor.json" % run)
         report["holder"] = lease.get("holder")
         if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
@@ -1125,6 +1151,10 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
         files["runs/%s/conductor.json" % run] = dumps({"holder": account, "at": now_iso()})
         state = run_state(bus, run)
         names = lane_names(bus, run)
+        if lease.get("holder") not in (None, account) and state["action"] == GO:
+            report["moved_from"] = lease["holder"]
+            note = message(account, "human", "takeover", "Conductor of %s moved from %s to %s. Open it: %s." % (run, lease["holder"], account, conductor_route(bus, run, account)))
+            files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
         if state["action"] == GO:
             for name in _stale(bus, run, stale_minutes):
                 claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
@@ -1132,7 +1162,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
                 said = "%s went quiet for over %d minutes" % (claim.get("account"), limit) if claim.get("session") else "%s claimed it, and no session joined within %d minutes" % (claim.get("account"), limit)
                 files.update(lost_lane(bus, run, name, claim.get("account")))
                 files["runs/%s/claims/%s.json" % (run, name)] = None
-                files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "freed: %s went quiet" % claim.get("account")})
+                files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "freed: %s went quiet" % claim.get("account"), "freed_from": claim.get("took_from") or claim.get("account")})
                 note = message(account, "all", "note", "Lane %s freed: %s." % (name, said))
                 files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
                 report["freed"].append(name)
@@ -1155,6 +1185,8 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
         return files
 
     bus.commit(mutate, "conduct(%s): %s" % (run, account))
+    if report["moved_from"] or report["freed"]:  # the page above was written before this commit, so it still has the old holders
+        bus.commit(lambda: {"STATUS.md": render_status(bus)}, "status: %s" % run)
     return report
 
 
@@ -1173,12 +1205,37 @@ def _stale(bus, run, stale_minutes):
     return out
 
 
+def recent_takeovers(bus, run):
+    return [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "takeover"][-5:]
+
+
+def render_holders(bus, runs):
+    """Who holds what now, and how to open it, because a takeover in a routine is otherwise only under Routines."""
+    table, moved = [], []
+    for run in runs:
+        if run_state(bus, run)["state"] in ("finished", "stopped"):
+            continue
+        lease = bus.doc("runs/%s/conductor.json" % run)
+        holder = lease.get("holder")
+        if holder:
+            late = " (lease lapsed)" if age_minutes(lease.get("at")) >= LEASE_MINUTES else ""
+            table.append((run, "conductor", "%s%s" % (holder, late), conductor_route(bus, run, holder)))
+        table += [(run, row["lane"], row["account"] or "-", row["open"] or "-") for row in lane_table(bus, run)]
+        moved += recent_takeovers(bus, run)
+    if not table:
+        return []
+    lines = ["## Who holds what", "", "| Run | Role | Account | Open it |", "|---|---|---|---|"]
+    lines += ["| %s |" % " | ".join(str(cell).replace("|", "/") for cell in row) for row in table]
+    return lines + ([""] + ["Latest takeovers:"] + ["- %s" % body for body in moved] if moved else []) + [""]
+
+
 def render_status(bus, fresh=None):
     """fresh: main.json docs this very commit is about to write, by run."""
     lines = ["# fast-builder status", "", "Updated %s." % now_iso(), ""]
     if bus.exists("STOP"):
         lines += ["**STOP is set: every run is stopping.**", ""]
     runs = list_runs(bus)
+    lines += render_holders(bus, runs[-6:])
     for run in runs[-6:]:
         job = bus.doc("runs/%s/job.json" % run)
         state = run_state(bus, run)
@@ -2420,8 +2477,10 @@ def release_lane(bus, run, lane, account, reason, cool=False):
     text = "Could not start lane %s: %s" % (lane, reason)
 
     def mutate():
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
+        took = claim.get("took_from") or (account if claim.get("session") else None)  # with no session it never ran here, so it stays whose it was
         files = {"runs/%s/claims/%s.json" % (run, lane): None,
-                 "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200]})}
+                 "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200], "freed_from": took})}
         if cool:
             files.update(lost_lane(bus, run, lane, account))
         if not any(m.get("body") == text for m in messages_for(bus, run, "human")):  # a lane refused all day is one blocker
@@ -2893,6 +2952,24 @@ def cmd_publish(args):
          "listeners": [n[:-5] for n in bus.listdir("listeners")]})
 
 
+def announce_join(bus, run, lane, account, token, route):
+    """Put how to open this session on the claim, and if the lane came from another account, tell a person once."""
+    rel = "runs/%s/claims/%s.json" % (run, lane)
+
+    def mutate():
+        doc = dict(bus.doc(rel))
+        if doc.get("session") != token:
+            return {}
+        took = doc.pop("took_from", None)
+        files = {rel: dumps(dict(doc, open=route))}
+        if took:
+            note = message(account, "human", "takeover", "Lane %s of %s moved from %s to %s. Open it: %s." % (lane, run, took, account, route))
+            files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
+        return files
+    bus.commit(mutate, "joined(%s): %s" % (run, lane))
+    bus.commit(lambda: {"STATUS.md": render_status(bus)}, "status: %s" % run)
+
+
 def cmd_join(args):
     if windows_problem():
         raise FbError(windows_problem())
@@ -2917,6 +2994,7 @@ def cmd_join(args):
     path = session_path()
     if not path:
         raise FbError("join from inside a clone of the repo")
+    announce_join(bus, run, lane, account, token, open_route(account, claim.get("where")))
     save_session(path, {"run": run, "lane": lane, "account": account, "remote": bus.remote, "autopilot": job.get("autopilot"), "base": job.get("base", "main"), "joined": now_iso(), "token": token})
     write_file(os.path.join(os.path.dirname(path), "lanes.json"), dumps(lanes_of(bus, run)))
     print("JOINED run=%s lane=%s account=%s where=%s autopilot=%s" % (run, lane, account, claim.get("where"), job.get("autopilot")))
@@ -3153,7 +3231,8 @@ def cmd_status(args):
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
                        "main": main_view(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
-                       "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
+                       "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"],
+                       "takeovers": recent_takeovers(bus, run)})
     out({"runs": report, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
 
 
@@ -3171,6 +3250,8 @@ def cmd_report(args):
     print("\n".join("- %s: %s" % (m["from"], m["body"]) for m in decisions) or "None.")
     print("\n## Waiting on a person\n")
     print("\n".join("- %s: %s" % (m["from"], m["body"]) for m in human) or "Nothing.")
+    print("\n## Moved between accounts\n")
+    print("\n".join("- %s" % m["body"] for m in all_msgs if m.get("kind") == "takeover") or "Nothing.")
 
 
 def cmd_prompt(args):

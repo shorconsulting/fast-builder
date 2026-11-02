@@ -710,6 +710,110 @@ class BusTests(World):
         bravo = self.j("bravo", "conduct", "--run", "hph-10-30-26")
         self.assertEqual(bravo["holder"], "alpha")
 
+    def age_lease(self, holder):
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "runs/hph-10-30-26/conductor.json"), "w") as handle:
+            json.dump({"holder": holder, "at": "2020-01-01T00:00:00Z"}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "old lease"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "fast-builder/bus"], cwd=phone)
+
+    def takeovers(self, account="alpha"):
+        return self.j(account, "status")["runs"][0]["takeovers"]
+
+    def test_a_retaken_lane_tells_a_person_once_who_has_it_and_how_to_open_it(self):
+        self.publish()
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.assertIn("money", self.j("alpha", "conduct", "--run", "hph-10-30-26", "--stale-minutes", "0")["freed"])
+        self.assertEqual(self.takeovers(), [])
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE_SESSION_ID": "cse_abc"}):
+            self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
+            self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
+        moved = self.takeovers()
+        self.assertEqual(len(moved), 1, moved)
+        for word in ("money", "from bravo", "to charlie", "https://claude.ai/code/session_abc"):
+            self.assertIn(word, moved[0])
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["needs_human"], [])
+        page = self.fb("alpha", "status", "--human").stdout
+        self.assertLess(page.index("## Who holds what"), page.index("## hph-10-30-26"))
+        self.assertIn("| hph-10-30-26 | money | charlie | https://claude.ai/code/session_abc, signed in as charlie |", page)
+        self.assertIn("Moved between accounts", self.fb("alpha", "report", "--run", "hph-10-30-26").stdout)
+
+    def test_the_status_page_on_the_bus_has_the_new_holder_at_once(self):
+        self.publish()
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.fb("alpha", "conduct", "--run", "hph-10-30-26")
+        self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.age_lease("alpha")
+        self.fb("bravo", "conduct", "--run", "hph-10-30-26")
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "STATUS.md")) as handle:
+            page = handle.read()
+        self.assertIn("| hph-10-30-26 | conductor | bravo |", page)
+        self.assertIn("Conductor of hph-10-30-26 moved from alpha to bravo", page)
+
+    def test_a_lane_retaken_by_its_own_account_is_no_takeover(self):
+        self.publish()
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.j("alpha", "conduct", "--run", "hph-10-30-26", "--stale-minutes", "0")
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.assertEqual(self.takeovers(), [])
+
+    def test_a_listener_that_never_started_the_lane_is_not_named_as_its_owner(self):
+        self.publish()
+        self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.j("bravo", "conduct", "--run", "hph-10-30-26", "--stale-minutes", "0")
+        failed_start = "import fb; bus = fb.Bus(%r, 'charlie'); bus.sync(); fb.claim_lane(bus, 'hph-10-30-26', 'charlie', 'money'); fb.release_lane(bus, 'hph-10-30-26', 'money', 'charlie', 'no clone')" % self.remote
+        subprocess.run([sys.executable, "-c", failed_start], cwd=HERE, env=self.env("charlie"), check=True)
+        self.fb("delta", "join", "--run", "hph-10-30-26", "--lane", "money")
+        moved = self.takeovers("delta")
+        self.assertEqual(len(moved), 1, moved)
+        self.assertIn("from bravo to delta", moved[0])
+
+    def test_a_lane_given_back_after_its_session_ran_names_the_account_that_ran_it(self):
+        self.publish()
+        self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        gave_back = "import fb; bus = fb.Bus(%r, 'bravo'); bus.sync(); fb.release_lane(bus, 'hph-10-30-26', 'money', 'bravo', 'kept exiting', cool=True)" % self.remote
+        subprocess.run([sys.executable, "-c", gave_back], cwd=HERE, env=self.env("bravo"), check=True)
+        self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.assertIn("from bravo to charlie", self.takeovers("charlie")[0])
+
+    def test_a_moved_lease_tells_a_person_once_and_points_at_the_holders_lane(self):
+        self.publish(where="local")
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.fb("alpha", "conduct", "--run", "hph-10-30-26")
+        self.assertEqual(self.takeovers(), [])
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abc-123"}):
+            self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.assertEqual(self.j("bravo", "conduct", "--run", "hph-10-30-26")["holder"], "alpha")
+        self.age_lease("alpha")
+        self.assertEqual(self.j("bravo", "conduct", "--run", "hph-10-30-26")["moved_from"], "alpha")
+        self.j("bravo", "conduct", "--run", "hph-10-30-26")
+        moved = self.takeovers()
+        self.assertEqual(len(moved), 1, moved)
+        self.assertIn("from alpha to bravo", moved[0])
+        self.assertIn("claude://resume?session=abc-123", moved[0])
+
+    def test_a_lease_taken_with_no_lane_says_there_is_nothing_to_open(self):
+        self.publish()
+        self.fb("alpha", "conduct", "--run", "hph-10-30-26")
+        self.age_lease("alpha")
+        self.fb("bravo", "conduct", "--run", "hph-10-30-26", "--remote", self.remote)
+        self.assertIn("nothing to open", self.takeovers("bravo")[0])
+
+    def test_a_run_that_is_over_leaves_the_holders_table_and_says_nothing_about_its_lease(self):
+        self.publish(accounts=1)
+        self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
+        self.fb("alpha", "lane-state", "done")
+        self.assertTrue(self.j("alpha", "conduct", "--run", "hph-10-30-26")["finished"])
+        self.age_lease("alpha")
+        self.fb("bravo", "conduct", "--run", "hph-10-30-26", "--remote", self.remote)
+        self.assertEqual(self.takeovers("bravo"), [])
+        self.assertNotIn("Who holds what", self.fb("bravo", "status", "--human", "--remote", self.remote).stdout)
+
     def test_run_finishes_when_every_lane_is_done(self):
         self.publish()
         self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
