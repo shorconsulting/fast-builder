@@ -45,6 +45,7 @@ sizes. Then make it right:
 - Each lane should be a coherent domain with few reasons to touch another's files. HPH's split: identity and tenancy,
   commerce, clinical, engagement.
 - Rename lanes after their domain. Give each one `modules`.
+- Size each lane to outlast the deadline. A lane that clears its list early is an account doing nothing.
 - `steward: true` on exactly one lane. It owns everything unclaimed, main going red, CI machinery and shared config.
 - Give generated files, lockfiles and other things every lane regenerates to `shared_ok`.
 - Keep `digits`: each lane's last digits for migration or other sequence numbers.
@@ -61,6 +62,12 @@ This writes `lanes/<lane>.md` and the plan, named like `HPH-10-30-26-orchestrati
 in both. For each lane the plan must let someone start cold, module by module: current state, requirements and where they
 live, binding decisions, open PRs and issues, traps, and the first three slices. Numbers come with the commit they were
 read at. Where a question is open, write the default to build.
+
+Fill `## Overflow` too, and `validate` refuses a plan without it: what each lane takes next if it clears its list, lane by
+lane. It is what a lane reads before it marks itself done.
+
+A deadline the conductor can use is an ISO date or time, such as `2026-11-03T18:00Z`. If only some of the repo's checks say
+whether main is healthy, list their names as `main_checks` in `job.json`. Otherwise any failed check on main counts.
 
 ## 5. Validate and publish
 
