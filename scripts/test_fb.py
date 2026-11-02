@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """End-to-end tests. Each account is a separate FB_HOME and FB_CACHE (and clone) against a local bare remote, so what
 passes here passed through real git pushes and real races. A shim stands in for the claude binary."""
+import atexit
 import concurrent.futures
 import glob
 import json
@@ -14,7 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest import mock
+import unittest.mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FB = os.path.join(HERE, "fb.py")
@@ -64,6 +65,41 @@ if not answer.get("no_tool"):
     print(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "RemoteTrigger", "input": {"action": action, "trigger_id": trigger}}]}}))
     print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "HTTP %s\n%s" % (status, json.dumps(body)), "is_error": answer.get("is_error", False)}]}}))
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": answer.get("reply", "done")}))
+"""
+
+
+# Stands in for gh, so no test reaches GitHub. Answers from FB_GH_TABLE, as gh api does for check-runs: `raw` prints that
+# instead, `fail` exits 1, `sleep` waits first, and no table at all also fails, as a gh with no login does. Every call
+# goes in FB_GH_LOG, and what it finds the caller holding and having done in FB_GH_LOG.probe.
+GH_SHIM = r"""#!/usr/bin/env python3
+import fcntl, glob, json, os, sys, time
+with open(os.environ["FB_GH_LOG"], "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\n")
+locked = False  # what the pass calling gh holds, and has done, by the time gh runs
+for path in glob.glob(os.path.join(os.environ.get("FB_CACHE", ""), "bus", "*.lock")):
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            locked = True
+try:
+    children = json.load(open(os.path.join(os.environ.get("FB_HOME", ""), "children.json")))
+except (OSError, ValueError):
+    children = {}
+with open(os.environ["FB_GH_LOG"] + ".probe", "a") as log:
+    log.write(json.dumps({"locked": locked, "children": children}) + "\n")
+try:
+    table = json.load(open(os.environ["FB_GH_TABLE"]))
+except OSError:
+    sys.exit(1)
+time.sleep(table.get("sleep", 0))
+if table.get("fail"):
+    sys.exit(1)
+if "raw" in table:
+    print(table["raw"])
+    sys.exit(0)
+rows = [dict(r, head_sha=table.get("sha", "a" * 40)) for r in table.get("runs", [])]
+print(json.dumps({"total_count": len(rows), "check_runs": rows}))
 """
 
 
@@ -119,6 +155,13 @@ class World(unittest.TestCase):
         self.shim_log = os.path.join(self.root, "shim.log")
         self.shim_table = os.path.join(self.root, "routines.json")
         self.more_env = {}
+        self.gh_bin = os.path.join(self.root, "gh-bin")
+        os.makedirs(self.gh_bin)
+        with open(os.path.join(self.gh_bin, "gh"), "w") as handle:
+            handle.write(GH_SHIM)
+        os.chmod(os.path.join(self.gh_bin, "gh"), 0o755)
+        self.gh_log = os.path.join(self.root, "gh.log")
+        self.gh_table = os.path.join(self.root, "gh.json")
 
     def tearDown(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -126,7 +169,9 @@ class World(unittest.TestCase):
     def env(self, account):
         home = os.path.join(self.root, "accounts", account)
         os.makedirs(home, exist_ok=True)
-        return dict(os.environ, FB_HOME=os.path.join(home, "cfg"), FB_CACHE=os.path.join(home, "cache"), FB_ACCOUNT=account, FB_CLAUDE=self.shim, FB_SHIM_LOG=self.shim_log, FB_SHIM_TABLE=self.shim_table, HOME=home, **self.more_env)
+        env = dict(os.environ, FB_HOME=os.path.join(home, "cfg"), FB_CACHE=os.path.join(home, "cache"), FB_ACCOUNT=account, FB_CLAUDE=self.shim, FB_SHIM_LOG=self.shim_log, FB_SHIM_TABLE=self.shim_table, HOME=home, FB_GH_LOG=self.gh_log, FB_GH_TABLE=self.gh_table, **self.more_env)
+        env["PATH"] = self.gh_bin + os.pathsep + env["PATH"]
+        return env
 
     def clone(self, account):
         path = os.path.join(self.root, "accounts", account, "repo")
@@ -683,7 +728,7 @@ class BusTests(World):
         self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
         self.assertIn("money", self.j("alpha", "conduct", "--run", "hph-10-30-26", "--stale-minutes", "0")["freed"])
         self.assertEqual(self.takeovers(), [])
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE_SESSION_ID": "cse_abc"}):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE_SESSION_ID": "cse_abc"}):
             self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
             self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
         moved = self.takeovers()
@@ -728,12 +773,20 @@ class BusTests(World):
         self.assertEqual(len(moved), 1, moved)
         self.assertIn("from bravo to delta", moved[0])
 
+    def test_a_lane_given_back_after_its_session_ran_names_the_account_that_ran_it(self):
+        self.publish()
+        self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
+        gave_back = "import fb; bus = fb.Bus(%r, 'bravo'); bus.sync(); fb.release_lane(bus, 'hph-10-30-26', 'money', 'bravo', 'kept exiting', cool=True)" % self.remote
+        subprocess.run([sys.executable, "-c", gave_back], cwd=HERE, env=self.env("bravo"), check=True)
+        self.fb("charlie", "join", "--run", "hph-10-30-26", "--lane", "money")
+        self.assertIn("from bravo to charlie", self.takeovers("charlie")[0])
+
     def test_a_moved_lease_tells_a_person_once_and_points_at_the_holders_lane(self):
         self.publish(where="local")
         self.fb("alpha", "join", "--run", "hph-10-30-26", "--lane", "core")
         self.fb("alpha", "conduct", "--run", "hph-10-30-26")
         self.assertEqual(self.takeovers(), [])
-        with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abc-123"}):
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "abc-123"}):
             self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
         self.assertEqual(self.j("bravo", "conduct", "--run", "hph-10-30-26")["holder"], "alpha")
         self.age_lease("alpha")
@@ -1531,7 +1584,7 @@ class Listener(World):
         self.until(self.calls)
         time.sleep(1.5)  # time for a second lane to log, if a second was started
         self.assertEqual(len([c for c in self.calls() if "account orchestrator" in c]), 1, self.calls())
-        self.assertEqual(list(json.load(open(path))), [run + "/" + lane])
+        self.assertEqual(list(json.load(open(path))), [run + "/money"], "the other lane: this account just lost that one")
 
     def test_a_failing_claude_posts_one_blocker(self):
         """Re-review B. Fresh ids open stdout on a real failing exit, so the old text differed every time."""
@@ -1827,6 +1880,39 @@ class Listener(World):
         sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "stale"], cwd=phone)
         sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
 
+    def freed_and_cooled_off(self, run, lane):
+        """Conduct frees a quiet lane, and three hours on its old account may have it again: the only way back to a
+        lane it lost, so the only way a listener now replaces its own hung process."""
+        self.assertIn(lane, self.j("bravo", "conduct", "--run", run, "--remote", self.remote)["freed"])
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        with open(os.path.join(phone, "runs", run, "beats", lane + ".json"), "w") as handle:
+            json.dump({"at": fb.now_iso(), "status": "open", "account": None, "note": ""}, handle)
+        with open(os.path.join(phone, "runs", run, "freed", lane + ".json"), "w") as handle:
+            json.dump({"lost": {"bravo": "2026-01-01T00:00:00Z"}}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "cooled"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def test_a_hung_lane_stays_away_from_the_account_that_lost_it(self):
+        """Freed in the pass that noticed, and that account takes another lane instead. The old process is not signalled:
+        it hears it lost the lane at its next tick, and a stop still ends it."""
+        self.answers({"lane_sleep": 60})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        path = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        key, first = list(json.load(open(path)).items())[0]
+        self.addCleanup(self.kill, first["pid"])
+        self.stale_beat(*key.split("/"))
+        self.fb("bravo", "listen", "--once")
+        children = json.load(open(path))
+        self.addCleanup(self.kill, children["hph-10-30-26/money"]["pid"])
+        self.assertEqual(children[key]["pid"], first["pid"])
+        self.assertTrue(self.running(first["pid"]))
+        lanes = {r["lane"]: r["account"] for r in self.j("alpha", "status")["runs"][0]["lanes"]}
+        self.assertEqual(lanes, {"core": None, "money": "bravo"})
+
     def hung_lane(self, ignore_term, started=True):
         """A local lane whose beat is stale, whose process is alive and hung, on a listener holding the lease."""
         self.register("bravo")
@@ -1842,6 +1928,7 @@ class Listener(World):
         with open(path, "w") as handle:
             json.dump(children, handle)
         self.stale_beat(run, lane)
+        self.freed_and_cooled_off(run, lane)
         open(self.shim_log, "w").close()
         self.fb("bravo", "listen", "--once")
         return path, key, pid
@@ -1922,6 +2009,7 @@ class Listener(World):
         self.assertEqual(first["started"], fb.process_start(first["pid"]))
         self.assertTrue(first["started"])
         self.stale_beat(*key.split("/"))
+        self.freed_and_cooled_off(*key.split("/"))
         self.fb("bravo", "listen", "--once")
         again = json.load(open(path))[key]
         self.addCleanup(self.kill, again["pid"])
@@ -2018,10 +2106,10 @@ class Listener(World):
         self.fb("bravo", "listen", "--once")
         self.j("bravo", "conduct", "--run", "hph-10-30-26", "--stale-minutes", "0")
         cfg = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
-        self.fb("bravo", "listen", "--once")  # takes one of the two lanes a zero stale limit just freed
+        self.fb("bravo", "listen", "--once")  # takes alpha's lane; a zero stale limit also freed bravo's own, which it does not take back
         self.fb("bravo", "listen", "--once")
         held = {r["lane"]: r["account"] for r in self.j("alpha", "status")["runs"][0]["lanes"]}
-        self.assertEqual(set(held.values()), {"bravo"}, held)
+        self.assertEqual(held, {"core": "bravo", "money": None})
         self.assertTrue(os.path.exists(cfg))
 
     def test_a_failed_local_start_gives_the_lane_back_and_tells_a_person(self):
@@ -2137,6 +2225,1548 @@ class Listener(World):
         self.fb("bravo", "listen", "--once", check=False)
         log = open(self.shim_log).read() if os.path.exists(self.shim_log) else ""
         self.assertNotIn("rm -rf", log)
+
+
+RUN = "hph-10-30-26"
+OLD = "2026-01-01T00:00:00Z"
+
+
+def ago(minutes):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - minutes * 60))
+
+
+def failed(name="ci"):
+    return {"name": name, "status": "completed", "conclusion": "failure"}
+
+
+def passed(name="ci"):
+    return {"name": name, "status": "completed", "conclusion": "success"}
+
+
+NOT_RUN = []  # a skip reads as nothing in the summary, and these are what stands between a live run and a new copy
+
+
+def say_what_did_not_run():
+    if NOT_RUN:
+        print("DID NOT RUN, needing old copy a4ead91b that this clone does not have (shallow? git fetch --unshallow, then run them): %s" % ", ".join(NOT_RUN), file=sys.stderr)
+
+
+atexit.register(say_what_did_not_run)
+
+
+class Hardening(World):
+    def setUp(self):
+        super().setUp()
+        self.publish()
+        self.fb("alpha", "join", "--run", RUN, "--lane", "core")
+        self.fb("bravo", "join", "--run", RUN, "--lane", "money")
+
+    def checks(self, *runs, **table):
+        with open(self.gh_table, "w") as handle:
+            json.dump(dict(table, runs=list(runs)), handle)
+
+    def gh_calls(self):
+        return [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
+
+    def due(self, account="alpha"):
+        """Five minutes on, as far as this account's throttle goes."""
+        for mark in glob.glob(os.path.join(self.env(account)["FB_CACHE"], "bus", "*.main-*")):
+            os.remove(mark)
+
+    def edit(self, files):
+        """Write to the bus as a person or another copy of the tool would. A value of None removes the file."""
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        for rel, doc in files.items():
+            full = os.path.join(phone, "runs", RUN, rel)
+            if doc is None:
+                os.remove(full)
+                continue
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as handle:
+                handle.write(doc if isinstance(doc, str) else json.dumps(doc))
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "edit"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def on_bus(self, rel):
+        proc = sh(["git", "show", "refs/heads/fast-builder/bus:" + rel], cwd=self.remote, check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    def doc(self, rel):
+        text = self.on_bus("runs/%s/%s" % (RUN, rel))
+        return json.loads(text) if text is not None else None
+
+    def said(self, who, words):
+        return [m for m in self.j("alpha", "inbox", "--run", RUN, "--who", who) if words in m["body"]]
+
+    def next_pass(self, *extra, account="alpha"):
+        """Bring on a full conductor pass, with the lease due for renewing."""
+        self.edit({"conductor.json": {"holder": account, "at": ago(11)}})
+        return self.j(account, "conduct", "--run", RUN, *extra)
+
+    # Red main
+
+    def test_main_going_red_and_green_is_told_once_each_and_each_lane_told_its_part(self):
+        self.checks(failed("build"), passed("lint"))
+        steward = self.j("alpha", "tick")
+        self.assertEqual(steward["main"]["state"], "red")
+        self.assertEqual(steward["main"]["failing"], ["build"])
+        self.assertIn("Fixing it comes before", steward["instruction"])
+        other = self.j("bravo", "tick")
+        self.assertEqual(other["main"]["state"], "red")
+        self.assertIn("Keep building", other["instruction"])
+        self.assertEqual(len(self.gh_calls()), 1, "only the lease holder asks")
+        self.assertEqual(self.gh_calls()[0][:2], ["api", "--paginate"])
+        self.assertTrue(self.gh_calls()[0][2].startswith("repos/owner/app/commits/main/check-runs"))
+        self.assertEqual(self.doc("main.json")["sha"], "a" * 40)
+        self.assertIn("Main is red at aaaaaaa", self.on_bus("STATUS.md"))
+        self.assertIn("build", self.on_bus("STATUS.md"))
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["main"]["state"], "red")
+        self.due()
+        self.j("alpha", "tick")
+        self.due()
+        self.j("alpha", "tick", "--note", "again")
+        self.assertEqual(len(self.said("bravo", "went red")), 1)
+        self.checks(failed("build"), sha="b" * 40)
+        self.due()
+        self.j("alpha", "tick")
+        self.assertEqual(self.doc("main.json")["sha"], "b" * 40, "a new head keeps the spell going")
+        self.assertEqual(len(self.said("bravo", "went red")), 1)
+        self.checks(passed("build"), sha="c" * 40)
+        self.due()
+        back = self.j("alpha", "tick")
+        self.assertEqual(back["main"]["state"], "green")
+        self.assertEqual(back["instruction"], fb.INSTRUCTIONS[fb.GO])
+        self.due()
+        self.j("alpha", "tick")
+        self.assertEqual(len(self.said("bravo", "green again")), 1)
+        self.assertIn("Main is green at ccccccc", self.on_bus("STATUS.md"))
+
+    def test_a_first_green_reading_tells_nobody(self):
+        self.checks(passed())
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "green")
+        self.assertFalse(self.said("bravo", "green"))
+
+    def test_gh_failing_or_missing_changes_nothing_and_kills_no_pass(self):
+        self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"}, "no table, so gh exits 1")
+        self.assertIsNone(self.doc("main.json"))
+        for table in ({"fail": True}, {"raw": "<html>rate limited</html>"}, {"raw": '{"check_runs": 5}'}, {"raw": '[]'}, {"raw": '{"message": "Not Found"}'}, {"raw": ""}):
+            with open(self.gh_table, "w") as handle:
+                json.dump(table, handle)
+            self.due()
+            self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"}, table)
+        self.checks(failed())
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red", "unknown leaves the last known state")
+        before = self.doc("main.json")
+        self.assertEqual(self.j("alpha", "conduct", "--run", RUN)["run"], RUN)
+        self.assertEqual(self.doc("main.json"), before)
+        with unittest.mock.patch("fb.shutil.which", return_value=None):
+            self.assertIsNone(fb.main_checks("owner/app", "main", []))
+
+    def test_only_a_completed_failure_on_a_check_that_counts_is_red(self):
+        running = {"name": "slow", "status": "in_progress", "conclusion": None}
+        quiet = [{"name": n, "status": "completed", "conclusion": n} for n in ("cancelled", "skipped", "neutral")]
+        for runs, only, state in (([failed(), running], [], "red"),
+                                  ([{"name": "t", "status": "completed", "conclusion": "timed_out"}], [], "red"),
+                                  ([passed(), running], [], None),
+                                  (quiet, [], None),
+                                  (quiet + [passed()], [], None),
+                                  (quiet[1:] + [passed()], [], "green"),
+                                  ([], [], None),
+                                  ([failed("nightly"), passed("ci")], ["ci"], "green"),
+                                  ([failed("nightly"), running], ["ci"], None),
+                                  ([failed("ci"), passed("nightly")], ["ci"], "red")):
+            self.checks(*runs)
+            env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+            with unittest.mock.patch.dict(os.environ, env):
+                got = fb.main_checks("owner/app", "main", only)
+            self.assertEqual(got and got["state"], state, runs)
+
+    def test_a_running_head_keeps_the_previous_state_and_main_checks_comes_from_the_job(self):
+        self.checks(failed("nightly"))
+        job = self.doc("job.json")
+        self.edit({"job.json": dict(job, main_checks=["ci"])})
+        self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"})
+        self.checks(failed("ci"))
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        self.checks({"name": "ci", "status": "queued", "conclusion": None}, sha="b" * 40)
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["sha"], "a" * 40)
+
+    def test_pages_are_read_past_the_first(self):
+        first = json.dumps({"check_runs": [dict(passed("a"), head_sha="a" * 40)]})
+        second = json.dumps({"check_runs": [dict(failed("b"), head_sha="a" * 40)]})
+        with open(self.gh_table, "w") as handle:
+            json.dump({"raw": first + second}, handle)
+        self.assertEqual(self.j("alpha", "tick")["main"]["failing"], ["b"])
+
+    def test_the_throttle_holds_and_a_non_holder_never_asks(self):
+        self.checks(passed())
+        for _ in range(3):
+            self.j("alpha", "tick", "--note", "x")
+            self.j("bravo", "tick", "--note", "y")
+        self.assertEqual(len(self.gh_calls()), 1)
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        self.due()
+        for _ in range(3):
+            self.j("alpha", "tick")
+        self.assertEqual(len(self.gh_calls()), 2, "a failing gh is not asked on every tick either")
+
+    def test_hostile_check_names_and_base_stay_off_the_command_line(self):
+        evil = "x`touch /tmp/pwned`\n| $(id) ; rm -rf / " + "y" * 200
+        self.checks(*[failed(str(i) + evil) for i in range(30)])
+        self.edit({"job.json": dict(self.doc("job.json"), base="a/../../../user")})
+        tick = self.j("alpha", "tick")
+        self.assertEqual(len(tick["main"]["failing"]), fb.MAIN_NAMES)
+        self.assertTrue(all(len(n) <= fb.MAIN_NAME_LEN for n in tick["main"]["failing"]))
+        for text in tick["main"]["failing"] + [self.on_bus("STATUS.md").split("Main is red", 1)[1].split("\n")[0]]:
+            self.assertFalse(set("`$;\n") & set(text), text)
+        call = self.gh_calls()[0]
+        self.assertEqual(call[2], "repos/owner/app/commits/a%2F..%2F..%2F..%2Fuser/check-runs?per_page=100")
+        self.assertNotIn("touch", " ".join(call))
+        self.assertNotIn("/../", " ".join(call))
+        self.assertFalse(os.path.exists("/tmp/pwned"))
+        self.edit({"job.json": dict(self.doc("job.json"), base="--hostname=evil.example"), "main.json": None})
+        self.due()
+        self.j("alpha", "tick")
+        self.assertEqual(len(self.gh_calls()), 1, "a base that fails its pattern is not asked about")
+
+    def test_a_hostile_main_json_reads_as_unknown_or_clean(self):
+        self.edit({"main.json": "not json"})
+        self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"})
+        self.edit({"main.json": {"state": "purple"}})
+        self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"})
+        self.edit({"main.json": {"state": "red", "sha": "$(id)", "since": "soon", "failing": ["`id`\n# new heading", 7, {"a": 1}]}})
+        tick = self.j("alpha", "tick")
+        self.assertEqual((tick["main"]["sha"], tick["main"]["since"], tick["main"]["failing"]), ("", "", ["id # new heading"]))
+        self.assertNotIn("$(id)", tick["instruction"])
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["main"]["sha"], "")
+        self.assertNotIn("$(id)", self.fb("alpha", "status", "--human").stdout)
+
+    def test_red_over_two_hours_posts_one_needs_human_per_spell(self):
+        self.checks(failed())
+        self.j("alpha", "tick")
+        self.assertFalse(self.said("human", "over 2 hours"))
+        self.edit({"main.json": dict(self.doc("main.json"), since=ago(119))})
+        self.due()
+        self.j("alpha", "tick")
+        self.assertFalse(self.said("human", "over 2 hours"))
+        self.edit({"main.json": dict(self.doc("main.json"), since=ago(121))})
+        for _ in range(3):
+            self.due()
+            self.j("alpha", "tick")
+        got = self.said("human", "over 2 hours")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["kind"], "needs-human")
+        self.assertIn("over 2 hours", self.j("alpha", "status")["runs"][0]["needs_human"][0])
+        self.checks(passed())
+        self.due()
+        self.j("alpha", "tick")
+        self.checks(failed())
+        self.due()
+        self.j("alpha", "tick")
+        self.edit({"main.json": dict(self.doc("main.json"), since=ago(121))})
+        self.due()
+        self.j("alpha", "tick")
+        self.assertEqual(len(self.said("human", "over 2 hours")), 2)
+
+    def test_red_with_no_fresh_reading_posts_nothing(self):
+        self.edit({"main.json": {"state": "red", "sha": "a" * 40, "since": ago(500), "failing": []}})
+        self.j("alpha", "tick")
+        self.assertFalse(self.said("human", "over 2 hours"))
+
+    def test_two_conductors_racing_tell_a_transition_once(self):
+        self.checks(failed())
+        self.edit({"conductor.json": {"holder": "gone", "at": OLD}})
+        accounts = ["alpha", "bravo", "charlie", "delta"]
+        for account in accounts:
+            self.clone(account)
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:
+            reports = list(pool.map(lambda a: self.j(a, "conduct", "--run", RUN, "--remote", self.remote), accounts))
+        self.assertEqual(len(self.said("money", "went red")), 1, reports)
+        self.assertEqual(self.doc("main.json")["state"], "red")
+
+    def test_a_run_from_the_old_version_still_works(self):
+        plan = "HPH-10-30-26-orchestration-plan.md"
+        text = self.on_bus("runs/%s/%s" % (RUN, plan))
+        self.edit({plan: text.split("## Overflow")[0] + "## Shared ground\nx\n"})
+        self.edit({"beats/money.json": {"at": ago(1), "status": "working", "account": "bravo", "note": ""}, "conductor.json": {"holder": "alpha", "at": ago(1)}})
+        self.assertEqual(self.j("bravo", "tick")["main"], {"state": "unknown"})
+        self.assertEqual(self.j("alpha", "tick")["action"], "continue")
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["main"], {"state": "unknown"})
+        self.assertNotIn("Main is", self.fb("alpha", "status", "--human").stdout)
+        self.assertEqual(self.fb("charlie", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+
+    # A drained account
+
+    def free_money(self):
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": ""}})
+        self.assertEqual(self.j("alpha", "conduct", "--run", RUN)["freed"], ["money"])
+
+    def test_a_lane_lost_to_going_quiet_is_not_handed_back_but_a_person_can_take_it(self):
+        self.free_money()
+        lost = self.doc("freed/money.json")["lost"]
+        self.assertEqual(list(lost), ["bravo"])
+        self.assertLess(fb.age_minutes(lost["bravo"]), 1)
+        self.assertEqual(self.fb("bravo", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+        self.assertNotEqual(self.fb("bravo", "join", "--run", RUN, check=False).returncode, 0)
+        self.assertIn("lane=money", self.fb("bravo", "join", "--run", RUN, "--lane", "money").stdout.split("\n")[0])
+
+    def test_another_account_takes_the_lane_and_the_cooldown_ends(self):
+        self.free_money()
+        self.edit({"freed/money.json": {"lost": {"bravo": ago(fb.COOLDOWN_MINUTES - 1)}}})
+        self.assertEqual(self.fb("bravo", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+        self.edit({"freed/money.json": {"lost": {"bravo": ago(fb.COOLDOWN_MINUTES + 1)}}})
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": ""}})
+        self.j("alpha", "conduct", "--run", RUN)
+        self.assertIn("lane=money", self.fb("charlie", "poll", "--remote", self.remote).stdout)
+
+    def test_a_lane_an_old_copy_freed_cools_too(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(5), "status": "open", "account": None, "note": "freed: bravo went quiet"}})
+        self.assertEqual(self.fb("bravo", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+        self.assertIn("lane=money", self.fb("charlie", "poll", "--remote", self.remote).stdout)
+
+    def test_a_cooldown_on_one_lane_leaves_a_fresh_one_open(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(5), "status": "open", "account": None, "note": "freed: bravo went quiet"}})
+        self.publish(accounts=2, today="2026-10-31")
+        self.assertIn("run=hph-10-31-26", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_a_far_future_or_bad_time_locks_nobody_out(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(5), "status": "open", "account": None, "note": ""}, "freed/money.json": {"lost": {"bravo": "2099-01-01T00:00:00Z"}}})
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": ""}, "freed/money.json": {"lost": 5}})
+        self.assertEqual(self.j("bravo", "conduct", "--run", RUN, "--remote", self.remote)["freed"], ["money"], "poll took the lease")
+
+    def test_a_claim_no_session_joined_is_freed_early_and_a_joined_one_is_not(self):
+        self.publish(accounts=2, today="2026-10-31")
+        run = "hph-10-31-26"
+        self.fb("charlie", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        self.assertIn("lane=core", self.fb("charlie", "poll", "--account", "charlie", "--remote", self.remote).stdout)
+        self.fb("delta", "join", "--run", run, "--lane", "money")
+        beat = json.loads(self.on_bus("runs/%s/beats/core.json" % run))
+        self.assertEqual(beat["note"], "claimed")
+        self.assertEqual(json.loads(self.on_bus("runs/%s/beats/money.json" % run))["note"], "joined")
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        for lane, note, account in (("core", "claimed", "charlie"), ("money", "joined", "delta")):
+            with open(os.path.join(phone, "runs", run, "beats", lane + ".json"), "w") as handle:
+                json.dump({"at": ago(fb.CLAIM_QUIET_MINUTES + 1), "status": "working", "account": account, "note": note}, handle)
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "age"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+        self.assertEqual(self.j("charlie", "conduct", "--run", run, "--remote", self.remote)["freed"], ["core"], "poll took the lease")
+        self.assertEqual(self.fb("charlie", "poll", "--account", "charlie", "--remote", self.remote).stdout.strip(), "NOTHING")
+
+    def test_a_session_joining_a_claim_clears_the_early_limit(self):
+        self.edit({"claims/money.json": None, "beats/money.json": None})
+        self.assertIn("lane=money", self.fb("charlie", "poll", "--remote", self.remote).stdout)
+        self.assertEqual(self.doc("beats/money.json")["note"], "claimed")
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        self.assertEqual(self.doc("beats/money.json")["note"], "joined")
+
+    def test_a_lane_sitting_open_tells_a_person_once_each_time(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(29), "status": "open", "account": None, "note": "freed: bravo went quiet"}})
+        self.next_pass()
+        self.assertFalse(self.said("human", "no taker"))
+        spell = ago(31)
+        self.edit({"beats/money.json": {"at": spell, "status": "open", "account": None, "note": "freed: bravo went quiet"}})
+        self.next_pass()
+        self.next_pass()
+        got = self.said("human", "no taker")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["kind"], "needs-human")
+        self.assertIn("/fast-builder:join --lane money", got[0]["body"])
+        self.assertIn("prompt --lane money", got[0]["body"])
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        self.next_pass()
+        self.assertEqual(len(self.said("human", "no taker")), 1)
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(40), "status": "open", "account": None, "note": "freed: charlie went quiet"}})
+        self.next_pass()
+        self.assertEqual(self.said("human", "no taker")[0]["body"], self.said("human", "no taker")[1]["body"])
+        self.assertEqual(len(self.said("human", "no taker")), 2)
+
+    def test_a_lane_never_held_is_not_called_unclaimed(self):
+        self.edit({"claims/money.json": None, "beats/money.json": None})
+        self.next_pass()
+        self.assertFalse(self.said("human", "no taker"))
+
+    # Lanes that clear their list
+
+    def test_a_plan_with_no_overflow_is_refused(self):
+        info, draft, _ = self.publish(today="2026-10-31")
+        path = os.path.join(draft, info["plan_file"])
+        with open(path) as handle:
+            full = handle.read()
+        self.assertIn("## Overflow\nfilled", full)
+        for broken in (full.replace("## Overflow\nfilled\n", ""), full.replace("## Overflow\nfilled\n", "## Overflow\n\n"), full.replace("## Overflow\nfilled", "## Overflow\n{{what}}")):
+            with open(path, "w") as handle:
+                handle.write(broken)
+            errors, _ = fb.validate(draft)
+            self.assertTrue(any("Overflow" in e or "unfilled" in e for e in errors), errors)
+        with open(path, "w") as handle:
+            handle.write(full)
+        self.assertEqual(fb.validate(draft)[0], [])
+        job = json.load(open(os.path.join(draft, "job.json")))
+        for bad in ("ci", [1], {"a": 1}):
+            with open(os.path.join(draft, "job.json"), "w") as handle:
+                json.dump(dict(job, main_checks=bad), handle)
+            self.assertTrue(any("main_checks" in e for e in fb.validate(draft)[0]), bad)
+
+    def test_the_template_leaves_overflow_as_a_blank(self):
+        self.assertIn("## Overflow\n{{{{", fb.PLAN_DOC)
+
+    def test_a_done_lane_with_time_left_raises_one_request(self):
+        self.fb("bravo", "lane-state", "done", "--note", "cleared")
+        self.next_pass()
+        self.next_pass()
+        got = self.said("conductor", "marked done")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["kind"], "request")
+        self.assertIn("money", got[0]["body"])
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1)
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 0)
+
+    def test_a_done_lane_near_the_deadline_or_with_nobody_working_raises_nothing(self):
+        self.fb("bravo", "lane-state", "done")
+        job = self.doc("job.json")
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
+        self.edit({"job.json": dict(job, deadline=soon)})
+        self.next_pass()
+        self.assertFalse(self.said("conductor", "marked done"))
+        past = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400 * 3))
+        self.edit({"job.json": dict(job, deadline=past)})
+        self.next_pass()
+        self.assertFalse(self.said("conductor", "marked done"))
+        later = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 7200))
+        self.edit({"job.json": dict(job, deadline=later)})
+        self.next_pass()
+        self.assertEqual(len(self.said("conductor", "marked done")), 1)
+
+    def test_a_blocked_or_quiet_other_lane_is_not_working(self):
+        self.fb("bravo", "lane-state", "done")
+        self.edit({"beats/core.json": {"at": OLD, "status": "working", "account": "alpha", "note": ""}})
+        report = self.next_pass()
+        self.assertEqual(report["freed"], ["core"])
+        self.assertFalse(self.said("conductor", "marked done"))
+
+    def test_every_lane_done_closes_the_run_and_asks_nothing(self):
+        self.fb("alpha", "lane-state", "done")
+        self.fb("bravo", "lane-state", "done")
+        self.assertTrue(self.j("alpha", "conduct", "--run", RUN)["finished"])
+        self.assertFalse(self.said("conductor", "marked done"))
+
+    def test_deadline_text(self):
+        self.assertEqual(fb.hours_left(None), float("inf"))
+        for text in ("Friday", "48h", "", 5, "2026-13-45", "0001-01-01T00:00:00+14:00x"):
+            self.assertEqual(fb.hours_left(text), float("inf"), text)
+        self.assertLess(fb.hours_left("2020-01-01"), 0)
+        self.assertLess(fb.hours_left("2020-01-01T00:00:00Z"), 0)
+        self.assertLess(fb.hours_left("2020-01-01 10:00"), 0)
+        self.assertGreater(fb.hours_left("2099-01-01"), 1000)
+
+    def test_a_lease_on_an_account_with_no_lane_does_not_strand_the_conductors_inbox(self):
+        self.fb("bravo", "send", "--run", RUN, "--to", "conductor", "--kind", "request", "--body", "more work please")
+        self.edit({"conductor.json": {"holder": "listener-only", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1, "the steward picks it up")
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 0)
+        self.edit({"conductor.json": {"holder": "bravo", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 0)
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 1)
+
+    # A lead waiting on subagents
+
+    def session_file(self, account):
+        return os.path.join(self.clone(account), ".git", "fast-builder", "session.json")
+
+    def long_ago_beat(self, account):
+        path = self.session_file(account)
+        session = json.load(open(path))
+        session["last_beat"] = time.time() - 3600
+        with open(path, "w") as handle:
+            json.dump(session, handle)
+
+    def test_wait_beats_while_subagent_tool_calls_share_the_session(self):
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": "on a long slice"}})
+        self.long_ago_beat("bravo")
+        waiter = subprocess.Popen([sys.executable, FB, "wait", "--seconds", "6", "--poll", "0.5"], cwd=self.clone("bravo"), env=self.env("bravo"), stdout=subprocess.PIPE, universal_newlines=True)
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": self.clone("bravo")})
+        for _ in range(3):
+            self.fb("bravo", "hook", "guard", stdin=payload)  # what a running subagent's tool call does
+            time.sleep(0.5)
+        output, _ = waiter.communicate(timeout=60)
+        self.assertEqual(waiter.returncode, 0)
+        self.assertIn("woke", output)
+        beat = self.doc("beats/money.json")
+        self.assertLess(fb.age_minutes(beat["at"]), 1)
+        self.assertEqual(beat["status"], "working")
+        self.assertEqual(self.j("alpha", "conduct", "--run", RUN)["freed"], [])
+
+    def test_a_wait_that_keeps_waking_still_beats(self):
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": ""}})
+        self.fb("alpha", "send", "--run", RUN, "--to", "money", "--kind", "note", "--body", "unread")
+        self.long_ago_beat("bravo")
+        waiter = subprocess.Popen([sys.executable, FB, "wait", "--seconds", "20", "--poll", "1"], cwd=self.clone("bravo"), env=self.env("bravo"), stdout=subprocess.PIPE, universal_newlines=True)
+        time.sleep(0.2)
+        self.fb("alpha", "send", "--run", RUN, "--to", "all", "--kind", "note", "--body", "the bus moves before its first look")
+        output, _ = waiter.communicate(timeout=60)
+        self.assertIn('"bus"', output)
+        self.assertLess(fb.age_minutes(self.doc("beats/money.json")["at"]), 1, "an early wake must not skip the beat")
+
+    # The restart cap
+
+    def local_lane(self):
+        """Bravo's listener holds a local lane whose session has already exited, as a drained account's does."""
+        self.fb("bravo", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        self.publish(where="local", today="2026-10-31")
+        self.fb("alpha", "join", "--run", "hph-10-31-26", "--lane", "core", "--remote", self.remote)
+        self.fb("bravo", "lane-state", "stopped")
+        self.fb("bravo", "listen", "--once")
+        children = os.path.join(self.env("bravo")["FB_HOME"], "children.json")
+        self.assertTrue(os.path.exists(children))
+        key = "hph-10-31-26/money"
+        deadline = time.time() + 20
+        while fb.alive(json.load(open(children))[key]["pid"]) and time.time() < deadline:
+            time.sleep(0.1)
+        return children, key
+
+    def test_a_lane_that_used_up_its_restarts_goes_back_at_once_and_cools(self):
+        children, key = self.local_lane()
+        doc = json.load(open(children))
+        doc[key]["attempt"] = fb.MAX_RESTARTS
+        json.dump(doc, open(children, "w"))
+        self.fb("bravo", "listen", "--once")
+        lanes = {r["lane"]: r for r in self.j("alpha", "status", "--run", "hph-10-31-26")["runs"][0]["lanes"]}
+        self.assertIsNone(lanes["money"]["account"])
+        self.assertIn("exited", lanes["money"]["note"])
+        self.assertIn("bravo", json.loads(self.on_bus("runs/hph-10-31-26/freed/money.json"))["lost"])
+        self.fb("bravo", "listen", "--once")
+        lanes = {r["lane"]: r for r in self.j("alpha", "status", "--run", "hph-10-31-26")["runs"][0]["lanes"]}
+        self.assertIsNone(lanes["money"]["account"], "not picked up again by the account it just failed on")
+
+    def test_a_session_that_lived_long_does_not_use_up_the_restarts(self):
+        children, key = self.local_lane()
+        doc = json.load(open(children))
+        doc[key].update(attempt=fb.MAX_RESTARTS, at=ago(fb.STALE_MINUTES + 1))
+        json.dump(doc, open(children, "w"))
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(json.load(open(children))[key]["attempt"], 1)
+        lanes = {r["lane"]: r for r in self.j("alpha", "status", "--run", "hph-10-31-26")["runs"][0]["lanes"]}
+        self.assertEqual(lanes["money"]["account"], "bravo")
+
+
+    # Review of this hardening
+
+    def old(self, account, *args):
+        """The copy a live run is on: main before this hardening."""
+        path = os.path.join(self.root, "old_fb.py")
+        if not os.path.exists(path):
+            show = subprocess.run(["git", "show", "a4ead91b:scripts/fb.py"], cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            if show.returncode != 0:
+                NOT_RUN.append(self._testMethodName)
+                self.skipTest("this clone has no a4ead91b")
+            with open(path, "w") as handle:
+                handle.write(show.stdout)
+        proc = subprocess.run([sys.executable, "-I", path] + list(args), cwd=self.clone(account), env=self.env(account), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, input="")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    def age_beat(self, lane, minutes):
+        self.edit({"beats/%s.json" % lane: dict(self.doc("beats/%s.json" % lane), at=ago(minutes))})
+
+    def open_money(self):
+        self.edit({"claims/money.json": None, "beats/money.json": None})
+
+    def assert_only_freed_at_the_full_limit(self):
+        for minutes, freed in ((fb.CLAIM_QUIET_MINUTES + 1, []), (fb.STALE_MINUTES - 1, []), (fb.STALE_MINUTES + 1, ["money"])):
+            self.age_beat("money", minutes)
+            self.age_beat("core", 1)
+            self.assertEqual(self.next_pass()["freed"], freed, minutes)
+
+    def test_an_old_session_on_an_old_listeners_claim_keeps_the_full_limit(self):
+        self.open_money()
+        self.assertIn("lane=money", self.old("charlie", "poll", "--account", "charlie", "--remote", self.remote).stdout)
+        self.old("charlie", "join", "--run", RUN, "--lane", "money", "--account", "charlie")
+        self.assertEqual(self.doc("beats/money.json")["note"], "claimed", "the old copy leaves this until its first tick")
+        self.assertTrue(self.doc("claims/money.json")["session"])
+        self.assert_only_freed_at_the_full_limit()
+
+    def test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit(self):
+        self.open_money()
+        self.assertIn("lane=money", self.fb("charlie", "poll", "--account", "charlie", "--remote", self.remote).stdout)
+        self.old("charlie", "join", "--run", RUN, "--lane", "money", "--account", "charlie")
+        self.assertEqual(self.doc("beats/money.json")["note"], "claimed")
+        self.age_beat("money", fb.CLAIM_QUIET_MINUTES + 1)
+        self.assertEqual(self.next_pass()["freed"], [])
+        self.assertEqual(json.loads(self.old("charlie", "tick").stdout)["action"], "continue")
+        self.assertEqual(self.doc("claims/money.json")["account"], "charlie")
+
+    def test_a_token_is_what_counts_and_not_the_note(self):
+        token = "t" * 32
+        self.edit({"claims/money.json": {"account": "charlie", "session": token, "where": "cloud"}, "beats/money.json": {"at": ago(21), "status": "working", "account": "charlie", "note": "claimed"}})
+        self.assertEqual(self.next_pass()["freed"], [])
+        self.edit({"claims/money.json": {"account": "charlie", "session": None, "where": "cloud"}, "beats/money.json": {"at": ago(21), "status": "working", "account": "charlie", "note": "claimed"}})
+        self.assertEqual(self.next_pass()["freed"], ["money"])
+
+    def test_a_resumed_old_session_is_not_freed_21_minutes_later(self):
+        self.open_money()
+        self.old("charlie", "join", "--run", RUN, "--lane", "money", "--account", "charlie")
+        self.age_beat("money", 30)
+        self.j("alpha", "pause", "--run", RUN)
+        self.j("alpha", "resume", "--run", RUN)
+        self.assertEqual(self.doc("beats/money.json")["note"], "claimed")
+        self.age_beat("money", fb.CLAIM_QUIET_MINUTES + 1)
+        self.assertEqual(self.next_pass()["freed"], [])
+
+    def launch_for_charlie(self, during_clone):
+        env = self.env("charlie")
+        clone = self.clone("charlie")
+
+        def slow_clone(*_):
+            during_clone()
+            return clone
+
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]), unittest.mock.patch.object(fb, "HOME_DIR", env["FB_HOME"]), unittest.mock.patch.object(fb, "CLAUDE", self.shim), unittest.mock.patch.object(fb, "work_clone", slow_clone):
+            fb.launch_lane(fb.Bus(self.remote, "charlie"), {}, RUN, "money", "charlie")
+
+    def test_a_slow_local_clone_does_not_use_up_the_time_to_join(self):
+        self.open_money()
+        self.assertIn("lane=money", self.fb("charlie", "poll", "--remote", self.remote).stdout)
+        self.launch_for_charlie(lambda: self.age_beat("money", fb.CLAIM_QUIET_MINUTES - 1))
+        beat = self.doc("beats/money.json")
+        self.assertLess(fb.age_minutes(beat["at"]), 1, "the clock starts when the session can start")
+        self.assertEqual(beat["note"], "claimed")
+        self.assertEqual(self.next_pass()["freed"], [])
+
+    def test_a_slow_clone_leaves_a_lane_it_no_longer_holds_alone(self):
+        self.open_money()
+        self.fb("charlie", "poll", "--remote", self.remote)
+        theirs = {"at": ago(5), "status": "working", "account": "delta", "note": "joined"}
+        self.launch_for_charlie(lambda: self.edit({"claims/money.json": {"account": "delta", "session": "d" * 32, "where": "local"}, "beats/money.json": theirs}))
+        self.assertEqual(self.doc("beats/money.json"), theirs)
+
+    def test_a_restart_on_a_joined_claim_leaves_the_beat_alone(self):
+        self.open_money()
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        self.age_beat("money", 10)
+        before = self.doc("beats/money.json")
+        self.launch_for_charlie(lambda: None)
+        self.assertEqual(self.doc("beats/money.json"), before)
+
+    def test_the_note_says_the_limit_that_was_used(self):
+        self.open_money()
+        self.fb("charlie", "poll", "--remote", self.remote)
+        self.age_beat("money", fb.CLAIM_QUIET_MINUTES + 1)
+        self.assertEqual(self.next_pass()["freed"], ["money"])
+        said = self.said("all", "Lane money freed")
+        self.assertEqual(len(said), 1)
+        self.assertIn("%d minutes" % fb.CLAIM_QUIET_MINUTES, said[0]["body"])
+        self.assertNotIn(str(fb.STALE_MINUTES), said[0]["body"])
+        self.assertEqual(self.doc("beats/money.json")["note"], "freed: charlie went quiet", "old copies read cooldown from this")
+        self.fb("delta", "join", "--run", RUN, "--lane", "money")
+        self.age_beat("money", fb.STALE_MINUTES + 1)
+        self.assertEqual(self.next_pass()["freed"], ["money"])
+        self.assertIn("%d minutes" % fb.STALE_MINUTES, self.said("all", "delta")[0]["body"])
+
+    # The conductor's inbox
+
+    def ask_conductor(self, body="more work please", at=None):
+        rel = "msgs/20260101T000000Z-bravo-%04x.json" % (abs(hash(body)) % 65536)
+        self.edit({rel: {"from": "money", "to": "conductor", "kind": "request", "body": body, "at": at or ago(1)}})
+
+    def unread_said(self):
+        return self.said("human", "to the conductor")
+
+    def test_the_steward_reads_when_the_holders_lane_is_done(self):
+        self.fb("bravo", "lane-state", "done")
+        self.fb("bravo", "send", "--run", RUN, "--to", "conductor", "--kind", "request", "--body", "more work please")
+        self.edit({"conductor.json": {"holder": "bravo", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1)
+
+    def test_the_steward_reads_when_the_holders_lane_is_quiet_or_unjoined(self):
+        self.ask_conductor()
+        for claim, beat in (({"account": "bravo", "session": "x"}, {"at": ago(fb.STALE_MINUTES + 1), "status": "working", "account": "bravo", "note": ""}),
+                            ({"account": "bravo", "session": None}, {"at": ago(1), "status": "working", "account": "bravo", "note": "claimed"}),
+                            ({"account": "bravo", "session": "x"}, {"at": ago(1), "status": "blocked", "account": "bravo", "note": ""})):
+            self.edit({"claims/money.json": claim, "beats/money.json": beat, "conductor.json": {"holder": "bravo", "at": ago(1)}})
+            self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1, claim)
+
+    def test_the_steward_stays_out_while_the_holder_has_a_live_lane(self):
+        self.ask_conductor()
+        self.edit({"beats/money.json": dict(self.doc("beats/money.json"), at=ago(1)), "conductor.json": {"holder": "bravo", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 0)
+
+    def test_what_one_reader_marks_read_is_read_for_all(self):
+        self.ask_conductor()
+        self.edit({"conductor.json": {"holder": "listener-only", "at": ago(1)}})
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1)
+        self.assertEqual(len(self.j("alpha", "inbox", "--run", RUN, "--who", "conductor", "--mark")), 1)
+        self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 0)
+        self.edit({"conductor.json": {"holder": "bravo", "at": ago(1)}})
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 0)
+        self.assertEqual(self.j("bravo", "inbox", "--run", RUN, "--who", "conductor"), [])
+
+    def test_a_person_with_no_session_can_mark_it_read(self):
+        self.ask_conductor(at=ago(fb.REQUEST_UNREAD_MINUTES + 1))
+        self.assertEqual(len(self.j("charlie", "inbox", "--run", RUN, "--who", "conductor", "--mark", "--remote", self.remote)), 1)
+        self.next_pass()
+        self.assertEqual(self.unread_said(), [])
+
+    def test_a_done_steward_with_no_other_reader_tells_a_person_once(self):
+        self.edit({"job.json": dict(self.doc("job.json"), deadline=ago(-30))})  # no request of the conductor's own
+        self.fb("alpha", "lane-state", "done")
+        self.ask_conductor("first")
+        self.assertEqual(self.next_pass(account="zulu")["holder"], "zulu")
+        said = self.unread_said()
+        self.assertEqual(len(said), 1)
+        self.assertEqual(said[0]["kind"], "needs-human")
+        self.assertIn("inbox --who conductor", said[0]["body"])
+        self.assertNotIn("first", said[0]["body"], "what a lane wrote stays out of this")
+        self.next_pass(account="zulu")
+        self.assertEqual(len(self.unread_said()), 1)
+        self.ask_conductor("second")
+        self.next_pass(account="zulu")
+        self.assertEqual(len(self.unread_said()), 2, "a later request is its own news")
+
+    def test_a_done_lane_on_a_done_steward_reaches_a_person_in_two_passes(self):
+        self.fb("alpha", "lane-state", "done")
+        self.age_beat("money", 1)
+        self.next_pass(account="zulu")
+        self.assertEqual(len(self.said("conductor", "Lane core is marked done")), 1)
+        self.next_pass(account="zulu")
+        self.assertEqual(len(self.unread_said()), 1)
+
+    def test_a_done_steward_with_a_live_holder_waits_for_the_limit(self):
+        self.fb("alpha", "lane-state", "done")
+        self.ask_conductor()
+        self.age_beat("money", 1)
+        self.next_pass(account="bravo")
+        self.assertEqual(self.unread_said(), [])
+
+    def test_a_request_unread_past_the_limit_tells_a_person_once_even_with_readers(self):
+        self.age_beat("money", 1)
+        self.ask_conductor("young", at=ago(fb.REQUEST_UNREAD_MINUTES - 1))
+        self.next_pass()
+        self.assertEqual(self.unread_said(), [])
+        self.ask_conductor("late", at=ago(fb.REQUEST_UNREAD_MINUTES + 1))
+        self.ask_conductor("later", at=ago(fb.REQUEST_UNREAD_MINUTES + 2))
+        self.next_pass()
+        said = self.unread_said()
+        self.assertEqual(len(said), 1, "one message for a pass, however many are late")
+        self.assertIn("2 requests", said[0]["body"])
+        self.next_pass()
+        self.assertEqual(len(self.unread_said()), 1)
+
+    def test_a_run_that_closes_with_a_request_unread_still_says_so(self):
+        self.ask_conductor()
+        self.fb("alpha", "lane-state", "done")
+        self.fb("bravo", "lane-state", "done")
+        self.assertTrue(self.next_pass(account="zulu")["finished"])
+        self.assertEqual(len(self.unread_said()), 1)
+
+    def test_a_hostile_read_file_only_costs_an_extra_alert(self):
+        for doc in ("[1, 2]", '{"read": 7, "told": {"x": 1}}', '{"read": [1, {}], "told": [[]]}', "not json"):
+            self.edit({fb.REQUESTS_FILE: doc})
+            self.ask_conductor(doc, at=ago(fb.REQUEST_UNREAD_MINUTES + 1))
+            self.assertEqual(self.next_pass()["run"], RUN)
+            self.assertTrue(self.unread_said())
+            self.assertGreaterEqual(self.j("alpha", "tick")["requests_for_conductor"], 0)
+
+    # Wait, when a beat cannot land
+
+    def refuse_pushes_from(self, account):
+        count = os.path.join(self.root, "refused")
+        hook = os.path.join(self.remote, "hooks", "update")
+        with open(hook, "w") as handle:
+            handle.write('#!/bin/sh\ncase "$(git log -1 --format=%%an "$3")" in *%s*) echo x >> %s; echo "denied: read-only" >&2; exit 1;; esac\nexit 0\n' % (account, shlex.quote(count)))
+        os.chmod(hook, 0o755)
+        return count
+
+    def waiter(self, *extra):
+        return subprocess.Popen([sys.executable, FB, "wait", "--seconds", "30", "--poll", "1"] + list(extra), cwd=self.clone("alpha"), env=self.env("alpha"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    def test_a_stop_wakes_a_wait_whose_beat_cannot_land(self):
+        self.refuse_pushes_from("alpha")
+        self.long_ago_beat("alpha")
+        proc = self.waiter()
+        time.sleep(2)
+        self.j("bravo", "stop", "--run", RUN)
+        began = time.time()
+        output = json.loads(proc.communicate(timeout=60)[0])
+        self.assertLess(time.time() - began, 15)
+        self.assertEqual((output["woke"], output["action"]), ("bus", fb.STOP))
+
+    def test_a_message_wakes_a_wait_whose_beat_cannot_land(self):
+        self.refuse_pushes_from("alpha")
+        self.long_ago_beat("alpha")
+        proc = self.waiter()
+        time.sleep(2)
+        self.fb("bravo", "send", "--run", RUN, "--to", "core", "--kind", "note", "--body", "hello")
+        began = time.time()
+        output = json.loads(proc.communicate(timeout=60)[0])
+        self.assertLess(time.time() - began, 15)
+        self.assertEqual(output["woke"], "bus")
+
+    def test_a_beat_that_cannot_land_is_not_tried_on_every_poll(self):
+        count = self.refuse_pushes_from("alpha")
+        self.long_ago_beat("alpha")
+        began = time.time()
+        output = json.loads(subprocess.run([sys.executable, FB, "wait", "--seconds", "5", "--poll", "1"], cwd=self.clone("alpha"), env=self.env("alpha"), stdout=subprocess.PIPE, universal_newlines=True).stdout)
+        self.assertEqual(output["woke"], "timeout")
+        self.assertLess(time.time() - began, 15)
+        self.assertLessEqual(len(open(count).read().split()), 3)
+
+    def test_a_wait_still_learns_it_lost_the_lane_from_its_beat(self):
+        self.edit({"claims/core.json": {"account": "alpha", "session": "someone-else", "where": "cloud"}})
+        self.long_ago_beat("alpha")
+        self.assertEqual(self.j("alpha", "wait", "--seconds", "5", "--poll", "1")["woke"], "lost")
+
+    # Reading main
+
+    def reading(self, *runs, only=(), raw=None):
+        if raw is None:
+            self.checks(*runs)
+        else:
+            with open(self.gh_table, "w") as handle:
+                json.dump({"raw": raw}, handle)
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE", "FB_HOME", "FB_CACHE")}
+        with unittest.mock.patch.dict(os.environ, env):
+            return fb.main_checks("owner/app", "main", list(only))
+
+    def state_of(self, *runs, only=()):
+        got = self.reading(*runs, only=only)
+        return got and got["state"]
+
+    def test_a_rerun_replaces_what_it_reran_under_one_name(self):
+        now = time.time()
+
+        def at(minutes):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - minutes * 60))
+
+        def run(conclusion, began, ended, status="completed"):
+            return {"name": "ci", "status": status, "conclusion": conclusion, "started_at": at(began) if began is not None else None, "completed_at": at(ended) if ended is not None else None}
+        for rows, state in (([run("failure", 60, 50), run("success", 40, 30)], "green"),
+                            ([run("success", 40, 30), run("failure", 60, 50)], "green"),
+                            ([run("success", 60, 50), run("failure", 40, 30)], "red"),
+                            ([run("cancelled", 60, 50), run("success", 40, 30)], "green"),
+                            ([run("success", 60, 50), run("cancelled", 40, 30)], None),
+                            ([run("failure", 60, 50), run(None, 40, None, "in_progress")], None),
+                            ([run("success", 60, 50), run(None, 40, None, "queued")], None),
+                            # overlapping rows are two checks sharing a name, and the worst of them stands
+                            ([run("failure", 60, 30), run("success", 50, 20)], "red"),
+                            ([run("success", 60, 20), run("failure", 50, 30)], "red"),
+                            ([run("success", 60, 20), run(None, 50, None, "in_progress")], None),
+                            ([run("failure", 60, 20), run(None, 50, None, "in_progress")], "red"),
+                            # a tie, or no time to compare, must not read green
+                            ([run("failure", 60, 50), run("success", 60, 50)], "red"),
+                            ([run("success", 60, 50), run("failure", 60, 50)], "red"),
+                            ([run("failure", 60, 50), run("success", 50, 40)], "red"),
+                            ([failed(), passed()], "red"),
+                            ([passed(), failed()], "red"),
+                            ([run("failure", 60, 50), passed()], "red"),
+                            ([dict(run("success", 60, 50), completed_at="soon"), run("failure", 40, 30)], "red"),
+                            ([dict(run("failure", 60, 50), completed_at="soon"), run("success", 40, 30)], "red"),
+                            ([dict(run("failure", 60, 50), completed_at=7), dict(run("success", 40, 30), started_at={})], "red"),
+                            # only finished times to go on
+                            ([dict(failed(), completed_at=at(50)), dict(passed(), completed_at=at(30))], "green")):
+            self.assertEqual(self.state_of(*rows), state, rows)
+        self.assertEqual(self.reading(run("failure", 60, 50), run("failure", 40, 30))["failing"], ["ci"])
+
+    def test_same_second_times_with_and_without_an_offset_compare(self):
+        rows = [dict(failed(), started_at="2026-01-01T00:00:00Z", completed_at="2026-01-01T01:00:00+01:00"), dict(passed(), started_at="2026-01-01T00:00:01", completed_at="2026-01-01T00:00:02Z")]
+        self.assertEqual(self.state_of(*rows), "green")
+
+    def test_green_needs_every_check_to_have_passed(self):
+        def done(name, conclusion):
+            return {"name": name, "status": "completed", "conclusion": conclusion}
+        ok = passed("lint")
+        for rows, only, state in (([ok, done("t", "cancelled")], [], None),
+                                  ([ok, done("t", "stale")], [], None),
+                                  ([ok, done("t", "action_required")], [], None),
+                                  ([ok, done("t", None)], [], None),
+                                  ([ok, done("t", "new-word")], [], None),
+                                  ([ok, done("t", ["success"])], [], None),
+                                  ([ok, done("t", "startup_failure")], [], "red"),
+                                  ([done("t", "timed_out")], [], "red"),
+                                  ([ok, done("t", "skipped"), done("u", "neutral")], [], "green"),
+                                  ([done("t", "skipped")], [], None),
+                                  ([done("t", "neutral")], [], None),
+                                  ([ok], ["lint", "test"], None),
+                                  ([ok, done("test", "cancelled")], ["lint", "test"], None),
+                                  ([ok, passed("test")], ["lint", "test"], "green"),
+                                  ([ok, failed("test")], ["lint", "test", "absent"], "red"),
+                                  ([ok, done("test", "skipped")], ["lint", "test"], "green"),
+                                  ([ok, done("other", "cancelled")], ["lint"], "green")):
+            self.assertEqual(self.state_of(*rows, only=only), state, (rows, only))
+
+    def test_an_incomplete_green_does_not_tell_anyone_main_is_green_again(self):
+        self.checks(failed("t"))
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        for rows in ([passed("lint"), {"name": "t", "status": "completed", "conclusion": "cancelled"}],
+                     [passed("lint"), {"name": "t", "status": "completed", "conclusion": "stale"}]):
+            self.checks(*rows)
+            self.due()
+            self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        self.assertEqual(self.said("all", "green again"), [])
+        self.checks(failed("t"), dict(passed("t"), started_at=ago(1), completed_at=ago(0)))
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red", "no times to order them by")
+        self.checks(dict(failed("t"), started_at=ago(9), completed_at=ago(8)), dict(passed("t"), started_at=ago(1), completed_at=ago(0)))
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "green")
+        self.assertEqual(len(self.said("all", "green again")), 1)
+
+    def test_rows_from_two_commits_are_not_read_at_all(self):
+        one, two = "a" * 40, "b" * 40
+        pages = [[dict(passed("a"), head_sha=one)], [dict(failed("b"), head_sha=two)]]
+        self.assertIsNone(self.reading(raw="".join(json.dumps({"check_runs": p}) for p in pages)))
+        pages = [[dict(failed("a"), head_sha=one)], [dict(passed("b"), head_sha=two)]]
+        self.assertIsNone(self.reading(raw="".join(json.dumps({"check_runs": p}) for p in pages)))
+        pages = [[dict(passed("a"), head_sha=one), dict(passed("b"), head_sha=two)]]
+        self.assertIsNone(self.reading(raw=json.dumps({"check_runs": pages[0]})), "and it does not take main_checks hiding one of them")
+        self.assertIsNone(self.reading(raw=json.dumps({"check_runs": pages[0]})))
+        for bad in (None, "nonsense", ["x"], 7):
+            rows = [dict(passed("a"), head_sha=one), dict(passed("b"), head_sha=bad)]
+            self.assertIsNone(self.reading(raw=json.dumps({"check_runs": rows})), bad)
+        rows = [dict(passed("a"), head_sha=one), dict(failed("nightly"), head_sha=two)]
+        with open(self.gh_table, "w") as handle:
+            json.dump({"raw": json.dumps({"check_runs": rows})}, handle)
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertIsNone(fb.main_checks("owner/app", "main", ["a"]), "main_checks must not hide a torn reading")
+
+    def test_gh_runs_under_its_own_time_limit(self):
+        self.checks(passed(), sleep=6)
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+        began = time.time()
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "MAIN_ASK_SECONDS", 1):
+            with self.assertRaises(fb.FbError):
+                fb.main_checks("owner/app", "main", [])
+        self.assertLess(time.time() - began, 5)
+
+    def probes(self):
+        path = self.gh_log + ".probe"
+        return [json.loads(line) for line in open(path)] if os.path.exists(path) else []
+
+    def test_the_checkout_is_free_while_gh_runs(self):
+        self.checks(passed())
+        self.j("alpha", "tick")
+        self.assertEqual([p["locked"] for p in self.probes()], [False])
+
+    def test_a_run_not_going_does_not_ask(self):
+        self.checks(passed())
+        self.j("alpha", "pause", "--run", RUN)
+        self.j("alpha", "conduct", "--run", RUN)
+        self.assertEqual(self.gh_calls(), [])
+        self.j("alpha", "resume", "--run", RUN)
+        self.j("alpha", "stop", "--run", RUN)
+        self.j("alpha", "conduct", "--run", RUN)
+        self.assertEqual(self.gh_calls(), [])
+
+    def test_a_slug_gh_should_not_see_never_reaches_it(self):
+        self.checks(passed())
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+        with unittest.mock.patch.dict(os.environ, env):
+            for slug in ("../../user", "a/b/c", "owner/app/../../x", "-X/y", "owner", "owner/app?a=1", "owner/app\n", ""):
+                self.assertIsNone(fb.main_checks(slug, "main", []), slug)
+            self.assertEqual(self.gh_calls(), [])
+            self.assertEqual(fb.main_checks("owner/app", "main", [])["state"], "green")
+            self.assertEqual(len(self.gh_calls()), 1)
+
+    def slow_reader(self, seconds):
+        self.checks(passed(), sleep=seconds)
+        env = self.env("alpha")
+        return unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]), unittest.mock.patch.object(fb, "MAIN_ASK_SECONDS", 1)
+
+    def test_a_head_too_big_to_read_is_said_once_and_a_good_reading_starts_over(self):
+        self.j("alpha", "tick", "--note", "lease")
+        patches = self.slow_reader(4)
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        bus = fb.Bus(self.remote, "alpha")
+        bus.sync()
+        slow = "%s.slow-%s" % (bus.dir, RUN)
+        self.due()
+        self.assertIsNone(fb.look_at_main(bus, RUN, "alpha"))
+        self.assertTrue(os.path.exists(slow))
+        self.due()
+        self.assertIsNone(fb.look_at_main(bus, RUN, "alpha"), "not on the second try")
+        with open(slow, "w") as handle:
+            handle.write(str(fb.MAIN_RED_MINUTES * 60 // fb.MAIN_SECONDS - 1))
+        self.due()
+        seen = fb.look_at_main(bus, RUN, "alpha")
+        self.assertEqual(seen, {"state": "slow"})
+        files = fb.main_update(bus, RUN, "alpha", seen)
+        self.assertNotIn("runs/%s/main.json" % RUN, files, "it changes nothing about what main is")
+        bus.commit(lambda: files, "slow")
+        bus.release()
+        said = self.said("human", "could not be read")
+        self.assertEqual(len(said), 1)
+        self.assertEqual(said[0]["kind"], "needs-human")
+        bus.sync()
+        self.assertEqual(fb.main_update(bus, RUN, "alpha", seen), {}, "once")
+        self.checks(passed())
+        self.due()
+        self.assertEqual(fb.look_at_main(bus, RUN, "alpha")["state"], "green")
+        self.assertFalse(os.path.exists(slow))
+        bus.release()
+
+    def test_a_slow_reading_reaches_a_person_through_a_real_pass(self):
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(1)}})
+        env = self.env("alpha")
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]), unittest.mock.patch.object(fb, "look_at_main", return_value={"state": "slow"}):
+            bus = fb.Bus(self.remote, "alpha")
+            self.assertEqual(fb.conduct(bus, RUN, "alpha")["run"], RUN)
+            bus.release()
+        self.assertEqual(len(self.said("human", "could not be read")), 1)
+        self.assertEqual(self.j("alpha", "tick")["main"], {"state": "unknown"})
+
+    def test_a_gh_that_hangs_costs_a_listener_pass_one_wait(self):
+        self.publish(accounts=2, today="2026-10-31")
+        self.publish(accounts=2, today="2026-11-01")
+        self.checks(passed(), sleep=4)
+        env = self.env("zulu")
+        self.fb("zulu", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]), unittest.mock.patch.object(fb, "HOME_DIR", env["FB_HOME"]), unittest.mock.patch.object(fb, "MAIN_ASK_SECONDS", 1):
+            fb.poll_repo(self.remote, {"routine_id": rid("123")}, "zulu", {}, launch=False)
+        self.assertEqual(len(self.gh_calls()), 1, "and the next pass asks again, its marks unwritten")
+
+    def test_gh_being_slow_once_does_not_throttle_the_runs_it_kept_from_asking(self):
+        self.checks(passed(), sleep=4)
+        env = self.env("alpha")
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]):
+            bus = fb.Bus(self.remote, "alpha")
+            bus.sync()
+            self.assertIsNone(fb.look_at_main(bus, RUN, "alpha", {"hung": True}))
+            self.assertEqual(glob.glob(os.path.join(env["FB_CACHE"], "bus", "*.main-*")), [])
+            bus.release()
+        self.assertEqual(self.gh_calls(), [])
+
+    # Resume
+
+    def lost_and_told(self):
+        self.edit({"beats/money.json": {"at": OLD, "status": "working", "account": "bravo", "note": ""}})
+        self.assertEqual(self.j("alpha", "conduct", "--run", RUN)["freed"], ["money"])
+        self.age_beat("money", fb.UNCLAIMED_MINUTES + 1)
+        self.next_pass()
+        self.assertEqual(len(self.said("human", "no taker")), 1)
+        self.assertTrue(self.doc("freed/money.json")["told"])
+        self.assertEqual(self.fb("bravo", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+
+    def test_the_30_minute_alert_gives_a_lone_account_its_way_out(self):
+        self.lost_and_told()
+        body = self.said("human", "no taker")[0]["body"]
+        self.assertIn("/fast-builder:join --lane money", body)
+        self.assertIn("%d hours" % (fb.COOLDOWN_MINUTES // 60), body)
+        self.assertIn("same account", body)
+        self.assertIn("resume", body)
+
+    def test_a_resume_puts_a_lost_lane_back_on_offer_and_starts_its_alert_over(self):
+        self.lost_and_told()
+        self.j("alpha", "pause", "--run", RUN)
+        self.assertIn(RUN, self.j("alpha", "resume", "--run", RUN)["runs"])
+        self.assertIsNone(self.doc("freed/money.json"))
+        beat = self.doc("beats/money.json")
+        self.assertEqual(beat["status"], "open")
+        self.assertLess(fb.age_minutes(beat["at"]), 1)
+        self.assertNotIn("went quiet", beat["note"])
+        self.next_pass()
+        self.assertEqual(len(self.said("human", "no taker")), 1, "the new spell has only just begun")
+        self.age_beat("money", fb.UNCLAIMED_MINUTES + 1)
+        self.next_pass()
+        self.next_pass()
+        self.assertEqual(len(self.said("human", "no taker")), 2, "a new spell gets a new alert, once")
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_a_resume_on_a_running_run_clears_a_cooldown_too(self):
+        self.lost_and_told()
+        self.assertIn(RUN, self.j("bravo", "resume", "--run", RUN, "--remote", self.remote)["runs"])
+        self.assertIsNone(self.doc("freed/money.json"))
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+        again = self.j("bravo", "resume", "--run", RUN, "--remote", self.remote)
+        self.assertEqual(again["runs"], [], "nothing to clear is nothing moved")
+
+    def test_a_resume_clears_a_cooldown_only_the_beat_note_holds(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(5), "status": "open", "account": None, "note": "freed: bravo went quiet"}})
+        self.assertEqual(self.fb("bravo", "poll", "--remote", self.remote).stdout.strip(), "NOTHING")
+        self.j("alpha", "pause", "--run", RUN)
+        self.j("alpha", "resume", "--run", RUN)
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_a_resume_leaves_held_and_never_held_lanes_alone(self):
+        self.edit({"freed/core.json": {"lost": {"zulu": ago(5)}}})
+        self.publish(accounts=2, today="2026-10-31")
+        run = "hph-10-31-26"
+        self.fb("charlie", "join", "--run", run, "--lane", "core")
+        self.j("alpha", "pause", "--run", RUN)
+        self.j("alpha", "resume", "--run", RUN)
+        self.assertEqual(self.doc("freed/core.json")["lost"].keys(), {"zulu"}, "a held lane is not back on offer")
+        self.j("alpha", "pause", "--run", run)
+        self.j("alpha", "resume", "--run", run)
+        self.assertIsNone(self.on_bus("runs/%s/beats/money.json" % run), "a lane never held gets no beat")
+
+    def test_a_stopped_lane_coming_back_loses_its_cooldown_too(self):
+        self.edit({"freed/money.json": {"lost": {"bravo": ago(5)}, "told": "x"}})
+        self.j("alpha", "stop", "--run", RUN)
+        self.fb("bravo", "lane-state", "stopped")
+        self.j("alpha", "resume", "--run", RUN)
+        self.assertIsNone(self.doc("freed/money.json"))
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_a_directory_where_a_freed_file_should_be_costs_no_resume(self):
+        self.edit({"claims/money.json": None, "beats/money.json": {"at": ago(5), "status": "open", "account": None, "note": "x"}, "freed/money.json/x": "y"})
+        self.j("alpha", "pause", "--run", RUN)
+        self.assertIn(RUN, self.j("alpha", "resume", "--run", RUN)["runs"])
+
+    # A listener pass
+
+    def test_a_stop_is_handled_before_gh_can_hold_a_pass_up(self):
+        self.publish(accounts=2, today="2026-10-31")
+        self.fb("zulu", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        self.j("alpha", "stop", "--run", RUN)
+        self.checks(passed())
+        alive = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(alive.wait)
+        self.addCleanup(alive.kill)
+        key = RUN + "/money"
+        path = os.path.join(self.env("zulu")["FB_HOME"], "children.json")
+        with open(path, "w") as handle:
+            json.dump({key: {"pid": alive.pid, "started": fb.process_start(alive.pid), "remote": self.remote, "attempt": 0, "at": ago(1)}}, handle)
+        self.fb("zulu", "listen", "--once")
+        self.assertTrue(self.gh_calls(), "the other run does ask")
+        self.assertIn("term_at", self.probes()[0]["children"][key], "the stop came first")
+
+    def test_a_dead_lane_a_pass_frees_is_still_not_restarted_in_that_pass(self):
+        self.fb("zulu", "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"))
+        self.open_money()
+        self.fb("zulu", "join", "--run", RUN, "--lane", "money")
+        self.age_beat("money", fb.STALE_MINUTES + 1)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "children.json")
+        with open(path, "w") as handle:
+            json.dump({RUN + "/money": {"pid": dead.pid, "started": "x", "remote": self.remote, "attempt": 0, "at": ago(1)}}, handle)
+        self.edit({"conductor.json": {"holder": "zulu", "at": ago(11)}})
+        self.fb("zulu", "listen", "--once")
+        self.assertEqual(self.doc("beats/money.json")["status"], "open")
+        self.assertEqual(json.load(open(path)), {})
+        log = open(self.shim_log).read() if os.path.exists(self.shim_log) else ""
+        self.assertNotIn("lane money", log)
+
+
+    # Review of the review: what reads green must have earned it
+
+    def in_suite(self, row, suite=1, app=7, slug="github-actions"):
+        return dict(row, check_suite={"id": suite}, app={"id": app, "slug": slug})
+
+    def timed(self, row, began, ended):
+        return dict(row, started_at=ago(began) if began is not None else None, completed_at=ago(ended) if ended is not None else None)
+
+    def test_a_row_of_another_suite_or_app_does_not_replace_a_failure(self):
+        fail, ok = self.timed(failed("test"), 60, 50), self.timed(passed("test"), 40, 30)
+        for only in ([], ["test"]):
+            for later in (self.in_suite(ok, suite=2), self.in_suite(ok, app=8, slug="other"), self.in_suite(ok, suite=2, app=8, slug="other")):
+                self.assertEqual(self.state_of(self.in_suite(fail), later, only=only), "red", later)
+            self.assertEqual(self.state_of(self.in_suite(fail), self.in_suite(ok), only=only), "green", "a genuine re-run")
+
+    def test_what_a_row_does_not_say_matches_only_what_another_does_not_say(self):
+        fail, ok = self.timed(failed("test"), 60, 50), self.timed(passed("test"), 40, 30)
+        self.assertEqual(self.state_of(fail, self.in_suite(ok)), "red", "no suite against a suite")
+        self.assertEqual(self.state_of(self.in_suite(fail), ok), "red")
+        self.assertEqual(self.state_of(dict(fail, app={"id": 7}), dict(ok, app={"slug": "github-actions"})), "red", "nothing says these are one app")
+        self.assertEqual(self.state_of(dict(fail, app={"slug": "a"}), dict(ok, app={"slug": "a"})), "green", "a slug is enough")
+        self.assertEqual(self.state_of(dict(fail, app={"id": 7, "slug": "a"}), dict(ok, app={"id": 7, "slug": "b"})), "green", "the id decides")
+        self.assertEqual(self.state_of(dict(fail, check_suite={"id": 1}), dict(ok, check_suite={"id": 1})), "green")
+        self.assertEqual(self.state_of(dict(fail, app=None, check_suite=None), dict(ok, app=None, check_suite=None)), "green")
+        for bad in (7, "x", [], {}, {"id": None}, {"id": [1]}, {"id": {}}, {"id": True}, {"id": 1.5}, {"slug": ["a"]}):
+            for field in ("app", "check_suite"):
+                self.assertEqual(self.state_of(dict(fail, **{field: bad}), dict(ok, **{field: bad})), "red", (field, bad))
+        self.assertEqual(self.state_of(dict(fail, check_suite={"id": 1}), dict(ok, check_suite={"id": "1"})), "red")
+
+    def test_a_row_with_no_verdict_replaces_nothing(self):
+        fail, lint = self.timed(failed("test"), 60, 50), self.timed(passed("lint"), 60, 50)
+        for word in ("skipped", "neutral", "cancelled", "stale", "action_required", "new-word", None, ["success"]):
+            later = dict(self.timed(passed("test"), 40, 30), conclusion=word)
+            for rows in ((fail, later, lint), (later, fail, lint), (self.in_suite(fail), self.in_suite(later), self.in_suite(lint))):
+                self.assertEqual(self.state_of(*rows), "red", word)
+        skipped = dict(self.timed(passed("test"), 40, 30), conclusion="skipped")
+        self.assertEqual(self.state_of(skipped, self.timed(passed("test"), 20, 10)), "green", "and it can itself be replaced")
+        self.assertEqual(self.state_of(fail, skipped, self.timed(passed("test"), 20, 10)), "green", "a real re-run still counts past it")
+        self.assertEqual(self.state_of(fail, dict(self.timed(passed("test"), 40, 30), status=["completed"], conclusion=None), lint), "red", "a status nobody knows")
+
+    def test_a_row_times_cannot_drop_it(self):
+        lint = self.timed(passed("lint"), 60, 50)
+        self.assertEqual(self.state_of(self.timed(failed("test"), 5, 60), lint), "red")
+        self.assertEqual(self.state_of(dict(failed("test"), started_at="2099-01-01T00:00:00Z", completed_at=ago(5)), lint), "red")
+        self.assertEqual(self.state_of(self.timed(failed("test"), 5, 60), self.timed(passed("test"), 3, 2)), "red", "an inverted failure can be read no way but standing")
+
+    def test_a_time_in_the_future_or_an_inverted_row_does_not_win(self):
+        fail = self.timed(failed("test"), 60, 50)
+        lint = self.timed(passed("lint"), 60, 50)
+        far = "2099-01-01T00:00:00Z"
+        for later in (dict(passed("test"), started_at=far, completed_at=far),
+                      dict(passed("test"), started_at=far, completed_at=None),
+                      dict(passed("test"), started_at=ago(40), completed_at=far),
+                      dict(passed("test"), started_at=far),
+                      dict(failed("test"), started_at=far, completed_at=far),
+                      self.timed(passed("test"), 5, 40),
+                      {"name": "test", "status": "in_progress", "conclusion": None, "started_at": far, "completed_at": None},
+                      {"name": "test", "status": "queued", "conclusion": None, "started_at": far, "completed_at": None},
+                      dict(passed("test"), started_at="soon", completed_at=ago(40)),
+                      dict(passed("test"), started_at={}, completed_at=ago(40))):
+            for rows in ((fail, later, lint), (later, fail, lint)):
+                self.assertEqual(self.state_of(*rows), "red", later)
+        ok = self.timed(passed("test"), 60, 50)
+        self.assertEqual(self.state_of(ok, dict(failed("test"), started_at=far, completed_at=far)), "red", "and a failure it cannot beat stands too")
+        self.assertEqual(self.state_of(ok, dict(passed("test"), started_at=far, completed_at=far)), "green", "nothing dropped, and nothing wrong")
+
+    def test_a_year_nobody_can_add_to_does_not_break_a_reading(self):
+        for stamp in ("9999-12-31T23:59:59-14:00", "0001-01-01T00:00:00+14:00", "2026-13-40T00:00:00Z", "", 7, None, [], {}):
+            rows = [self.timed(failed("test"), 60, 50), dict(passed("test"), started_at=stamp, completed_at=stamp)]
+            self.assertEqual(self.state_of(*rows), "red", stamp)
+
+    def test_no_shape_of_row_breaks_a_reading(self):
+        junk = (None, 7, "x", [], {}, ["completed"], {"id": {}}, True, 1.5)
+        for field in ("status", "conclusion", "started_at", "completed_at", "app", "check_suite"):
+            for value in junk:
+                rows = [dict(self.timed(failed("test"), 60, 50), **{field: value}), self.timed(passed("test"), 40, 30)]
+                self.assertIn(self.state_of(*rows), ("red", None, "green"), (field, value))
+                rows = [self.timed(failed("test"), 60, 50), dict(self.timed(passed("test"), 40, 30), **{field: value})]
+                self.assertIn(self.state_of(*rows), ("red", "green") if field not in ("status", "conclusion") else ("red",), (field, value))
+
+    def test_a_false_green_tells_nobody_main_recovered(self):
+        fail = self.in_suite(self.timed(failed("test"), 60, 50))
+        self.checks(fail, passed("lint"))
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "red")
+        for later in (self.in_suite(self.timed(passed("test"), 40, 30), suite=2),
+                      self.in_suite(dict(self.timed(passed("test"), 40, 30), conclusion="skipped")),
+                      self.in_suite(dict(passed("test"), started_at="2099-01-01T00:00:00Z", completed_at="2099-01-01T00:00:00Z"))):
+            self.checks(fail, later, self.in_suite(passed("lint"), suite=3))
+            self.due()
+            tick = self.j("alpha", "tick")
+            self.assertEqual(tick["main"]["state"], "red", later)
+            self.assertIn("Fixing it comes before", tick["instruction"])
+        self.assertEqual(self.said("all", "green again"), [])
+        self.checks(fail, self.in_suite(self.timed(passed("test"), 40, 30)), self.in_suite(passed("lint"), suite=3))
+        self.due()
+        self.assertEqual(self.j("alpha", "tick")["main"]["state"], "green")
+        self.assertEqual(len(self.said("all", "green again")), 1)
+
+    # A tick says what is true when it returns
+
+    def tick_while_gh_hangs(self, account="alpha", *also):
+        self.checks(passed("lint"), sleep=8)
+        self.due(account)
+        started = len(self.gh_calls())
+        proc = subprocess.Popen([sys.executable, FB, "tick"] + list(also), cwd=self.clone(account), env=self.env(account), stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        end = time.time() + 30
+        while len(self.gh_calls()) == started and time.time() < end:
+            time.sleep(0.05)
+        self.assertEqual(len(self.gh_calls()), started + 1, "tick reached gh")
+        return proc, started
+
+    def test_a_stop_that_lands_while_gh_hangs_is_what_that_tick_says(self):
+        proc, started = self.tick_while_gh_hangs("alpha", "--exit-code")
+        self.j("bravo", "stop", "--run", RUN)
+        self.assertIsNone(proc.poll(), "the stop landed while the tick was in gh")
+        out, err = proc.communicate(timeout=60)
+        got = json.loads(out)
+        self.assertEqual(got["action"], "stop", err)
+        self.assertEqual(got["state"], "stopping")
+        self.assertEqual(got["instruction"], fb.INSTRUCTIONS["stop"])
+        self.assertEqual(proc.returncode, fb.EXIT_CODES["stop"])
+        self.assertEqual(len(self.gh_calls()), started + 1, "and no second gh call to find that out")
+        cache = os.path.join(self.clone("alpha"), ".git", "fast-builder", "control-cache.json")
+        self.assertEqual(json.load(open(cache))["action"], "stop", "the hook hears the same")
+
+    def test_a_pause_a_drain_and_a_lost_lane_are_what_that_tick_says_too(self):
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "pause", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "pause")
+        self.j("bravo", "resume", "--run", RUN)
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "stop", "--drain", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "drain")
+        self.j("bravo", "resume", "--run", RUN)
+        proc, _ = self.tick_while_gh_hangs()
+        self.edit({"claims/core.json": {"account": "zulu", "session": "z" * 32, "where": "cloud"}})
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "lost")
+
+    def test_a_stop_gone_again_by_the_time_gh_answers_is_not_said_either(self):
+        proc, _ = self.tick_while_gh_hangs()
+        self.j("bravo", "pause", "--run", RUN)
+        self.j("bravo", "resume", "--run", RUN)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(json.loads(proc.communicate(timeout=60)[0])["action"], "continue")
+
+    def test_a_tick_that_closes_the_run_says_so(self):
+        for lane, account in (("core", "alpha"), ("money", "bravo")):
+            self.fb(account, "lane-state", "done")
+        self.checks(passed("lint"))
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(11)}})
+        # a done lane's tick conducts, and that is what finishes the run
+        self.assertEqual(json.loads(self.fb("alpha", "tick").stdout)["action"], "finished")
+
+    # The alert's way out
+
+    def cool(self, run=RUN, lane="money"):
+        base = "" if run == RUN else "../%s/" % run
+        files = {base + "beats/%s.json" % lane: {"at": ago(5), "status": "open", "account": None, "note": "freed: bravo went quiet"},
+                 base + "freed/%s.json" % lane: {"lost": {"bravo": ago(5)}, "told": ago(5)}}
+        if self.on_bus("runs/%s/claims/%s.json" % (run, lane)) is not None:
+            files[base + "claims/%s.json" % lane] = None
+        self.edit(files)
+
+    def test_the_alert_names_a_command_that_works_as_written(self):
+        self.lost_and_told()
+        body = self.said("human", "no taker")[0]["body"]
+        self.assertIn("/fast-builder:resume --run %s" % RUN, body)
+        self.assertIn("/fast-builder:join --lane money --run %s" % RUN, body)
+        self.assertIn("fb.py prompt --lane money --run %s" % RUN, body)
+        self.assertEqual(self.j("zulu", "resume", "--run", RUN, "--remote", self.remote)["runs"], [RUN])
+        self.assertIsNone(self.doc("freed/money.json"))
+        self.assertIn("lane=money", self.fb("bravo", "poll", "--remote", self.remote).stdout)
+
+    def test_both_selectors_find_a_running_run_with_a_cooled_lane(self):
+        for args in (("resume",), ("resume", "--all")):
+            self.cool()
+            got = self.j("zulu", *args, "--remote", self.remote)
+            self.assertEqual(got["runs"], [RUN], args)
+            self.assertIsNone(self.doc("freed/money.json"))
+            self.assertEqual(self.doc("beats/money.json")["note"], "back on offer after a resume")
+            self.assertEqual(self.doc("control.json").get("state", "running"), "running")
+
+    def test_a_running_run_with_nothing_cooled_is_not_something_to_resume(self):
+        got = self.fb("zulu", "resume", "--remote", self.remote, check=False)
+        self.assertEqual(got.returncode, 1)
+        self.assertIn("0 runs could resume", got.stderr)
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [])
+        self.edit({"freed/money.json": {"lost": {"bravo": ago(5)}}})  # money is held: back_on_offer leaves a held lane alone
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [])
+        self.assertTrue(self.doc("freed/money.json"))
+        self.assertEqual(self.doc("claims/money.json")["account"], "bravo")
+
+    def test_a_cooled_run_nobody_can_read_the_state_of_is_left_alone(self):
+        self.cool()
+        for bad in ("[]", "nonsense", '{"state": 5}', '{"state": "who-knows"}'):
+            self.edit({"control.json": bad})
+            self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [], bad)
+            self.assertTrue(self.doc("freed/money.json"), bad)
+            self.assertEqual(self.fb("zulu", "resume", "--remote", self.remote, check=False).returncode, 1, bad)
+
+    def test_a_cooled_lane_does_not_widen_what_may_be_resumed(self):
+        self.publish(accounts=2, today="2026-10-31")
+        other = "hph-10-31-26"
+        self.cool()
+        self.cool(other)
+        got = self.fb("zulu", "resume", "--remote", self.remote, check=False)
+        self.assertEqual(got.returncode, 1, "two candidates and nothing to choose by")
+        self.assertIn("2 runs could resume", got.stderr)
+        self.assertIn(RUN, got.stderr)
+        self.assertIn(other, got.stderr)
+        self.assertTrue(self.doc("freed/money.json"), "and it touched neither")
+        self.j("alpha", "stop", "--run", other)
+        self.edit({"../%s/control.json" % other: {"state": "stopped", "reason": "by someone", "by": "alpha", "at": ago(1)}})
+        got = self.j("zulu", "resume", "--all", "--remote", self.remote)
+        self.assertEqual(got["runs"], [RUN])
+        self.assertEqual(got["not_resumed_stopped"], [other], "a stopped run stays stopped under --all, cooled or not")
+        self.assertEqual(json.loads(self.on_bus("runs/%s/control.json" % other))["state"], "stopped")
+        self.assertTrue(json.loads(self.on_bus("runs/%s/freed/money.json" % other)))
+
+    def test_a_stop_landing_after_a_run_was_picked_for_its_cooled_lane_is_not_undone(self):
+        self.cool()
+        env = self.env("zulu")
+
+        def cool_only():
+            with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]):
+                bus = fb.Bus(self.remote, "zulu")
+                try:
+                    return fb.set_control(bus, RUN, "running", "x", "zulu", cool_only=True)
+                finally:
+                    bus.release()
+        for state in ("stopping", "paused", "draining", "stopped", "finished"):
+            land = {"state": state, "reason": "someone", "by": "alpha", "at": ago(0)}
+            self.edit({"control.json": land})
+            self.assertFalse(cool_only(), state)
+            self.assertEqual(self.doc("control.json"), land)
+        self.edit({"control.json": {"state": "running", "reason": "", "by": "alpha", "at": ago(0)}, "STOP": ""})
+        self.assertFalse(cool_only())
+        self.assertIsNotNone(self.on_bus("runs/%s/STOP" % RUN))
+        self.assertTrue(self.doc("freed/money.json"))
+        self.edit({"STOP": None})
+        self.assertTrue(cool_only(), "and with no stop it does what it is for")
+        self.assertIsNone(self.doc("freed/money.json"))
+
+    def test_a_run_stop_file_is_not_a_cooled_lane_to_a_bare_resume(self):
+        self.cool()
+        self.edit({"STOP": ""})
+        self.assertEqual(self.fb("zulu", "resume", "--remote", self.remote, check=False).returncode, 1)
+        self.assertIsNotNone(self.on_bus("runs/%s/STOP" % RUN))
+        self.assertTrue(self.doc("freed/money.json"))
+        self.assertEqual(self.j("zulu", "resume", "--all", "--remote", self.remote)["runs"], [RUN], "--all has always cleared one")
+        self.assertIsNone(self.on_bus("runs/%s/STOP" % RUN))
+
+    def test_pause_and_stop_are_not_softened_by_a_cooled_lane(self):
+        self.cool()
+        self.j("alpha", "pause", "--run", RUN)
+        self.assertEqual(self.doc("control.json")["state"], "paused")
+        self.assertEqual(self.j("zulu", "pause", "--all", "--remote", self.remote)["runs"], [], "paused already: nothing new")
+        self.assertTrue(self.doc("freed/money.json"), "only a resume takes a cooldown off")
+        self.assertEqual(self.j("zulu", "stop", "--all", "--remote", self.remote)["runs"], [RUN])
+        self.assertEqual(self.doc("control.json")["state"], "stopping")
+        self.assertTrue(self.doc("freed/money.json"))
+
+    # A reinstall keeps what was chosen
+
+    def config_of(self, account="zulu"):
+        return json.load(open(os.path.join(self.env(account)["FB_HOME"], "config.json")))["repos"]["owner/app"]
+
+    def install(self, *flags, account="zulu"):
+        return self.fb(account, "listen-install", "--dry-run", "--remote", self.remote, *flags)
+
+    def test_a_bare_reinstall_keeps_what_was_chosen(self):
+        self.install("--no-local", "--no-cloud", "--permission-mode", "acceptEdits", "--routine-id", rid("123"))
+        got = json.loads(self.install().stdout)
+        self.assertEqual(got["permission_mode"], "acceptEdits")
+        held = self.config_of()
+        self.assertEqual((held["local"], held["cloud"], held["permission_mode"], held["routine_id"]), (False, False, "acceptEdits", rid("123")))
+
+    def test_a_flag_on_a_reinstall_changes_only_that_flag(self):
+        self.install("--no-local", "--permission-mode", "dontAsk")
+        self.install("--no-cloud")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"], self.config_of()["permission_mode"]), (False, False, "dontAsk"))
+        self.install("--local")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, False))
+        self.install("--cloud")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+        self.install("--permission-mode", "auto")
+        self.assertEqual(self.config_of()["permission_mode"], "auto")
+        self.assertEqual(self.fb("zulu", "listen-install", "--dry-run", "--remote", self.remote, "--local", "--no-local", check=False).returncode, 2)
+
+    def test_a_first_install_has_the_old_defaults(self):
+        got = json.loads(self.install().stdout)
+        self.assertEqual(got["permission_mode"], "auto")
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+
+    def test_bypass_is_never_carried_by_a_reinstall_and_says_so(self):
+        proc = self.install("--permission-mode", "bypassPermissions")
+        self.assertEqual(self.config_of()["permission_mode"], "bypassPermissions", "said in as many words")
+        self.assertNotIn("WARNING", proc.stderr)
+        proc = self.install()
+        got = json.loads(proc.stdout)
+        self.assertEqual(got["permission_mode"], "auto")
+        self.assertEqual(self.config_of()["permission_mode"], "auto")
+        self.assertIn("bypassPermissions", proc.stderr)
+        self.assertIn("auto", proc.stderr)
+        self.assertIn("--permission-mode bypassPermissions", proc.stderr)
+        self.assertIn("bypassPermissions", got["warning"])
+        proc = self.install()
+        self.assertEqual(proc.stderr, "", "it was said once, and auto is now what is held")
+        self.install("--permission-mode", "bypassPermissions")
+        self.assertEqual(self.config_of()["permission_mode"], "bypassPermissions", "and it can be chosen again")
+
+    def test_a_config_saying_anything_else_cannot_bring_on_a_mode_by_itself(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        for bad in ("BypassPermissions", "bypassPermissions ", "plan", "", 7, None, [], {}, ["bypassPermissions"]):
+            config = json.load(open(path))
+            config["repos"]["owner/app"]["permission_mode"] = bad
+            with open(path, "w") as handle:
+                json.dump(config, handle)
+            proc = self.install()
+            self.assertEqual(json.loads(proc.stdout)["permission_mode"], "auto", bad)
+            self.assertEqual(self.config_of()["permission_mode"], "auto", bad)
+
+    def test_a_config_entry_that_is_not_a_table_costs_no_reinstall(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        for bad in ([], 7, "x", None):
+            config = json.load(open(path))
+            config["repos"]["owner/app"] = bad
+            with open(path, "w") as handle:
+                json.dump(config, handle)
+            self.assertEqual(json.loads(self.install().stdout)["permission_mode"], "auto", bad)
+            self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True), bad)
+
+    def test_a_flag_that_is_not_a_yes_or_no_reads_as_what_a_first_install_gives(self):
+        self.install()
+        path = os.path.join(self.env("zulu")["FB_HOME"], "config.json")
+        config = json.load(open(path))
+        config["repos"]["owner/app"].update(local="no", cloud=0)
+        with open(path, "w") as handle:
+            json.dump(config, handle)
+        self.install()
+        self.assertEqual((self.config_of()["local"], self.config_of()["cloud"]), (True, True))
+
+    # Bad bus files and missing history
+
+    def test_a_directory_where_requests_json_should_be_costs_no_requests(self):
+        self.ask_conductor()
+        self.edit({"requests.json/x": "y"})
+        got = self.j("alpha", "inbox", "--run", RUN, "--who", "conductor", "--mark")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.doc("requests.json")["read"], [got[0]["id"]], "it takes a real file's place, as a bad file's reading does")
+        self.assertEqual(self.j("bravo", "inbox", "--run", RUN, "--who", "conductor"), [])
+
+    def test_a_directory_where_requests_json_should_be_costs_no_conductor_pass(self):
+        self.ask_conductor(at=ago(fb.REQUEST_UNREAD_MINUTES + 1))
+        self.edit({"requests.json/x": "y"})
+        self.next_pass()
+        self.assertEqual(len(self.unread_said()), 1)
+        self.next_pass()
+        self.assertEqual(len(self.unread_said()), 1, "told once")
+        self.assertTrue(self.doc("requests.json")["told"])
+
+    def test_a_write_or_removal_over_a_directory_on_the_bus_costs_no_commit(self):
+        self.edit({"junk.json/deep/x": "y"})
+        env = self.env("alpha")
+        with unittest.mock.patch.dict(os.environ, env), unittest.mock.patch.object(fb, "CACHE_DIR", env["FB_CACHE"]):
+            bus = fb.Bus(self.remote, "alpha")
+            self.addCleanup(bus.release)
+            self.assertTrue(bus.commit(lambda: {"runs/%s/junk.json" % RUN: "{}"}, "write"))
+            self.assertEqual(self.on_bus("runs/%s/junk.json" % RUN), "{}")
+            self.edit({"junk.json": None, "junk2.json/x": "y"})
+            self.assertTrue(bus.commit(lambda: {"runs/%s/junk2.json" % RUN: None}, "remove"))
+            self.assertIsNone(self.on_bus("runs/%s/junk2.json/x" % RUN))
+
+    def test_a_failed_mark_still_hands_over_what_it_read(self):
+        for error in (OSError("disk"), fb.FbError("bus is too busy")):
+            with unittest.mock.patch.object(fb.Bus, "commit", side_effect=error) as commit:
+                fb.mark_requests_read(fb.Bus(self.remote, "alpha"), RUN, ["x"])
+            self.assertEqual(commit.call_count, 1)
+
+    def test_a_clone_without_the_old_copy_says_which_tests_did_not_run(self):
+        repo = tempfile.mkdtemp(dir=self.root)
+        os.makedirs(os.path.join(repo, "scripts"))
+        for name in ("fb.py", "test_fb.py"):
+            shutil.copy(os.path.join(HERE, name), os.path.join(repo, "scripts", name))
+        sh(["git", "init", "-q", repo])
+        sh(["git", "add", "-A"], cwd=repo)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"], cwd=repo)
+        name = "Hardening.test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit"
+        proc = subprocess.run([sys.executable, "-I", "scripts/test_fb.py", name], cwd=repo, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("skipped=1", proc.stderr)
+        last = proc.stderr.strip().splitlines()[-1]
+        self.assertIn("DID NOT RUN", last, "the last thing said, after the summary")
+        self.assertIn("a4ead91b", last)
+        self.assertIn("git fetch --unshallow", last)
+        self.assertIn("test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit", last)
 
 
 class CloudBootstrap(World):

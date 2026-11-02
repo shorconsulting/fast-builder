@@ -24,7 +24,7 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
 4. Listeners see the bus move. For a local run they claim a lane and start `claude -p` in its own clone. For a cloud run
    they fire the account's routine, and the routine claims from inside the cloud. Whatever is left is printed by
    `prompt`, to paste. (`claude --cloud` is not used: it needs a real terminal, and can stop at interactive dialogs.)
-5. Each lane loops on `tick`. The conductor frees quiet lanes and closes the run.
+5. Each lane loops on `tick`. The conductor frees quiet lanes, watches main, and closes the run.
 6. A freed lane's beat keeps `freed_from`. The next claim turns it into `took_from`, and `join` replaces that with one
    `takeover` message to a person and puts how to open the session in the claim's `open`. So a lane that never starts is
    no takeover, and neither is an account retaking its own lane. A `takeover` is news, not a request, so it stays out of
@@ -58,9 +58,12 @@ bus writer cannot edit a routine. The listener renames itself only after its own
 writer can still spend up to 12 Haiku calls a pass on a listener whose routine is gone, or fill those 12 places and hide
 a real swap until those rows are removed. The blocker then says how many went untried, and `switch NAME` still reaches
 that name's row. The listener puts no free text from the bus on a command line: names, model and base branch must match
-strict patterns, and the prompt is a fixed template. A bus with a symlink on it is refused. Local lanes run the `fb.py`
+strict patterns, and the prompt is a fixed template. The conductor's `gh api` call takes the repo from the clone's remote
+and only a pattern-checked, percent-encoded base branch from the bus. Check names are repo data: they are only compared
+and printed, cleaned and capped first, here and again when read back from `main.json`. A bus with a symlink on it is refused. Local lanes run the `fb.py`
 that `listen-install` copied to the computer. Cloud lanes cannot, so they run the bus's copy, which is one more reason the
 repo's write access matters. A bus file that is not the object it should be reads as empty, except `control.json`, which
 then reads as stopping, as an unknown state does. One bad run cannot stop another run's stop being handled. A lane's
 model reads the plan, so a hostile plan could still mislead it. That is why the listener's local permission mode
-defaults to `auto` and `bypassPermissions` has to be chosen when it is installed.
+defaults to `auto` and `bypassPermissions` has to be chosen each time it is installed: a reinstall that does not name it
+goes back to `auto` and says so.

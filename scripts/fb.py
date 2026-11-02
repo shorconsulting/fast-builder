@@ -26,6 +26,8 @@ Layout of the bus:
   runs/<run>/beats/<lane>.json    heartbeat and lane status
   runs/<run>/handoffs/<lane>.md   rolling handoff, what a replacement account starts from
   runs/<run>/conductor.json       lease on the cross-account orchestrator role
+  runs/<run>/main.json            the base branch's last known check state
+  runs/<run>/freed/<lane>.json    which accounts lost this lane to going quiet, and when
   runs/<run>/msgs/<id>.json       messages between lanes, the conductor and the human
 
 See docs/protocol.md. Everything is a subcommand: fb.py --help.
@@ -45,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 from xml.sax.saxutils import escape
 
@@ -72,7 +75,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -84,6 +87,7 @@ DEFAULT_MAX_ACCOUNTS = 4
 ROUTE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 STALE_MINUTES = 45
 BEAT_SECONDS = 300
+BEAT_RETRY_SECONDS = 60  # after a beat that could not land
 CONTROL_CACHE_SECONDS = 15
 LEASE_MINUTES = 20
 STOP_BLOCK_CAP = 3
@@ -139,9 +143,29 @@ STATUS_RE = re.compile(r"(?:HTTP(?:/[0-9.]+)?\s+|Status:?\s*)?([0-9]{3})(?:\s+(?
 FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}\Z")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}\Z")
 MODEL_RE = re.compile(r"^(opus|sonnet|haiku|claude-[a-z0-9-]{1,40})\Z")
+SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,100}/[A-Za-z0-9][A-Za-z0-9._-]{0,100}\Z")
+SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+CHECK_NAME_DROP = re.compile(r"[^A-Za-z0-9 ._:/()+#=-]+")
 LOCK_SECONDS = 30
 LANE_STOP_SECONDS = 10
 HOOK_LOCK_SECONDS = 4
+MAIN_SECONDS = 300  # how often one account asks GitHub about the base branch
+MAIN_ASK_SECONDS = 60  # every page of a head: a real one with 1,054 rows took 19.5 seconds
+MAIN_RED_MINUTES = 120
+MAIN_NAMES = 8
+MAIN_NAME_LEN = 60
+BYPASS = "bypassPermissions"
+KEPT_MODES = ("acceptEdits", "auto", "dontAsk")  # what a reinstall may carry over without being told
+COOLDOWN_MINUTES = 180  # how long an account that lost a lane to going quiet is not handed it back
+UNCLAIMED_MINUTES = 30
+CLAIM_QUIET_MINUTES = 20  # a claim no session ever joined: a live one joins in a minute or two
+REQUEST_UNREAD_MINUTES = 60  # a request to the conductor nobody has read: every live lead ticks within 45
+REQUESTS_FILE = "requests.json"
+MAIN_RED = ("failure", "timed_out", "startup_failure")
+MAIN_GREEN = ("success", "neutral", "skipped")
+MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
+CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
+OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
 
 
 class FbError(Exception):
@@ -512,6 +536,8 @@ class Bus:
                 return False
             for rel, text in files.items():
                 full = self.path(rel)
+                if os.path.isdir(full) and not os.path.islink(full):  # anyone can push one, and it reads as a bad file does: empty, and replaced on writing
+                    shutil.rmtree(full)
                 if text is None:
                     if os.path.exists(full):
                         os.remove(full)
@@ -659,6 +685,39 @@ def messages_for(bus, run, who, seen=()):
     return out
 
 
+def cooling(bus, run, lane, account):
+    """Whether this lane went quiet under this account too recently to be handed back to it. The beat's note counts too:
+    it is all an old copy of this tool leaves behind. A time far ahead of the clock cannot lock an account out."""
+    lost = bus.doc("runs/%s/freed/%s.json" % (run, lane)).get("lost")
+    at = lost.get(account) if isinstance(lost, dict) else None
+    if at is None:
+        beat = beat_of(bus, run, lane)
+        if beat.get("status") == "open" and beat.get("note") == "freed: %s went quiet" % account:
+            at = beat.get("at")
+    return abs(age_minutes(at)) < COOLDOWN_MINUTES
+
+
+def lost_lane(bus, run, lane, account):
+    """The file saying account lost this lane. Its own file: the next claim overwrites a beat, and old copies never read it."""
+    rel = "runs/%s/freed/%s.json" % (run, lane)
+    doc = bus.doc(rel)
+    held = doc.get("lost") if isinstance(doc.get("lost"), dict) else {}
+    lost = {who: at for who, at in held.items() if age_minutes(at) < COOLDOWN_MINUTES}
+    if isinstance(account, str):
+        lost[account] = now_iso()
+    return {rel: dumps(dict(doc, lost=lost))}
+
+
+def rejoined(bus, run, lane, token):
+    """The files for a session taking a lane its account holds. A beat still saying `claimed` has not heard from a session
+    of this copy, so its time starts now."""
+    files = {"runs/%s/claims/%s.json" % (run, lane): dumps(dict(bus.doc("runs/%s/claims/%s.json" % (run, lane)), session=token))}
+    beat = beat_of(bus, run, lane)
+    if beat.get("note") == "claimed":
+        files["runs/%s/beats/%s.json" % (run, lane)] = dumps(dict(beat, at=now_iso(), note="joined"))
+    return files
+
+
 def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, token=None):
     """Atomically claim a lane: the named one, or the first open one. Returns its name.
 
@@ -679,18 +738,12 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         mine = [n for n in names if bus.doc("runs/%s/claims/%s.json" % (run, n)).get("account") == account]
         if lane and lane in mine:
             won["lane"] = lane
-            if not token:
-                return {}
-            doc = dict(bus.doc("runs/%s/claims/%s.json" % (run, lane)), session=token)
-            return {"runs/%s/claims/%s.json" % (run, lane): dumps(doc)}
+            return rejoined(bus, run, lane, token) if token else {}
         if mine and not allow_second:
             if lane:
                 raise Taken("%s already holds lane %s in %s" % (account, mine[0], run))
             won["lane"] = mine[0]
-            if not token:
-                return {}
-            doc = dict(bus.doc("runs/%s/claims/%s.json" % (run, mine[0])), session=token)
-            return {"runs/%s/claims/%s.json" % (run, mine[0]): dumps(doc)}
+            return rejoined(bus, run, mine[0], token) if token else {}
         if lane:
             if lane not in names:
                 raise FbError("no lane %s in %s" % (lane, run))
@@ -698,6 +751,11 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         else:
             candidates = names
         open_lanes = [n for n in candidates if not bus.exists("runs/%s/claims/%s.json" % (run, n))]
+        if not lane:  # naming a lane is a person's call, and still works; taking whatever is open is not
+            cool = [n for n in open_lanes if cooling(bus, run, n, account)]
+            open_lanes = [n for n in open_lanes if n not in cool]
+            if cool and not open_lanes:
+                raise Taken("%s lost lane %s to going quiet in the last %d hours: name it with --lane to take it anyway" % (account, cool[0], COOLDOWN_MINUTES // 60))
         if not open_lanes:
             raise Taken("no open lane in " + run)
         won["lane"] = open_lanes[0]
@@ -705,7 +763,7 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         took = beat_of(bus, run, won["lane"]).get("freed_from")
         if took and took != account:
             doc["took_from"] = took  # join tells a person, so a lane that never starts is no takeover
-        beat = {"at": now_iso(), "status": "working", "account": account, "note": "claimed"}
+        beat = {"at": now_iso(), "status": "working", "account": account, "note": "joined" if token else "claimed"}
         return {"runs/%s/claims/%s.json" % (run, won["lane"]): dumps(doc),
                 "runs/%s/beats/%s.json" % (run, won["lane"]): dumps(beat)}
 
@@ -721,20 +779,54 @@ TRANSITIONS = {
 }
 
 
-def set_control(bus, run, state, reason, by):
+def back_on_offer(bus, run):
+    """The files for a person's resume to take a cooldown off every open lane that has one, whichever account and whether
+    it is in freed/ or only in an old copy's beat note. The alert's marker goes too and the beat's time starts over, so
+    a lane still left open tells a person again."""
+    files = {}
+    for name in lane_names(bus, run):
+        if bus.exists("runs/%s/claims/%s.json" % (run, name)):
+            continue
+        rel, beat = "runs/%s/freed/%s.json" % (run, name), beat_of(bus, run, name)
+        held = os.path.isfile(bus.path(rel))
+        if held:
+            files[rel] = None
+        if beat.get("status") == "open" and (held or str(beat.get("note", "")).startswith("freed: ")):
+            files["runs/%s/beats/%s.json" % (run, name)] = dumps(dict(beat, at=now_iso(), note="back on offer after a resume"))
+    return files
+
+
+def has_cooled_lane(bus, run):
+    """A running run with a lane a resume would put back on offer, and that is all a resume would do to it. A control file
+    nobody can read reads as stopping, and that is not running."""
+    rel = "runs/%s/control.json" % run
+    if bus.exists("runs/%s/STOP" % run) or (bus.exists(rel) and not isinstance(bus.json(rel), dict)):
+        return False
+    return bus.doc(rel).get("state", "running") == "running" and bool(back_on_offer(bus, run))
+
+
+def set_control(bus, run, state, reason, by, cool_only=False):
     """Move a run to state if that is a legal move. pause can never soften a stop, and nothing reopens a finished run.
     Returns whether it moved. A resume also refreshes working lanes' beats: nobody beats while paused, and those lanes
-    must not look dead the moment the run starts again."""
+    must not look dead the moment the run starts again. It takes cooldowns off open lanes too, even on a running run,
+    where that alone counts as moving: it is a lone account's way to have its lane offered again. cool_only: a run picked
+    for that alone, which a stop landing since must not lose to this."""
     moved = {}
 
     def mutate():
         current = bus.doc("runs/%s/control.json" % run).get("state", "running")
+        if cool_only and not has_cooled_lane(bus, run):
+            moved["ok"] = False
+            return {}
         moved["ok"] = current in TRANSITIONS[state]
         if not moved["ok"]:
-            if state == "running" and current == "running" and bus.exists("runs/%s/STOP" % run):
-                moved["ok"] = True
-                return {"runs/%s/STOP" % run: None}
-            return {}
+            if state != "running" or current != "running":
+                return {}
+            files = back_on_offer(bus, run)
+            if bus.exists("runs/%s/STOP" % run):
+                files["runs/%s/STOP" % run] = None
+            moved["ok"] = bool(files)
+            return files
         files = {"runs/%s/control.json" % run: dumps({"state": state, "reason": reason, "by": by, "at": now_iso()})}
         if state == "running":
             files["runs/%s/STOP" % run] = None
@@ -744,20 +836,300 @@ def set_control(bus, run, state, reason, by):
                     claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
                     files["runs/%s/claims/%s.json" % (run, name)] = None
                     files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "stopped lane back on offer", "freed_from": claim.get("took_from") or claim.get("account")})
+                    if os.path.isfile(bus.path("runs/%s/freed/%s.json" % (run, name))):
+                        files["runs/%s/freed/%s.json" % (run, name)] = None
                 elif beat.get("status") == "working":
                     files["runs/%s/beats/%s.json" % (run, name)] = dumps(dict(beat, at=now_iso()))
+            files.update(back_on_offer(bus, run))
         return files
 
     bus.commit(mutate, "control(%s): %s" % (run, state))
     return moved.get("ok", False)
 
 
-def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
+def clean_names(names):
+    """Check names are repo data, and they reach STATUS.md, messages and whichever model reads those. Keep what cannot
+    end a line or a table cell, and not much of it. They are only ever compared and printed, never run."""
+    out = []
+    for name in names if isinstance(names, list) else []:
+        text = CHECK_NAME_DROP.sub(" ", name).strip()[:MAIN_NAME_LEN] if isinstance(name, str) else ""
+        if text and text not in out and len(out) < MAIN_NAMES:
+            out.append(text)
+    return out
+
+
+def check_time(text):
+    """A time on a check run in seconds, or None if it cannot be read. No offset means UTC."""
+    try:
+        when = datetime.datetime.fromisoformat(re.sub(r"[Zz]\Z", "+00:00", text))
+        return (when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def check_family(row):
+    """What must match for one row to replace another: name, app and check suite. A re-run keeps its suite, and any other
+    suite may be another workflow with the same job name. A field no row has matches itself, as a test or a plain status
+    says nothing of it; a field that makes no sense matches nothing."""
+    def part(value, *keys):
+        if value is None:
+            return None
+        for key in keys:
+            got = value.get(key) if isinstance(value, dict) else None
+            if got is not None:
+                return got if isinstance(got, (int, str)) and not isinstance(got, bool) else object()
+        return object()
+    return row["name"], part(row.get("app"), "id", "slug"), part(row.get("check_suite"), "id")
+
+
+def check_times(row, now):
+    """A row's (began, ended), ended None until it finishes; or None if they cannot be believed: unreadable, ending before
+    they begin, or still to come. Nothing but its finish to go on counts as beginning then."""
+    done = row.get("status") == "completed"
+    ended = check_time(row.get("completed_at")) if done else None
+    began = ended if row.get("started_at") is None else check_time(row.get("started_at"))
+    if began is None or (done and ended is None):
+        return None
+    return (began, ended) if began <= (ended if done else began) <= now else None
+
+
+def standing_checks(rows):
+    """What still stands: a row goes only if a later one replaces it, and when in doubt it stays, since a failure wrongly
+    dropped tells everyone main is green. To replace, a row must be of the same family, have believable times, begin after
+    the other ended, and have a verdict to give or be on its way to one. Rows that overlap, tie or cannot be compared all
+    stay, and the worst of them decides. A row a re-dispatch made is in a new suite, so it stands beside the old failure."""
+    now = time.time()
+    newest, seen = {}, []
+    for row in rows:
+        family, times = check_family(row), check_times(row, now)
+        seen.append((row, family, times))
+        said = row.get("conclusion") in MAIN_VERDICT if row.get("status") == "completed" else row.get("status") in CHECK_UNDERWAY
+        if times and said:
+            newest[family] = max(times[0], newest.get(family, times[0]))
+    return [r for r, family, times in seen if not (times and times[1] is not None and newest.get(family, times[1]) > times[1])]
+
+
+def main_checks(slug, base, only):
+    """What the checks on the base branch's head say: red, green, or None for nothing to go on. REST, because cloud
+    sessions refuse GraphQL. The slug comes from this clone's remote and not from the bus.
+
+    Red: a check that stands ended in MAIN_RED. Green: every one that stands ended in MAIN_GREEN, at least one of them
+    a success, and every name in `only` was seen. Anything else says nothing about this head. Raises FbError if gh runs
+    out of time, and every page of a very large head has to fit in that time: look_at_main says so."""
+    if not (isinstance(base, str) and SLUG_RE.match(slug) and BRANCH_RE.match(base) and shutil.which("gh")):
+        return None
+    proc = run_cmd(["gh", "api", "--paginate", "repos/%s/commits/%s/check-runs?per_page=100" % (slug, urllib.parse.quote(base, safe=""))], check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return None
+    rows, text, at = [], proc.stdout.strip(), 0
+    while at < len(text):  # --paginate prints one object per page, one after the other
+        page, at = json.JSONDecoder().raw_decode(text, at)
+        rows += page["check_runs"]
+        at += len(text[at:]) - len(text[at:].lstrip())
+    rows = [r for r in rows if isinstance(r, dict)]
+    sha = rows[0].get("head_sha") if rows else None
+    if not (isinstance(sha, str) and SHA_RE.match(sha)) or any(r.get("head_sha") != sha for r in rows):
+        return None  # main moved between two pages, and a reading across commits is of neither. Before `only`, which could hide it
+    rows = standing_checks([r for r in rows if isinstance(r.get("name"), str) and (not only or r["name"] in only)])
+    failing = [r["name"] for r in rows if r.get("status") == "completed" and r.get("conclusion") in MAIN_RED]
+    if failing:
+        return {"state": "red", "sha": sha, "failing": clean_names(sorted(failing))}
+    if (all(r.get("status") == "completed" and r.get("conclusion") in MAIN_GREEN for r in rows) and any(r.get("conclusion") == "success" for r in rows)
+            and all(any(r["name"] == name for r in rows) for name in only)):
+        return {"state": "green", "sha": sha, "failing": []}
+    return None
+
+
+def look_at_main(bus, run, account, asked=None):
+    """A fresh reading of main if this pass is the one to take it, else None. Outside the commit: a retry must not ask
+    again, and gh must not hold the bus checkout. The throttle is a local file, so a reading with no news costs the bus
+    no commit, and a gh that keeps failing costs a tick nothing. Whatever goes wrong here is only an unknown, except gh
+    running out of time on every try for as long as main may stay red: that comes back as state `slow`, to tell a person.
+    asked: what this pass has learned about gh, so that a gh that hung once costs the pass that once and not once per run."""
+    try:
+        if asked and asked.get("hung"):
+            return None
+        lease = bus.doc("runs/%s/conductor.json" % run)
+        if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
+            return None
+        if run_state(bus, run)["action"] != GO:
+            return None
+        mark = "%s.main-%s" % (bus.dir, run)
+        if os.path.exists(mark) and abs(time.time() - os.path.getmtime(mark)) < MAIN_SECONDS:
+            return None
+        write_file(mark, "")
+        job = bus.doc("runs/%s/job.json" % run)
+        only = job.get("main_checks")
+        only = [c for c in only if isinstance(c, str)] if isinstance(only, list) else []
+        bus.release()
+        slow = "%s.slow-%s" % (bus.dir, run)
+        try:
+            seen = main_checks(repo_slug(bus.remote), job.get("base", "main"), only)
+        except FbError:  # counted and not timed: a lease that was away for days must not make one slow answer look like days
+            if asked is not None:
+                asked["hung"] = True
+            tries = (read_json(slow) or 0) + 1
+            write_file(slow, str(tries))
+            return {"state": "slow"} if tries >= MAIN_RED_MINUTES * 60 // MAIN_SECONDS else None
+        if os.path.exists(slow):
+            os.remove(slow)
+        return seen
+    except Exception:  # bad JSON, a timeout, anything: a conductor pass must not die from this
+        return None
+
+
+def main_view(bus, run, doc=None):
+    """main.json as anyone may read it. It is on the bus, so nothing in it is taken on trust."""
+    doc = bus.doc("runs/%s/main.json" % run) if doc is None else doc
+    if doc.get("state") not in ("green", "red"):
+        return {"state": "unknown"}
+    sha = doc.get("sha")
+    return {"state": doc["state"], "sha": sha if isinstance(sha, str) and SHA_RE.match(sha) else "", "failing": clean_names(doc.get("failing")),
+            "since": doc["since"] if age_minutes(doc.get("since")) != float("inf") else ""}
+
+
+def add_message(files, run, frm, to, kind, body):
+    while True:  # ids come from the second and 16 random bits, and two in one commit must not be one file
+        rel = "runs/%s/msgs/%s.json" % (run, make_id(frm))
+        if rel not in files:
+            files[rel] = dumps(message(frm, to, kind, body))
+            return
+
+
+def main_update(bus, run, account, seen):
+    """The files a fresh reading of main calls for, from the bus as it now is, so a lost race just works it out again and
+    a transition is told once. A note on a change, and one needs-human for each red spell that outlasts the limit."""
+    if seen["state"] == "slow":  # says nothing about main, so main.json stays as it is. The text is the marker
+        body = "Main's checks could not be read within %d seconds on any try for about %d hours, so main stays at its last known state or unknown, and nobody will be told if it goes red. A head with a very large number of check rows does this, as does a gh that hangs. Look at the checks by hand." % (MAIN_ASK_SECONDS, MAIN_RED_MINUTES // 60)
+        files = {}
+        if not any(m.get("body") == body for m in messages_for(bus, run, "human")):
+            add_message(files, run, account, "human", "needs-human", body)
+        return files
+    rel = "runs/%s/main.json" % run
+    held = bus.doc(rel)
+    was = main_view(bus, run)
+    same = was["state"] == seen["state"]
+    doc = dict(seen, since=was["since"] if same and was["since"] else now_iso())
+    short = seen["sha"][:7]
+    names = " (%s)" % ", ".join(seen["failing"]) if seen["failing"] else ""
+    files = {}
+    if seen["state"] == "red" and not same:
+        add_message(files, run, account, "all", "note", "Main went red at %s%s. The steward lane fixes it first; every other lane keeps building and leaves it alone unless asked." % (short, names))
+    elif seen["state"] == "green" and was["state"] == "red":
+        add_message(files, run, account, "all", "note", "Main is green again at %s." % short)
+    told = seen["state"] == "red" and same and held.get("told") is True
+    if seen["state"] == "red" and not told and age_minutes(doc["since"]) >= MAIN_RED_MINUTES:
+        add_message(files, run, account, "human", "needs-human", "Main has been red for over %d hours, now at %s%s, and the steward lane has not cleared it." % (MAIN_RED_MINUTES // 60, short, names))
+        told = True
+    if told:
+        doc["told"] = True
+    if doc != held:
+        files[rel] = dumps(doc)
+    return files
+
+
+def unclaimed_alerts(bus, run, account, files, skip):
+    """One needs-human for a lane that was held once and has sat open too long, once each time it is left open. Its
+    marker lands in the same commit as the message, so two conductors cannot both post it."""
+    for name in lane_names(bus, run):
+        beat = beat_of(bus, run, name)
+        if name in skip or beat.get("status") != "open" or bus.exists("runs/%s/claims/%s.json" % (run, name)) or age_minutes(beat.get("at")) < UNCLAIMED_MINUTES:
+            continue
+        rel = "runs/%s/freed/%s.json" % (run, name)
+        doc = bus.doc(rel)
+        if doc.get("told") != beat.get("at"):
+            files[rel] = dumps(dict(doc, told=beat.get("at")))
+            add_message(files, run, account, "human", "needs-human", "Lane %s has had no taker for over %d minutes. On another account, /fast-builder:join --lane %s --run %s starts it here, or fb.py prompt --lane %s --run %s prints a prompt to paste. An account that lost it to going quiet is not offered it for %d hours, but /fast-builder:join --lane %s --run %s on that same account still takes it, and /fast-builder:resume --run %s puts it back on offer: with one account, those are the ways out." % (name, UNCLAIMED_MINUTES, name, run, name, run, COOLDOWN_MINUTES // 60, name, run, run))
+
+
+def hours_left(deadline):
+    """Hours to a job's deadline. It is free text: an ISO date or time can be read, UTC unless it says otherwise, a bare
+    date meaning the end of that day. Anything else, or none, reads as no limit: an extra request costs little, and
+    saying nothing is the failure this exists for."""
+    try:
+        text = deadline.strip()
+        when = datetime.datetime.fromisoformat(re.sub(r"[Zz]\Z", "+00:00", text + "T23:59:59" if re.match(r"^\d{4}-\d{2}-\d{2}\Z", text) else text))
+        return ((when if when.tzinfo else when.replace(tzinfo=datetime.timezone.utc)) - utcnow()).total_seconds() / 3600.0
+    except (AttributeError, ValueError, OverflowError):
+        return float("inf")
+
+
+def overflow_requests(bus, run, account, files, skip):
+    """A lane marked done while others work and time is left is a lane that may have stopped early. Once per lane: the
+    text is the marker, and it lands in the commit that checked for it."""
+    names = lane_names(bus, run)
+    if not any(beat_of(bus, run, n).get("status") == "working" and n not in skip for n in names):
+        return
+    if hours_left(bus.doc("runs/%s/job.json" % run).get("deadline")) <= OVERFLOW_HOURS:
+        return
+    asked = [m.get("body") for m in messages_for(bus, run, "conductor")]
+    for name in names:
+        body = "Lane %s is marked done while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane." % name
+        if beat_of(bus, run, name).get("status") == "done" and body not in asked:
+            add_message(files, run, account, "conductor", "request", body)
+
+
+def requests_doc(bus, run):
+    """requests.json: which requests to the conductor were read, and which a person was told of. On the bus, because a
+    session's own list of what it has seen reaches nobody else. Anything but a list of ids reads as empty: the worst
+    that does is an extra alert."""
+    doc = bus.doc("runs/%s/%s" % (run, REQUESTS_FILE))
+    return {key: [i for i in doc[key] if isinstance(i, str)] if isinstance(doc.get(key), list) else [] for key in ("read", "told")}
+
+
+def conductor_requests(bus, run, seen=()):
+    """What is asked of the conductor and not yet read by anyone."""
+    skip = set(seen) | set(requests_doc(bus, run)["read"])
+    return [m for m in messages_for(bus, run, "conductor", skip) if m.get("kind") in ("request", "blocker")]
+
+
+def mark_requests_read(bus, run, ids):
+    def mutate():
+        doc = requests_doc(bus, run)
+        new = [i for i in ids if i not in doc["read"]]
+        return {"runs/%s/%s" % (run, REQUESTS_FILE): dumps(dict(doc, read=doc["read"] + new))} if new else {}
+    try:
+        bus.commit(mutate, "read(%s): conductor requests" % run)
+    except (FbError, OSError):
+        pass  # the reader has them: all this can cost is an alert saying it did not
+
+
+def lane_is_live(bus, run, name):
+    """Whether a session looks to be on this lane: joined, working and beating. A lane marked done still has its claim,
+    and its account's listener still renews the lease, with nobody left to read anything."""
+    beat = beat_of(bus, run, name)
+    return bool(bus.doc("runs/%s/claims/%s.json" % (run, name)).get("session")) and beat.get("status") == "working" and abs(age_minutes(beat.get("at"))) < STALE_MINUTES
+
+
+def unread_requests(bus, run, account, files, skip):
+    """One needs-human when a request to the conductor is reaching nobody: at once if the steward lane is done and this
+    holder has no live lane, else when one has sat unread past the limit, which also covers an old copy's steward that
+    never looks. Its marker lands in the same commit. Ids only: what a lane wrote stays out of a person's status page."""
+    doc = requests_doc(bus, run)
+    waiting = conductor_requests(bus, run, doc["told"])
+    if not waiting:
+        return
+    names = lane_names(bus, run)
+    nobody = any(is_steward(bus, run, n) and beat_of(bus, run, n).get("status") == "done" for n in names) and not any(
+        n not in skip and bus.doc("runs/%s/claims/%s.json" % (run, n)).get("account") == account and lane_is_live(bus, run, n) for n in names)
+    due = waiting if nobody else [m for m in waiting if abs(age_minutes(m.get("at"))) >= REQUEST_UNREAD_MINUTES]
+    if not due:
+        return
+    ids = [m["id"] for m in due]
+    files["runs/%s/%s" % (run, REQUESTS_FILE)] = dumps(dict(doc, told=doc["told"] + ids))
+    why = "The steward lane is done and the lease holder has no lane working, so nobody is left to read it." if nobody else "It has sat unread for over %d minutes." % REQUEST_UNREAD_MINUTES
+    add_message(files, run, account, "human", "needs-human", "%d %s to the conductor unread (%s). %s Read with fb.py inbox --who conductor --mark, or /fast-builder:join --lane the steward to answer." % (
+        len(ids), "request" if len(ids) == 1 else "requests", ", ".join(clean_names(ids)), why))
+
+
+def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     """The deterministic half of the cross-account orchestrator. Needs no model, so a listener can run it too.
 
     Takes or renews the lease; frees lanes whose account went quiet, so another account takes them over; closes
-    the run once every lane is done; rewrites STATUS.md. Returns what it did and what needs judgement."""
+    the run once every lane is done; watches main, unclaimed lanes and lanes done early; rewrites STATUS.md. Returns
+    what it did and what needs judgement."""
     report = {"run": run, "holder": None, "freed": [], "finished": False, "moved_from": None}
+    seen = look_at_main(bus, run, account, asked)
 
     def mutate():
         files = {}
@@ -769,10 +1141,11 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
         held = lease.get("holder") == account and age_minutes(lease.get("at")) < LEASE_MINUTES / 2.0
         if held and (bus.exists("STOP") or bus.exists("runs/%s/STOP" % run)):
             return {}  # the stop files decide this run: control.json stays as it was, so removing them restores it
+        main = main_update(bus, run, account, seen) if seen else {}
         if held and run_state(bus, run)["action"] == GO:
             stale = _stale(bus, run, stale_minutes)
             names = lane_names(bus, run)
-            if not stale and not (names and all(beat_of(bus, run, n).get("status") in ("done", "blocked") for n in names)):
+            if not main and not stale and not (names and all(beat_of(bus, run, n).get("status") in ("done", "blocked") for n in names)):
                 return {}
         report["holder"] = account
         files["runs/%s/conductor.json" % run] = dumps({"holder": account, "at": now_iso()})
@@ -785,11 +1158,18 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
         if state["action"] == GO:
             for name in _stale(bus, run, stale_minutes):
                 claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
+                limit = quiet_limit(claim, stale_minutes)
+                said = "%s went quiet for over %d minutes" % (claim.get("account"), limit) if claim.get("session") else "%s claimed it, and no session joined within %d minutes" % (claim.get("account"), limit)
+                files.update(lost_lane(bus, run, name, claim.get("account")))
                 files["runs/%s/claims/%s.json" % (run, name)] = None
                 files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "freed: %s went quiet" % claim.get("account"), "freed_from": claim.get("took_from") or claim.get("account")})
-                note = message(account, "all", "note", "Lane %s freed: %s went quiet for over %d minutes." % (name, claim.get("account"), stale_minutes))
+                note = message(account, "all", "note", "Lane %s freed: %s." % (name, said))
                 files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
                 report["freed"].append(name)
+            files.update(main)
+            unclaimed_alerts(bus, run, account, files, report["freed"])
+            overflow_requests(bus, run, account, files, report["freed"])
+            unread_requests(bus, run, account, files, report["freed"])
             statuses = [beat_of(bus, run, n).get("status") for n in names]
             if names and all(s in ("done", "blocked") for s in statuses):
                 blocked = statuses.count("blocked")
@@ -800,7 +1180,8 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
             quiet = _stale(bus, run, stale_minutes)
             if all(n in quiet or beat_of(bus, run, n).get("status") in ("done", "blocked", "stopped", "open", None) for n in names):
                 files["runs/%s/control.json" % run] = dumps({"state": "stopped", "reason": state["reason"], "by": account, "at": now_iso()})
-        files["STATUS.md"] = render_status(bus)
+        fresh = files.get("runs/%s/main.json" % run)
+        files["STATUS.md"] = render_status(bus, {run: json.loads(fresh)} if fresh else {})
         return files
 
     bus.commit(mutate, "conduct(%s): %s" % (run, account))
@@ -809,11 +1190,17 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES):
     return report
 
 
+def quiet_limit(claim, stale_minutes):
+    """How long a lane may go without a beat. A claim no session joined gets less. The token is what says so and not the
+    beat's note: an old copy's join sets the token and leaves the note `claimed` until its first tick."""
+    return stale_minutes if claim.get("session") else min(stale_minutes, CLAIM_QUIET_MINUTES)
+
+
 def _stale(bus, run, stale_minutes):
     out = []
     for name in lane_names(bus, run):
         beat = beat_of(bus, run, name)
-        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and age_minutes(beat.get("at")) >= stale_minutes:
+        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and age_minutes(beat.get("at")) >= quiet_limit(bus.doc("runs/%s/claims/%s.json" % (run, name)), stale_minutes):
             out.append(name)
     return out
 
@@ -842,7 +1229,8 @@ def render_holders(bus, runs):
     return lines + ([""] + ["Latest takeovers:"] + ["- %s" % body for body in moved] if moved else []) + [""]
 
 
-def render_status(bus):
+def render_status(bus, fresh=None):
+    """fresh: main.json docs this very commit is about to write, by run."""
     lines = ["# fast-builder status", "", "Updated %s." % now_iso(), ""]
     if bus.exists("STOP"):
         lines += ["**STOP is set: every run is stopping.**", ""]
@@ -851,8 +1239,11 @@ def render_status(bus):
     for run in runs[-6:]:
         job = bus.doc("runs/%s/job.json" % run)
         state = run_state(bus, run)
-        lines += ["## %s: %s" % (run, state["state"]), "", job.get("goal", ""), "",
-                  "| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
+        lines += ["## %s: %s" % (run, state["state"]), "", job.get("goal", ""), ""]
+        main = main_view(bus, run, (fresh or {}).get(run))
+        if main["state"] != "unknown":
+            lines += ["Main is %s at %s since %s.%s" % (main["state"], main["sha"][:7], main["since"], " Failing: %s." % ", ".join(main["failing"]) if main["failing"] else ""), ""]
+        lines += ["| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
         for row in lane_table(bus, run):
             lines.append("| %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-", row["note"].replace("|", "/")[:80]))
         human = [m for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]
@@ -878,6 +1269,9 @@ def validate(draft, files=None):
     if job.get("where") not in ("cloud", "local"):
         errors.append("where must be cloud or local")
     errors += job_errors(job)
+    checks = job.get("main_checks", [])
+    if not isinstance(checks, list) or not all(isinstance(c, str) for c in checks):
+        errors.append("main_checks must be a list of check names")
     if job.get("autopilot") not in ("full", "policy"):
         errors.append("autopilot must be full or policy")
     rows = lanes.get("lanes", [])
@@ -935,6 +1329,9 @@ def validate(draft, files=None):
         for name in names:
             if "## Lane: %s" % name not in text:
                 errors.append("plan has no section for lane %s" % name)
+        overflow = re.search(r"^## Overflow[ \t]*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+        if not overflow or not overflow.group(1).strip():
+            errors.append("plan has no Overflow: what each lane takes next if it clears its list")
     for name in names:
         doc = read_text(os.path.join(draft, "lanes", name + ".md"))
         if doc is None:
@@ -1139,6 +1536,9 @@ with any other, so what is not written here does not exist for them.
 {{{{Why these boundaries keep the lanes from sharing files, and how the load balances.}}}}
 
 {lane_sections}
+## Overflow
+{{{{What each lane takes next if it clears its list, lane by lane, with enough there that no lane runs dry before the deadline.}}}}
+
 ## Shared ground
 Files any lane may touch: {shared}. A conflict in a generated file is resolved by regenerating it, never by hand.
 The steward lane (`{steward}`) owns every path no other lane does, fixes main when it goes red, and answers
@@ -1298,6 +1698,10 @@ INSTRUCTIONS = {
     LOST: "Another account holds this lane now. Stop work and run fb.py leave, then end the session.",
     FINISHED: "The run is finished. Write your end-of-run summary and end the session.",
 }
+
+
+MAIN_RED_STEWARD = "Main is red at %s: see main.failing. Fixing it comes before your next work item; then carry on."
+MAIN_RED_OTHER = "Main is red at %s, and that is the steward lane's to fix. Keep building your next work item, and do not fix main unless asked."
 
 
 def remember_control(path, action):
@@ -1688,6 +2092,21 @@ def end_child(key, remote):
         raise FbError("its last process, pid %d, will not stop, so no second one was started in its clone" % child["pid"])
 
 
+def start_joining_clock(bus, run, lane, account):
+    """A claim's time to be joined starts when a session can start. A first clone can take most of it. Only ever this
+    account's own claim that nobody joined: the clone may have outlasted it."""
+    def mutate():
+        beat = beat_of(bus, run, lane)
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
+        if claim.get("account") != account or claim.get("session") or beat.get("status") != "working":
+            return {}
+        return {"runs/%s/beats/%s.json" % (run, lane): dumps(dict(beat, at=now_iso()))}
+    try:
+        bus.commit(mutate, "beat(%s): %s starting" % (run, lane))
+    except FbError:
+        pass  # only a clock: it must not cost the lane its start
+
+
 def claude_call(prompt, *rest):
     """A claude command, and the prompt if it has to go on stdin. npm's claude.cmd runs through cmd.exe, which ends an
     argument at a newline and acts on & and |. Windows also finds only an .exe without the full path."""
@@ -1726,6 +2145,7 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     end_child("%s/%s" % (run, lane), bus.remote)
     clone = work_clone(bus.remote, run, lane, job.get("base", "main"))
     bus.sync()
+    start_joining_clock(bus, run, lane, account)
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
     log = open(os.path.join(HOME_DIR, "logs", "%s-%s.log" % (run, lane)), "a")
     rest = ["--model", job.get("lane_model", "opus"), "--permission-mode", repo_cfg.get("permission_mode", "auto"), "--permission-prompts", "none", "--name", "fb %s %s" % (run, lane)]
@@ -1916,9 +2336,10 @@ def roster_help(cut):
     return ": %d more routines on the bus went untried past the limit of %d, so this login may own one of them: remove the rows that do not belong from listeners/ on the bus, or run /fast-builder:switch NAME" % (cut, MAX_ROSTER)
 
 
-def supervise(bus, repo_cfg, account):
+def supervise(bus, repo_cfg, account, stops_only=False):
     """Restart a local lane whose claude exited with its lane unfinished, up to a cap, and end children of a stopped
-    run after giving them time to write a handoff. Cloud lanes are not children: the conductor covers those."""
+    run after giving them time to write a handoff. Cloud lanes are not children: the conductor covers those.
+    stops_only: just the second half, for before conducting, which must come first for the restarts."""
     children = read_json(children_path()) or {}
     changed = False
     for key, child in list(children.items()):
@@ -1944,33 +2365,43 @@ def supervise(bus, repo_cfg, account):
                 del children[key]
                 changed = True
             continue
-        if running or action != GO:
+        if stops_only or running or action != GO:
             continue
         status = beat_of(bus, run, lane).get("status")
         claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
         del children[key]
         changed = True
-        if status == "working" and claim.get("account") == account and child.get("attempt", 0) < MAX_RESTARTS:
+        lived = age_minutes(child.get("at"))
+        attempt = 0 if STALE_MINUTES <= lived < float("inf") else child.get("attempt", 0)  # the cap is for sessions that die young, not for a lane that restarts at its context limit
+        ours = status == "working" and claim.get("account") == account
+        if ours and attempt < MAX_RESTARTS:
             write_file(children_path(), dumps(children))
             try:
-                launch_lane(bus, repo_cfg, run, lane, account, child.get("attempt", 0) + 1)
+                launch_lane(bus, repo_cfg, run, lane, account, attempt + 1)
             except FbError as exc:
                 release_lane(bus, run, lane, account, str(exc))
             children = read_json(children_path()) or {}
+        elif ours:  # nothing left will restart it, so the lane must not sit here looking alive until the conductor frees it
+            write_file(children_path(), dumps(children))
+            try:
+                release_lane(bus, run, lane, account, "its session exited %d times in a row on %s" % (attempt + 1, account), cool=True)
+            except FbError:
+                pass  # still claimed, so the conductor frees it in the end
     if changed:
         write_file(children_path(), dumps(children))
 
 
 def pick_lane(bus, run, account):
     """The lane this account should take now, if any. A lane freed from an account that went quiet or stopped is fair
-    game for an account already in the run; a fresh lane is not, so one account never ends up carrying a whole run."""
+    game for an account already in the run; a fresh lane is not, so one account never ends up carrying a whole run.
+    A lane this account just lost to going quiet is neither: it probably has no usage left to run it with."""
     table = lane_table(bus, run)
-    open_lanes = [r["lane"] for r in table if r["account"] is None]
+    open_lanes = [r["lane"] for r in table if r["account"] is None and not cooling(bus, run, r["lane"], account)]
     if not open_lanes:
         return None
     if not [r for r in table if r["account"] == account]:
         return open_lanes[0]
-    freed = [r["lane"] for r in table if r["account"] is None and r["status"] == "open" and beat_of(bus, run, r["lane"])]
+    freed = [r["lane"] for r in table if r["lane"] in open_lanes and r["status"] == "open" and beat_of(bus, run, r["lane"])]
     return freed[0] if freed else None
 
 
@@ -2041,14 +2472,17 @@ def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
     return [action]
 
 
-def release_lane(bus, run, lane, account, reason):
-    """Give a lane back, so the next listener can take it."""
+def release_lane(bus, run, lane, account, reason, cool=False):
+    """Give a lane back, so the next listener can take it. cool: and not to this account, for the cooldown."""
     text = "Could not start lane %s: %s" % (lane, reason)
 
     def mutate():
-        took = bus.doc("runs/%s/claims/%s.json" % (run, lane)).get("took_from")  # this account never ran it, so it stays whose it was
+        claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
+        took = claim.get("took_from") or (account if claim.get("session") else None)  # with no session it never ran here, so it stays whose it was
         files = {"runs/%s/claims/%s.json" % (run, lane): None,
                  "runs/%s/beats/%s.json" % (run, lane): dumps({"at": now_iso(), "status": "open", "account": None, "note": reason[:200], "freed_from": took})}
+        if cool:
+            files.update(lost_lane(bus, run, lane, account))
         if not any(m.get("body") == text for m in messages_for(bus, run, "human")):  # a lane refused all day is one blocker
             files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(message(account, "human", "blocker", text))
         return files
@@ -2066,10 +2500,12 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     if not sha or (sha == last.get("sha") and not beat_due and not conduct_due and not (read_json(children_path()) or {})):
         return actions
     bus.sync()
-    if conduct_due:  # before supervise: a dead lane it frees must not be restarted there and started again below
+    if conduct_due:  # before restarts: a dead lane it frees must not be restarted there and started again below
+        supervise(bus, repo_cfg, account, stops_only=True)  # and after stops: asking gh can take a minute
+        asked = {}
         for run in active_runs(bus):
             try:
-                report = conduct(bus, run, account)
+                report = conduct(bus, run, account, asked=asked)
             except Exception as exc:  # one bad run must not cost another run's stop
                 actions.append({"did": "conduct-failed", "run": run, "error": repr(exc)[:200]})
                 continue
@@ -2337,13 +2773,24 @@ def listen_install(args):
     same_account = config.get("account") in (None, account)
     if not same_account:  # a routine belongs to one login, so no repo keeps the previous name's
         for cfg in config.get("repos", {}).values():
-            cfg["routine_id"] = None
+            if isinstance(cfg, dict):
+                cfg["routine_id"] = None
     config["account"] = account
     remote = args.remote or cwd_remote()
     slug = repo_slug(remote)
-    held = config.setdefault("repos", {}).get(slug, {})
+    held = config.setdefault("repos", {}).get(slug)
+    held = held if isinstance(held, dict) else {}
     routine = args.routine_id or (held.get("routine_id") if same_account else None)
-    config["repos"][slug] = {"remote": remote, "permission_mode": args.permission_mode, "cloud": not args.no_cloud, "local": not args.no_local, "routine_id": routine}
+    # A flag not given keeps what was chosen, except bypass: that takes saying so at the install that sets it
+    kept = held.get("permission_mode")
+    mode = args.permission_mode or (kept if kept in KEPT_MODES else "auto")
+    warning = None
+    if kept == BYPASS and not args.permission_mode:
+        warning = "WARNING: permission mode %s is not kept across a reinstall, and local lanes in %s now run in auto. To keep it, say so: listen-install --permission-mode %s" % (BYPASS, slug, BYPASS)
+        print(warning, file=sys.stderr)
+    cloud = held.get("cloud") is not False if args.cloud is None else args.cloud
+    local = held.get("local") is not False if args.local is None else args.local
+    config["repos"][slug] = {"remote": remote, "permission_mode": mode, "cloud": cloud, "local": local, "routine_id": routine}
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
@@ -2357,13 +2804,15 @@ def listen_install(args):
         shutil.rmtree(plugin_copy(), ignore_errors=True)
         shutil.copytree(root, plugin_copy(), ignore=shutil.ignore_patterns(".git", "__pycache__", "*.zip"))
     text = service_text(account)
-    out = {"account": account, "repo": slug, "permission_mode": args.permission_mode, "service": service_file()}
+    out = {"account": account, "repo": slug, "permission_mode": mode, "cloud": cloud, "local": local, "service": service_file()}
+    if warning:
+        out["warning"] = warning
     if args.dry_run:
         out["service_text"] = text
     else:
         start_service(text)
         bus = Bus(remote, account)
-        doc = {"account": account, "at": now_iso(), "cloud": not args.no_cloud, "local": not args.no_local, "routine": routine, "version": VERSION}
+        doc = {"account": account, "at": now_iso(), "cloud": cloud, "local": local, "routine": routine, "version": VERSION}
         announce_listener(bus, account, doc, proved=bool(args.routine_id))
     print(json.dumps(out, indent=2))
 
@@ -2557,6 +3006,19 @@ def cmd_join(args):
     print(bus.read("runs/%s/%s" % (run, job.get("plan_file")), ""))
 
 
+def is_steward(bus, run, lane):
+    return any(l["name"] == lane and l.get("steward") for l in lanes_of(bus, run)["lanes"])
+
+
+def answers_conductor(bus, session, holder):
+    """Whether this lane reads the conductor's inbox: the lease holder's does, or the steward's when the holder has no live
+    lane in this run. A listener holds the lease as long as it runs, even on an account with no usage left or whose lane
+    is done, and no session of its own would ever read a request. If both read, the first to mark it read has it."""
+    if holder == session["account"]:
+        return True
+    return is_steward(bus, session["run"], session["lane"]) and not any(r["account"] == holder and lane_is_live(bus, session["run"], r["lane"]) for r in lane_table(bus, session["run"]))
+
+
 def cmd_tick(args):
     session, path, bus = need_session()
     bus.sync()
@@ -2569,10 +3031,15 @@ def cmd_tick(args):
         session["last_beat"] = time.time()
     if result["action"] in (GO, DRAIN):
         report = conduct(bus, session["run"], session["account"])
-        waiting = [m for m in messages_for(bus, session["run"], "conductor", set(session.get("conductor_seen", []))) if m.get("kind") in ("request", "blocker")]
+        result = build_tick(bus, session)  # gh can hold a pass for a minute, and a stop may have landed. This is the checkout conduct just synced: no network
+        remember_control(path, result["action"])
+        waiting = conductor_requests(bus, session["run"], session.get("conductor_seen", []))
         result["conductor"] = report["holder"]
-        result["requests_for_conductor"] = len(waiting) if report["holder"] == session["account"] else 0
+        result["requests_for_conductor"] = len(waiting) if answers_conductor(bus, session, report["holder"]) else 0
         result["freed"] = report["freed"]
+    result["main"] = main_view(bus, session["run"])  # after conducting: it may just have learned this
+    if result["main"]["state"] == "red" and result["action"] == GO:
+        result["instruction"] = (MAIN_RED_STEWARD if is_steward(bus, session["run"], session["lane"]) else MAIN_RED_OTHER) % result["main"]["sha"][:7]
     if result["inbox"]:
         session["seen"] = (session.get("seen", []) + [m["id"] for m in result["inbox"]])[-1000:]
     session["stop_blocks"] = 0
@@ -2585,7 +3052,7 @@ def beat_status(bus, session):
     return beat_of(bus, session["run"], session["lane"]).get("status", "working")
 
 
-def write_beat(bus, session, status, note):
+def write_beat(bus, session, status, note, attempts=10):
     """Write the lane's heartbeat, but only while this session still holds the lane: a session that lost it must not
     be able to mark the new holder's lane done."""
     run, lane = session["run"], session["lane"]
@@ -2596,7 +3063,7 @@ def write_beat(bus, session, status, note):
             raise Lost("this session no longer holds lane %s" % lane)
         return {"runs/%s/beats/%s.json" % (run, lane): dumps(doc)}
 
-    bus.commit(mutate, "beat(%s): %s %s" % (run, lane, status))
+    bus.commit(mutate, "beat(%s): %s %s" % (run, lane, status), attempts=attempts)
 
 
 def cmd_lane_state(args):
@@ -2636,6 +3103,15 @@ def cmd_wait(args):
     while time.time() < end:
         time.sleep(min(args.poll, max(0.0, end - time.time())))
         try:
+            if time.time() - last_beat >= BEAT_SECONDS:  # first: a wake below returns, and a lane that keeps waking must still beat
+                try:
+                    write_beat(bus, session, beat_status_fresh(bus, session), session.get("note", ""), attempts=3)
+                    last_beat = session["last_beat"] = time.time()
+                    save_session(path, session)
+                except Lost:
+                    raise
+                except Exception:  # its own try: a beat that cannot land must not cost a stop or a message their wake
+                    last_beat = time.time() - BEAT_SECONDS + BEAT_RETRY_SECONDS
             sha = bus.head()
             if sha != seen:
                 bus.sync()
@@ -2648,11 +3124,6 @@ def cmd_wait(args):
                 if tick["action"] == GO and args.until_resumed:
                     out({"woke": "resumed", "action": GO})
                     return
-            if time.time() - last_beat >= BEAT_SECONDS:
-                write_beat(bus, session, beat_status_fresh(bus, session), session.get("note", ""))
-                last_beat = session["last_beat"] = time.time()
-                save_session(path, session)
-                seen = bus.head()
         except Lost:
             out({"woke": "lost", "action": LOST})
             return
@@ -2681,11 +3152,14 @@ def cmd_inbox(args):
     bus = get_bus(args)
     bus.sync()
     session, path = load_session()
-    seen = set((session or {}).get("conductor_seen", [])) if args.who == "conductor" else set()
-    got = messages_for(bus, pick_run(bus, args), args.who, seen)
-    if args.mark and session and args.who == "conductor" and got:
-        session["conductor_seen"] = (session.get("conductor_seen", []) + [m["id"] for m in got])[-1000:]
-        save_session(path, session)
+    run = pick_run(bus, args)
+    seen = set((session or {}).get("conductor_seen", [])) | set(requests_doc(bus, run)["read"]) if args.who == "conductor" else set()
+    got = messages_for(bus, run, args.who, seen)
+    if args.mark and args.who == "conductor" and got:
+        if session:
+            session["conductor_seen"] = (session.get("conductor_seen", []) + [m["id"] for m in got])[-1000:]
+            save_session(path, session)
+        mark_requests_read(bus, run, [m["id"] for m in got])
     out(got)
 
 
@@ -2711,17 +3185,18 @@ def control_cmd(state, reason_default):
         bus = get_bus(args)
         if not bus.sync():
             raise FbError("no bus on this repo yet")
+        cool = [r for r in list_runs(bus) if has_cooled_lane(bus, r)] if state == "running" and (args.all or not (args.run or load_session()[0])) else []
         if args.all and state == "running":
-            runs = [r for r in list_runs(bus) if bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
+            runs = [r for r in list_runs(bus) if r in cool or bus.exists("runs/%s/STOP" % r) or bus.doc("runs/%s/control.json" % r).get("state") in ("paused", "draining", "stopping")]
         elif args.all:
             runs = [r for r in list_runs(bus) if run_state(bus, r)["state"] not in ("finished", "stopped")]
         elif state == "running" and not args.run and not load_session()[0]:
-            runs = [r for r in list_runs(bus) if bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
+            runs = [r for r in list_runs(bus) if r in cool or bus.doc("runs/%s/control.json" % r).get("state", "running") in TRANSITIONS["running"]]
             if len(runs) != 1:
                 raise FbError("%d runs could resume: pass --run or --all (%s)" % (len(runs), ", ".join(runs)))
         else:
             runs = [pick_run(bus, args)]
-        moved = [r for r in runs if set_control(bus, r, state, args.reason or reason_default, bus.account)]
+        moved = [r for r in runs if set_control(bus, r, state, args.reason or reason_default, bus.account, cool_only=r in cool)]
         cleared = False
         if state == "running" and args.all:
             cleared = bus.commit(lambda: {"STOP": None}, "resume: clear the stop on every run")
@@ -2755,7 +3230,7 @@ def cmd_status(args):
     for run in runs:
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
-                       "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
+                       "main": main_view(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"],
                        "takeovers": recent_takeovers(bus, run)})
     out({"runs": report, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
@@ -2842,8 +3317,9 @@ def cmd_poll(args):
     if not bus.sync():
         print("NOTHING")
         return
+    asked = {}
     for run in active_runs(bus):
-        conduct(bus, run, account)
+        conduct(bus, run, account, asked=asked)
         if run_state(bus, run)["action"] != GO:
             continue
         lane = pick_lane(bus, run, account)
@@ -3109,9 +3585,11 @@ def build_parser():
     add("poll", cmd_poll, help="one listener pass for a routine")
 
     p = add("listen-install", listen_install, help="install the always-on listener")
-    p.add_argument("--permission-mode", default="auto", choices=["acceptEdits", "auto", "bypassPermissions", "dontAsk"])
-    p.add_argument("--no-cloud", action="store_true")
-    p.add_argument("--no-local", action="store_true")
+    p.add_argument("--permission-mode", choices=list(KEPT_MODES) + [BYPASS], help="default: what this repo has, else auto. %s is never kept: it has to be given each time" % BYPASS)
+    for name in ("cloud", "local"):  # default: what this repo has, else on
+        pair = p.add_mutually_exclusive_group()
+        pair.add_argument("--" + name, dest=name, action="store_true", default=None)
+        pair.add_argument("--no-" + name, dest=name, action="store_false", default=None)
     p.add_argument("--routine-id", help="this account's listener routine, so the daemon can start cloud lanes")
     p.add_argument("--dry-run", action="store_true")
 

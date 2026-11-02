@@ -7,7 +7,7 @@
       "name": "fast-builder",
       "source": "./",
       "description": "Size the team, split work into proven-disjoint swim lanes, kick off through the repo, stop from one command, route every task to the cheapest capable model.",
-      "version": "0.1.9"
+      "version": "0.1.11"
     }
   ]
 }
