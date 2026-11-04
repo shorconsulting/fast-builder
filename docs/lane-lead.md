@@ -21,7 +21,7 @@ quiet for 45 minutes is given to another account.
 | pause | Save your handoff, then `python3 "$FB" wait --until-resumed --seconds 540` in a loop (Bash timeout 600000). |
 | drain | Finish the slice in hand, land or park it, start nothing new, save your handoff, `python3 "$FB" lane-state stopped`, end. |
 | stop | Tell subagents to stop, save your handoff at once, `python3 "$FB" lane-state stopped`, end. |
-| lost | Another account took this lane. `python3 "$FB" leave`, end. |
+| lost | Another account took this lane. Tell subagents to stop. `tick` has already pushed your own unpushed `fb/<run>/<lane>/` branches and a snapshot of the rest, and noted them in the handoff (`saved` says what). `python3 "$FB" leave`, end. |
 | finished | Write your summary, end. |
 
 If the plugin's guard or the repo's hook is active it also enforces stop and pause on every tool call, for you and your
@@ -54,11 +54,18 @@ still working on it. So while subagents run:
 - A lane holding a long-running agent must still `tick` before 45 minutes are up. `wait` keeps the lane alive, but only
   `tick` runs the conductor's work and hands you the `instruction`.
 
+On a computer, the listener that started your lane also speaks for it: while your process is alive and its transcript,
+log or git keeps moving, it says so on the bus every 5 minutes once your own beat is 10 minutes old, and the lane is not
+freed. That covers a slow network or a loaded computer. It is a backstop, not leave to stop ticking: it lapses 4 hours
+after your last beat, and a cloud lane has no listener.
+
 ## Doing the work
 
 You are the orchestrator, so you dispatch and you do not write code yourself unless it is a line or two. Keep your own
 context small: it is what every message costs. Run up to 3 writer subagents at once, each in its own git worktree, each
-on a different slice.
+on a different slice, and no more: on a computer running other lanes, each one beyond that slows every lane there, and a
+lane whose git times out goes quiet. Name each slice's branch `fb/<run>/<lane>/<slice>`, so that if the lane moves to
+another account, its unpushed work goes up under that name.
 
 Before every spawn, ask for the model, and set `model` explicitly. Never leave it to inherit.
 
@@ -124,9 +131,10 @@ path to `fb.py`. A command that sets `$FB` first or chains anything is refused.
 It holds open PRs (number, head sha, state, sequence number), position in the work, next three slices, blockers and
 lessons. It is what a replacement account starts from if this one runs out of usage, so write it for a stranger.
 
-If you are that replacement and the handoff ends with a section saying an account ran out of usage, it names a branch under
-`fast-builder/wip/` holding what that account left, and lists what could not be saved. It is a snapshot nobody has reviewed:
-start from it as it says, check it builds, and do not land it as it stands.
+If you are that replacement and the handoff ends with a section saying an account ran out of usage or lost this lane, it
+may name lane branches it pushed under their own names: fetch them and carry on from them. It may also name a branch under
+`fast-builder/wip/` holding the rest of what that account left, and it lists what could not be saved. Nobody has reviewed
+either: start from them as it says, check they build, and do not land them as they stand.
 
 At about 300k context, save the handoff and end the session: the listener or the steward restarts the lane fresh.
 

@@ -24,12 +24,13 @@ Layout of the bus:
   runs/<run>/STOP                 any content: stop this run
   runs/<run>/claims/<lane>.json   which account holds a lane
   runs/<run>/beats/<lane>.json    heartbeat and lane status
+  runs/<run>/alive/<lane>.json    a local lane's listener saying its session is still working
   runs/<run>/handoffs/<lane>.md   rolling handoff, what a replacement account starts from
   runs/<run>/conductor.json       lease on the cross-account orchestrator role
   runs/<run>/main.json            the base branch's last known check state
   runs/<run>/freed/<lane>.json    which accounts lost this lane to going quiet, and when
   runs/<run>/desk.json            which account and computer hold the session a person talks to
-  accounts/<account>.json         when this account ran out of usage
+  accounts/<account>.json         when this account ran out of usage, and when its limit said it resets
   runs/<run>/msgs/<id>.json       messages between lanes, the conductor and the human
 
 See docs/protocol.md. Everything is a subcommand: fb.py --help.
@@ -78,7 +79,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -168,6 +169,28 @@ MAIN_GREEN = ("success", "neutral", "skipped")
 MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
 CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
+DRY_MAX_DAYS = 8  # the furthest ahead a limit's own reset time is believed: a weekly limit is the longest there is
+RESTART_BACKOFF_SECONDS = 60  # doubled for each restart in a row after the first: a network blip outlasts a minute
+SPREAD_MINUTES = 10  # how long a freed lane waits for an account with no lane before one with a lane may take it
+DEFAULT_LANE_CAP = 2  # lanes one account may hold in a run, unless the job says otherwise
+LISTENER_BEAT_SECONDS = 600
+LISTENER_LIVE_MINUTES = 30  # a listener heard from this recently counts as one that could take a lane
+VOUCH_AFTER_MINUTES = 10  # a lane's own beat this old, and its listener speaks for it if its process is working
+VOUCH_SECONDS = 300
+VOUCH_ACTIVE_MINUTES = 15  # what working means: its transcript, log or git written this recently
+VOUCH_MAX_MINUTES = 240  # a lead that has not beaten for this long is freed whatever its listener says
+LOG_TAIL_BYTES = 65536
+DEFAULT_MAX_LOCAL_LANES = 2  # live local lanes per OS user, across repos
+LOAD_PER_CPU = 2.0  # no new local lane while the 5-minute load is over this per core: git starts timing out past it
+MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+# What the CLI prints when an account is out, as a whole line of its own: "You've hit your weekly limit · resets Nov 4 at
+# 3pm (America/Los_Angeles)", or the older "Claude usage limit reached. Your limit will reset at 3pm (America/Los_Angeles)."
+# Only that form: a lead's own summary saying "callers who hit your API limit get a 429" is no limit of this account's.
+LIMIT_RE = re.compile(r"(?im)^[ \t]*(?:(?:you've|you have)\s+hit\s+your\s+(?P<kind>[a-z0-9 -]{0,24}?)\s*limit|claude(?:\s+ai)?\s+usage\s+limit\s+reached)"
+                      r"(?P<rest>\s*[·.|-]\s*(?:(?:your\s+limit\s+will\s+)?resets?\b|(?:contact|ask)\s+your\s+admin\b)[^\n]{0,120})?[ \t.]*$")
+RESET_RE = re.compile(r"(?i)\bresets?(?:\s+at)?\s+(?:(?P<mon>%s)[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?(?:\s+at)?\s+)?(?P<hour>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<half>am|pm)?\b"
+                      r"(?:\s*\((?P<tz>[A-Za-z][A-Za-z0-9_+-]*(?:/[A-Za-z0-9_+-]+){0,2})\))?" % "|".join(MONTHS))
+SAID_RE = re.compile(r"^[a-z0-9 -]{1,40}\Z")
 
 
 class FbError(Exception):
@@ -623,10 +646,13 @@ def lane_table(bus, run):
     for name in lane_names(bus, run):
         claim = bus.doc("runs/%s/claims/%s.json" % (run, name))
         beat = beat_of(bus, run, name)
+        alive = bus.doc("runs/%s/alive/%s.json" % (run, name))
+        vouched = claim.get("session") and alive.get("session") == claim.get("session") and alive.get("account") == claim.get("account")
         rows.append({
             "lane": name, "account": claim.get("account") if claim else None, "status": beat.get("status", "open" if not claim else "claimed"),
             "beat": beat.get("at"), "beat_age_min": None if not beat.get("at") else round(age_minutes(beat["at"]), 1),
             "note": str(beat.get("note", "")), "where": claim.get("where") if claim else None,
+            "alive_min": round(age_minutes(alive.get("at")), 1) if vouched and alive.get("at") else None,
         })
     return rows
 
@@ -678,11 +704,106 @@ def cooling(bus, run, lane, account):
     return abs(age_minutes(at)) < COOLDOWN_MINUTES
 
 
+def dry_until(doc):
+    """The reset time the account's own limit gave, if it is believable: still ahead, and no further than the longest
+    limit runs. Without one, the cooldown is all there is to go on."""
+    try:
+        until = parse_iso(doc.get("until"))
+    except (TypeError, ValueError):
+        return None
+    return doc["until"] if 0 < (until - utcnow()).total_seconds() <= DRY_MAX_DAYS * 86400 else None
+
+
 def out_of_usage(bus, account):
-    """When this account ran out of usage, if that was recent enough to still count. The same cooldown as a lost lane, and a
-    time far ahead of the clock cannot lock an account out."""
-    at = bus.doc("accounts/%s.json" % account).get("out_of_usage") if NAME_RE.match(str(account)) else None
-    return at if at and abs(age_minutes(at)) < COOLDOWN_MINUTES else None
+    """When this account ran out of usage, if that still counts: until the reset time its limit gave, or else for the same
+    cooldown as a lost lane. A time far ahead of the clock cannot lock an account out for long."""
+    doc = bus.doc("accounts/%s.json" % account) if NAME_RE.match(str(account)) else {}
+    at = doc.get("out_of_usage")
+    if not at:
+        return None
+    return at if dry_until(doc) or abs(age_minutes(at)) < COOLDOWN_MINUTES else None
+
+
+def back_in(bus, account):
+    """When an account out of usage gets lanes again, as a person reads it."""
+    doc = bus.doc("accounts/%s.json" % account)
+    if dry_until(doc):
+        return "until %s" % doc["until"]
+    try:
+        return "until about %s" % (parse_iso(doc.get("out_of_usage")) + datetime.timedelta(minutes=COOLDOWN_MINUTES)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return "for now"
+
+
+def reset_time(found, now=None):
+    """The UTC time a limit's "resets 3pm (America/Los_Angeles)" means: that day if a date is given, else the next time the
+    clock shows it. Python 3.8 has no zoneinfo, and the name may be unknown, so this computer's zone stands in: the
+    CLI that printed it runs here. None for anything that does not read as a time ahead within the longest limit."""
+    now = now or utcnow()
+    zone = None
+    if found.group("tz"):
+        try:
+            import zoneinfo
+            zone = zoneinfo.ZoneInfo(found.group("tz"))
+        except Exception:
+            zone = None
+    here = now.astimezone(zone) if zone else now.astimezone()
+    hour, minute, half = int(found.group("hour")), int(found.group("min") or 0), (found.group("half") or "").lower()
+    if half:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if half == "pm" else 0)
+    if hour > 23 or minute > 59:
+        return None
+    tz = zone or here.tzinfo
+    try:
+        if found.group("mon"):
+            at = datetime.datetime(here.year, MONTHS.index(found.group("mon")[:3].lower()) + 1, int(found.group("day")), hour, minute, tzinfo=tz)
+            if at < here - datetime.timedelta(days=180):  # December's message read in January
+                at = at.replace(year=here.year + 1)
+        else:
+            at = datetime.datetime(here.year, here.month, here.day, hour, minute, tzinfo=tz)
+            if here - datetime.timedelta(hours=1) < at <= here:
+                return None  # read just after it passed: likely today's, already over, and not tomorrow's
+            if at <= here:
+                day = here.date() + datetime.timedelta(days=1)
+                at = datetime.datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
+    except ValueError:
+        return None
+    at = at.astimezone(datetime.timezone.utc)
+    if not 0 < (at - now).total_seconds() <= DRY_MAX_DAYS * 86400:
+        return None
+    return at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def usage_limit(text, now=None):
+    """The last thing in text saying the account is out of usage, as {"said": "weekly limit", "until": ISO or None}, or
+    None if it says no such thing."""
+    found = None
+    for found in LIMIT_RE.finditer(text or ""):
+        pass
+    if not found:
+        return None
+    kind = " ".join((found.group("kind") or "usage").lower().split())
+    reset = RESET_RE.search(found.group("rest") or "")
+    return {"said": ("%s limit" % kind)[:40], "until": reset_time(reset, now) if reset else None}
+
+
+def dry_files(bus, account, limit=None):
+    """The file marking an account out of usage. A reset time already there and later than this one is kept: a session
+    limit can come and go inside a weekly one."""
+    rel = "accounts/%s.json" % account
+    held = bus.doc(rel)
+    until, kept = (limit or {}).get("until"), dry_until(held)
+    if kept and (not until or kept > until):
+        until = kept
+    doc = {"out_of_usage": now_iso()}
+    if until:
+        doc["until"] = until
+    said = (limit or {}).get("said")
+    if isinstance(said, str) and SAID_RE.match(said):
+        doc["said"] = said
+    return {rel: dumps(doc)}
 
 
 def lost_lane(bus, run, lane, account):
@@ -706,11 +827,12 @@ def rejoined(bus, run, lane, token):
     return files
 
 
-def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, token=None):
+def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, token=None, cap=None):
     """Atomically claim a lane: the named one, or the first open one. Returns its name.
 
     An account takes one lane per run unless allow_second is set, which is how a lane orphaned by an account that
-    ran out of usage still gets picked up when every account already has one. A claim only lands if the push wins.
+    ran out of usage still gets picked up when every account already has one, and then no more than cap, if given. A
+    claim only lands if the push wins.
 
     token marks the one session holding the lane. Rejoining a lane the account holds moves the token, so a restarted
     session replaces its dead predecessor, and the predecessor, if it was not dead, is told it lost the lane."""
@@ -732,6 +854,9 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
                 raise Taken("%s already holds lane %s in %s" % (account, mine[0], run))
             won["lane"] = mine[0]
             return rejoined(bus, run, mine[0], token) if token else {}
+        live = [n for n in mine if beat_of(bus, run, n).get("status", "claimed") in LIVE_BEATS]
+        if cap is not None and len(live) >= cap:
+            raise Taken("%s already holds %d live lanes in %s, its most" % (account, len(live), run))
         if lane:
             if lane not in names:
                 raise FbError("no lane %s in %s" % (lane, run))
@@ -1087,7 +1212,7 @@ def lane_is_live(bus, run, name):
     """Whether a session looks to be on this lane: joined, working and beating. A lane marked done still has its claim,
     and its account's listener still renews the lease, with nobody left to read anything."""
     beat = beat_of(bus, run, name)
-    return bool(bus.doc("runs/%s/claims/%s.json" % (run, name)).get("session")) and beat.get("status") == "working" and abs(age_minutes(beat.get("at"))) < STALE_MINUTES
+    return bool(bus.doc("runs/%s/claims/%s.json" % (run, name)).get("session")) and beat.get("status") == "working" and abs(quiet_minutes(bus, run, name)) < STALE_MINUTES
 
 
 def unread_requests(bus, run, account, files, skip):
@@ -1118,6 +1243,9 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     the run once every lane is done; watches main, unclaimed lanes and lanes done early; rewrites STATUS.md. Returns
     what it did and what needs judgement."""
     report = {"run": run, "holder": None, "freed": [], "finished": False}
+    if too_old(bus, run):  # it would free and hand out lanes by rules the run has moved past
+        report["too_old"] = True
+        return report
     seen = look_at_main(bus, run, account, asked)
 
     def mutate():
@@ -1152,6 +1280,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
                 files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
                 report["freed"].append(name)
             files.update(main)
+            old_listener_alerts(bus, run, account, files)
             unclaimed_alerts(bus, run, account, files, report["freed"])
             overflow_requests(bus, run, account, files, report["freed"])
             unread_requests(bus, run, account, files, report["freed"])
@@ -1173,17 +1302,48 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     return report
 
 
+def old_listener_alerts(bus, run, account, files):
+    """One needs-human per listener heard from in the last day that runs a copy older than the run asks for. Its conductor
+    and claims follow older rules, and nothing on the bus can make it stop: only updating it can."""
+    need = bus.doc("runs/%s/job.json" % run).get("min_version")
+    if not need:
+        return
+    told = set(m.get("body") for m in messages_for(bus, run, "human"))
+    shown = re.sub(r"[^0-9.]", "", str(need))[:20]
+    for name in bus.listdir("listeners"):
+        who, doc = name[:-5], bus.doc("listeners/" + name)
+        if not name.endswith(".json") or not NAME_RE.match(who) or abs(age_minutes(doc.get("at"))) >= 24 * 60:
+            continue
+        if version_tuple(doc.get("version")) >= version_tuple(need):
+            continue
+        have = re.sub(r"[^0-9.]", "", str(doc.get("version") or ""))[:20] or "an unknown version"
+        body = "Listener %s runs fast-builder %s, older than the %s run %s needs, so it still frees and takes lanes by older rules. Update the plugin on that account and run /fast-builder:listen again." % (who, have, shown, run)
+        if body not in told:
+            add_message(files, run, account, "human", "needs-human", body)
+
+
 def quiet_limit(claim, stale_minutes):
     """How long a lane may go without a beat. A claim no session joined gets less. The token is what says so and not the
     beat's note: an old copy's join sets the token and leaves the note `claimed` until its first tick."""
     return stale_minutes if claim.get("session") else min(stale_minutes, CLAIM_QUIET_MINUTES)
 
 
+def quiet_minutes(bus, run, name):
+    """How long a lane has gone unheard: since its own beat, or since its listener last spoke for this very session if that
+    is later. Never longer than VOUCH_MAX_MINUTES on a listener's word alone."""
+    beat, claim = beat_of(bus, run, name), bus.doc("runs/%s/claims/%s.json" % (run, name))
+    quiet = age_minutes(beat.get("at"))
+    alive = bus.doc("runs/%s/alive/%s.json" % (run, name))
+    if claim.get("session") and alive.get("session") == claim.get("session") and alive.get("account") == claim.get("account") and quiet < VOUCH_MAX_MINUTES:
+        quiet = min(quiet, max(0.0, age_minutes(alive.get("at"))))
+    return quiet
+
+
 def _stale(bus, run, stale_minutes):
     out = []
     for name in lane_names(bus, run):
         beat = beat_of(bus, run, name)
-        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and age_minutes(beat.get("at")) >= quiet_limit(bus.doc("runs/%s/claims/%s.json" % (run, name)), stale_minutes):
+        if bus.exists("runs/%s/claims/%s.json" % (run, name)) and beat.get("status") == "working" and quiet_minutes(bus, run, name) >= quiet_limit(bus.doc("runs/%s/claims/%s.json" % (run, name)), stale_minutes):
             out.append(name)
     return out
 
@@ -1212,7 +1372,7 @@ def who_runs_it(bus, run):
     lines = [line, "Conductor: %s." % (holder if NAME_RE.match(str(holder)) else "none yet")]
     dry = sorted(n[:-5] for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5]))
     if dry:
-        lines.append("Out of usage: %s. No lanes are offered to these accounts for %d hours." % (", ".join(dry), COOLDOWN_MINUTES // 60))
+        lines.append("Out of usage, so offered no lanes: %s." % ", ".join("%s %s" % (name, back_in(bus, name)) for name in dry))
     return lines
 
 
@@ -1232,7 +1392,10 @@ def render_status(bus, fresh=None):
             lines += ["Main is %s at %s since %s.%s" % (main["state"], main["sha"][:7], main["since"], " Failing: %s." % ", ".join(main["failing"]) if main["failing"] else ""), ""]
         lines += ["| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
         for row in lane_table(bus, run):
-            lines.append("| %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-", row["note"].replace("|", "/")[:80]))
+            note = row["note"]
+            if row["alive_min"] is not None and row["beat_age_min"] is not None and row["alive_min"] < row["beat_age_min"]:
+                note = "working, says its listener %s min ago; %s" % (row["alive_min"], note)
+            lines.append("| %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-", note.replace("|", "/")[:80]))
         human = [m for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]
         if human:
             lines += ["", "Waiting on a person:"] + ["- %s: %s" % (m["from"], m["body"]) for m in human]
@@ -1682,7 +1845,8 @@ INSTRUCTIONS = {
     PAUSE: "Finish nothing new. Save your handoff, then run fb.py wait until the run resumes.",
     DRAIN: "Finish the slice in hand, land or park it, start nothing new, save your handoff, then fb.py lane-state stopped.",
     STOP: "Stop now. Tell subagents to stop, save your handoff, run fb.py lane-state stopped, and end the session.",
-    LOST: "Another account holds this lane now. Stop work and run fb.py leave, then end the session.",
+    LOST: ("Another account holds this lane now. Stop work and tell subagents to stop. fb.py has pushed this lane's own unpushed "
+           "branches and a snapshot of the rest, and noted both in the lane's handoff (see `saved`). Then run fb.py leave and end the session."),
     FINISHED: "The run is finished. Write your end-of-run summary and end the session.",
 }
 
@@ -2020,14 +2184,88 @@ def alive(pid):
 def work_clone(remote, run, lane, base):
     """A private clone per lane, on the run's base branch: lanes never share a checkout, and no checkout belongs to
     another OS user."""
-    key = hashlib.sha1(remote.encode()).hexdigest()[:10]
-    path = os.path.join(CACHE_DIR, "work", key, "%s-%s" % (run, lane))
+    path = clone_path(remote, run, lane)
     if not os.path.isdir(os.path.join(path, ".git")):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         git(["clone", "-q", "--branch", base, remote, path], timeout=900)
     else:
         git(["fetch", "-q", "origin"], cwd=path, timeout=300)  # a restarted lane keeps its branch and work
     return path
+
+
+def clone_path(remote, run, lane):
+    return os.path.join(CACHE_DIR, "work", hashlib.sha1(remote.encode()).hexdigest()[:10], "%s-%s" % (run, lane))
+
+
+def transcript_dirs(folder):
+    """Where Claude Code keeps the transcripts of sessions run in folder, named for the folder with everything but letters
+    and digits made a dash. Every turn and every subagent's step lands there, so it moves while a lead works even if the
+    lead itself calls nothing for an hour. A long name is cut and given a suffix, so that one is found by its start."""
+    base = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"), "projects")
+    found = []
+    for path in sorted(set([folder, os.path.realpath(folder)])):
+        name = re.sub(r"[^A-Za-z0-9]", "-", path)
+        if os.path.isdir(os.path.join(base, name)):
+            found.append(os.path.join(base, name))
+        elif len(name) > 200:
+            found += [p for p in globlib.glob(os.path.join(globlib.escape(base), globlib.escape(name[:200]) + "*")) if os.path.isdir(p)]
+    return found
+
+
+def last_activity(remote, run, lane):
+    """When anything of this lane's last moved: its session transcripts, subagents' included, its log, or its clone's git,
+    worktrees' too. A hung process moves none of them. None if nothing can be read."""
+    folder = clone_path(remote, run, lane)
+    git_dir = os.path.join(folder, ".git")
+    paths = [lane_log(run, lane), os.path.join(git_dir, "index"), os.path.join(git_dir, "HEAD"), os.path.join(git_dir, "logs", "HEAD")]
+    paths += globlib.glob(os.path.join(globlib.escape(git_dir), "worktrees", "*", "index")) + globlib.glob(os.path.join(globlib.escape(git_dir), "worktrees", "*", "logs", "HEAD"))
+    for top in transcript_dirs(folder):
+        for root, _, names in os.walk(top):
+            paths += [os.path.join(root, name) for name in names]
+    newest = 0.0
+    for path in paths:
+        try:
+            newest = max(newest, os.path.getmtime(path))
+        except OSError:
+            pass
+    return newest or None
+
+
+def vouch(bus, account):
+    """Speak for this listener's own lanes whose process is alive and working, so that a lead blocked on long subagents, or
+    one whose pushes keep timing out on a loaded computer, is not freed for going quiet. Only a joined, working claim of
+    this account's, only a process proved to be ours, and only while something of the lane has moved lately: a hung one
+    is still freed. A lead unheard past VOUCH_MAX_MINUTES is not spoken for at all."""
+    due = {}
+    for key, child in (read_json(children_path()) or {}).items():
+        run, _, lane = key.partition("/")
+        if child.get("remote") != bus.remote or not (RUN_RE.match(run) and NAME_RE.match(lane)):
+            continue
+        claim, beat = bus.doc("runs/%s/claims/%s.json" % (run, lane)), beat_of(bus, run, lane)
+        if claim.get("account") != account or not claim.get("session") or beat.get("status") != "working":
+            continue
+        if not VOUCH_AFTER_MINUTES <= age_minutes(beat.get("at")) < VOUCH_MAX_MINUTES:
+            continue
+        held = bus.doc("runs/%s/alive/%s.json" % (run, lane))
+        if held.get("session") == claim.get("session") and abs(age_minutes(held.get("at"))) * 60 < VOUCH_SECONDS:
+            continue
+        seen = last_activity(bus.remote, run, lane) if child_state(child) == "ours" else None
+        if seen and time.time() - seen < VOUCH_ACTIVE_MINUTES * 60:
+            due[(run, lane)] = claim["session"]
+    if not due:
+        return
+
+    def mutate():
+        files = {}
+        for (run, lane), token in due.items():
+            claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
+            if claim.get("account") == account and claim.get("session") == token and beat_of(bus, run, lane).get("status") == "working":
+                files["runs/%s/alive/%s.json" % (run, lane)] = dumps({"account": account, "session": token, "at": now_iso()})
+        return files
+    try:
+        bus.commit(mutate, "alive: %s" % account)
+    except FbError:
+        pass  # a vouch that cannot land is one the next pass tries again
 
 
 def process_start(pid):
@@ -2150,7 +2388,9 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
     bus.sync()
     start_joining_clock(bus, run, lane, account)
     os.makedirs(os.path.join(HOME_DIR, "logs"), exist_ok=True)
-    log = open(os.path.join(HOME_DIR, "logs", "%s-%s.log" % (run, lane)), "a")
+    log_path = lane_log(run, lane)
+    log_from = os.path.getsize(log_path) if os.path.exists(log_path) else 0  # where this session's words start: the log is appended to
+    log = open(log_path, "a")
     rest = ["--model", job.get("lane_model", "opus"), "--permission-mode", repo_cfg.get("permission_mode", "auto"), "--permission-prompts", "none", "--name", "fb %s %s" % (run, lane)]
     if os.path.isdir(plugin_copy()):
         rest += ["--plugin-dir", plugin_copy()]
@@ -2169,9 +2409,52 @@ def launch_lane(bus, repo_cfg, run, lane, account, attempt=0):
         if prompt is not None:
             stdin.close()
     children = read_json(children_path()) or {}
-    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "started": process_start(proc.pid), "remote": bus.remote, "attempt": attempt, "at": now_iso()}
+    children["%s/%s" % (run, lane)] = {"pid": proc.pid, "started": process_start(proc.pid), "remote": bus.remote, "attempt": attempt, "at": now_iso(), "log_from": log_from}
     write_file(children_path(), dumps(children))
     return proc.pid
+
+
+def lane_log(run, lane):
+    return os.path.join(HOME_DIR, "logs", "%s-%s.log" % (run, lane))
+
+
+def lane_said(child, run, lane):
+    """What a lane's last session printed. Only from where its launch began, since earlier sessions wrote to the same log.
+    An entry from before log_from was recorded gets only the very end, and only if the log was written after it started."""
+    path = lane_log(run, lane)
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if isinstance(child.get("log_from"), int):
+                start = child["log_from"] if child["log_from"] <= size else 0  # a log cut short since: all of it is newer
+                start = max(start, size - LOG_TAIL_BYTES)
+            else:
+                if os.path.getmtime(path) < parse_iso(child.get("at")).timestamp():
+                    return ""
+                start = max(0, size - 2048)
+            handle.seek(start)
+            return handle.read().decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def ran_dry(bus, run, lane, account, limit):
+    """A lane's session said its account is out of usage. Nothing could restart it, so the lane goes back at once, not to
+    this account, and the account is offered no lane until its limit resets. lane None: only mark the account."""
+    back = ", back %s" % limit["until"] if limit.get("until") else ""
+    why = "freed: %s ran out of usage (%s%s)" % (account, limit.get("said", "usage limit"), back)
+
+    def mutate():
+        files = dry_files(bus, account, limit)
+        if lane:
+            claim, beat = bus.doc("runs/%s/claims/%s.json" % (run, lane)), beat_of(bus, run, lane)
+            if claim.get("account") == account and beat.get("status") in LIVE_BEATS:
+                files.update(lost_lane(bus, run, lane, account))
+                files["runs/%s/claims/%s.json" % (run, lane)] = None
+                files["runs/%s/beats/%s.json" % (run, lane)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": why[:200]})
+                add_message(files, run, account, "all", "note", "Lane %s %s." % (lane, why))
+        return files
+    bus.commit(mutate, "out of usage(%s): %s" % (run, account))
 
 
 def stated_status(text):
@@ -2345,8 +2628,9 @@ def supervise(bus, repo_cfg, account, stops_only=False):
     stops_only: just the second half, for before conducting, which must come first for the restarts."""
     children = read_json(children_path()) or {}
     changed = False
-    for key, child in list(children.items()):
-        if child.get("remote") != bus.remote:
+    for key in list(children):
+        child = children.get(key)  # from the dict as it is now: a restart below reads it back from disk
+        if not isinstance(child, dict) or child.get("remote") != bus.remote:
             continue
         run, lane = key.split("/", 1)
         action = run_state(bus, run)["action"]
@@ -2372,11 +2656,29 @@ def supervise(bus, repo_cfg, account, stops_only=False):
             continue
         status = beat_of(bus, run, lane).get("status")
         claim = bus.doc("runs/%s/claims/%s.json" % (run, lane))
-        del children[key]
-        changed = True
+        ours = status == "working" and claim.get("account") == account
+        if not child.get("exited"):
+            child["exited"] = time.time()
+            changed = True
+            # The CLI's own last words, not anything earlier: a lead's summary may quote a limit message
+            limit = usage_limit("\n".join([line for line in lane_said(child, run, lane).splitlines() if line.strip()][-3:]))
+            if limit:  # no restart can work, and every one would print the same thing again
+                child["dry"] = limit
+        if child.get("dry"):  # kept until it lands: the log is the only evidence, and the next pass reads no further than this
+            try:
+                ran_dry(bus, run, lane if ours else None, account, child["dry"])
+            except FbError:
+                continue
+            del children[key]
+            changed = True
+            continue
         lived = age_minutes(child.get("at"))
         attempt = 0 if STALE_MINUTES <= lived < float("inf") else child.get("attempt", 0)  # the cap is for sessions that die young, not for a lane that restarts at its context limit
-        ours = status == "working" and claim.get("account") == account
+        wait = RESTART_BACKOFF_SECONDS * 2 ** (attempt - 1) if attempt else 0
+        if ours and attempt < MAX_RESTARTS and time.time() - child["exited"] < wait:
+            continue  # an outage that killed it kills a restart too, and restarts are few
+        del children[key]
+        changed = True
         if ours and attempt < MAX_RESTARTS:
             write_file(children_path(), dumps(children))
             try:
@@ -2394,27 +2696,72 @@ def supervise(bus, repo_cfg, account, stops_only=False):
         write_file(children_path(), dumps(children))
 
 
-def pick_lane(bus, run, account):
+def pick_lane(bus, run, account, skip=()):
     """The lane this account should take now, if any. A lane freed from an account that went quiet or stopped is fair
     game for an account already in the run; a fresh lane is not, so one account never ends up carrying a whole run.
     A lane this account just lost to going quiet is neither: it probably has no usage left to run it with. An account that
-    said it has none gets no lane at all, or it would start one, stop at once and free it, one lane after another."""
-    if out_of_usage(bus, account):
+    said it has none gets no lane at all, or it would start one, stop at once and free it, one lane after another.
+    skip: lanes this pass freed itself, which go to whichever listener sees them next, never straight back to this one.
+    No account holds more than the run's lane cap."""
+    if out_of_usage(bus, account) or too_old(bus, run):
         return None
     table = lane_table(bus, run)
-    open_lanes = [r["lane"] for r in table if r["account"] is None and not cooling(bus, run, r["lane"], account)]
+    open_lanes = [r["lane"] for r in table if r["account"] is None and r["lane"] not in skip and not cooling(bus, run, r["lane"], account)]
     if not open_lanes:
         return None
-    if not [r for r in table if r["account"] == account]:
+    held = [r for r in table if r["account"] == account]
+    if not held:
         return open_lanes[0]
-    freed = [r["lane"] for r in table if r["lane"] in open_lanes and r["status"] == "open" and beat_of(bus, run, r["lane"])]
-    return freed[0] if freed else None
+    live = [r for r in held if r["status"] in LIVE_BEATS]  # a lane marked done keeps its claim and costs nothing
+    if len(live) >= lane_cap(bus, run):
+        return None
+    freed = [r for r in table if r["lane"] in open_lanes and r["status"] == "open" and beat_of(bus, run, r["lane"])]
+    # A second lane doubles how fast this account runs dry, so one with no lane gets the first go at it.
+    ready = [r["lane"] for r in freed if not live or abs(age_minutes(r["beat"])) >= SPREAD_MINUTES or not other_takers(bus, run, r["lane"], account)]
+    return ready[0] if ready else None
+
+
+def lane_cap(bus, run):
+    cap = bus.doc("runs/%s/job.json" % run).get("lane_cap")
+    return cap if isinstance(cap, int) and not isinstance(cap, bool) and 1 <= cap <= 20 else DEFAULT_LANE_CAP
+
+
+def version_tuple(text):
+    parts = re.findall(r"\d+", str(text or ""))[:4]
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def too_old(bus, run):
+    """Whether this copy is older than the run asks for. An older copy frees and takes lanes by older rules, which is how
+    one account out of usage ended up holding a whole run."""
+    return version_tuple(VERSION) < version_tuple(bus.doc("runs/%s/job.json" % run).get("min_version"))
+
+
+def other_takers(bus, run, lane, account):
+    """Listeners besides this account that could take this lane now and hold none in the run: heard from lately, able to
+    run lanes where this run runs them, not out of usage, not cooling on this lane, and new enough for the run."""
+    job = bus.doc("runs/%s/job.json" % run)
+    holders = set(r["account"] for r in lane_table(bus, run) if r["account"] and r["status"] in LIVE_BEATS)
+    found = []
+    for name in bus.listdir("listeners"):
+        who = name[:-5]
+        if not name.endswith(".json") or who == account or who in holders or not NAME_RE.match(who):
+            continue
+        doc = bus.doc("listeners/" + name)
+        if abs(age_minutes(doc.get("at"))) >= LISTENER_LIVE_MINUTES:
+            continue
+        if not (doc.get("local", True) if job.get("where", "cloud") == "local" else doc.get("cloud", True) and doc.get("routine")):
+            continue
+        if out_of_usage(bus, who) or cooling(bus, run, lane, who) or version_tuple(doc.get("version")) < version_tuple(job.get("min_version")):
+            continue
+        found.append(who)
+    return found
 
 
 def claim_picked(bus, run, lane, account):
     second = any(r["account"] == account for r in lane_table(bus, run))
     try:
-        return claim_lane(bus, run, account, lane, allow_second=second) == lane
+        return claim_lane(bus, run, account, lane, allow_second=second, cap=lane_cap(bus, run)) == lane
     except Taken:
         return False
 
@@ -2427,7 +2774,16 @@ def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
     if job.get("where", "cloud") == "local":
         if time.time() - failed.get(run, 0) < WAKE_SECONDS:  # a lane that cannot start must not churn the bus
             return []
-        if not repo_cfg.get("local", True) or not claim_picked(bus, run, lane, account):
+        if not repo_cfg.get("local", True):
+            return []
+        dry = any(dry_pending(c) for c in (read_json(children_path()) or {}).values())
+        busy = "a lane here said this account is out of usage, and the bus has not heard it yet" if dry else no_room_here(load_config())
+        if busy:  # unclaimed, so a listener on another computer can have it meanwhile
+            said = memory.get("held") == busy
+            memory["held"] = busy
+            return [] if said else [{"did": "held", "run": run, "lane": lane, "why": busy}]
+        memory.pop("held", None)
+        if not claim_picked(bus, run, lane, account):
             return []
         try:
             return [{"did": "launch", "run": run, "lane": lane, "where": "local", "pid": launch_lane(bus, repo_cfg, run, lane, account)}]
@@ -2478,6 +2834,40 @@ def start_lane(bus, repo_cfg, run, lane, account, memory, budget):
     return [action]
 
 
+def dry_pending(child):
+    """Whether a lane here said its account is out and the bus may not know yet. Only until the reset it gave, or for the
+    cooldown without one: the entry can outlive its repo, or wait on a paused run, and must not hold every lane forever."""
+    limit = child.get("dry") if isinstance(child, dict) else None
+    if not isinstance(limit, dict):
+        return False
+    if limit.get("until"):
+        return bool(dry_until(limit))
+    try:
+        return time.time() - float(child.get("exited") or 0) < COOLDOWN_MINUTES * 60
+    except (TypeError, ValueError):
+        return False
+
+
+def no_room_here(config):
+    """Why this computer should start no more local lanes now, or None. Lanes on one computer share it: three OS users with
+    four lanes each pushed the load to 35 on 14 cores, git timed out a thousand times, and healthy lanes went quiet and were
+    freed. Counts this OS user's live lanes across every repo, and the load of the whole computer."""
+    cap = config.get("max_local_lanes", DEFAULT_MAX_LOCAL_LANES)
+    if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+        live = [k for k, c in (read_json(children_path()) or {}).items() if isinstance(c, dict) and isinstance(c.get("pid"), int) and child_state(c) != "gone"]
+        if len(live) >= cap:
+            return "%d local lanes already running here, the most this OS user runs (max_local_lanes)" % len(live)
+    per_cpu = config.get("max_load_per_cpu", LOAD_PER_CPU)
+    if isinstance(per_cpu, (int, float)) and not isinstance(per_cpu, bool) and per_cpu > 0 and hasattr(os, "getloadavg"):
+        try:
+            load, cores = os.getloadavg()[1], os.cpu_count() or 1
+        except OSError:
+            return None
+        if load > per_cpu * cores:
+            return "this computer's load is %.0f on %d cores, over max_load_per_cpu %s" % (load, cores, per_cpu)
+    return None
+
+
 def release_lane(bus, run, lane, account, reason, cool=False):
     """Give a lane back, so the next listener can take it. cool: and not to this account, for the cooldown."""
     text = "Could not start lane %s: %s" % (lane, reason)
@@ -2499,27 +2889,36 @@ def poll_repo(remote, repo_cfg, account, heads, launch=True):
     sha = bus.head()
     actions = []
     last = heads.setdefault(remote, {})  # here and not at the end: a pass that dies must still remember its wake
-    beat_due = time.time() - last.get("beat", 0) > 3600
+    beat_due = time.time() - last.get("beat", 0) > LISTENER_BEAT_SECONDS  # often enough to tell a listener gone from one with no lane
     conduct_due = time.time() - last.get("conduct", 0) > 300
     if not sha or (sha == last.get("sha") and not beat_due and not conduct_due and not (read_json(children_path()) or {})):
         return actions
     bus.sync()
+    freed = {}
     if conduct_due:  # before restarts: a dead lane it frees must not be restarted there and started again below
         supervise(bus, repo_cfg, account, stops_only=True)  # and after stops: asking gh can take a minute
         asked = {}
         for run in active_runs(bus):
+            if too_old(bus, run):
+                try:
+                    post_once(bus, run, account, "%s's listener runs fast-builder %s, older than run %s needs, so it takes no lanes there and does not conduct it. Update the plugin on %s and run /fast-builder:listen again." % (account, VERSION, run, account))
+                except FbError:
+                    pass
+                continue
             try:
                 report = conduct(bus, run, account, asked=asked)
             except Exception as exc:  # one bad run must not cost another run's stop
                 actions.append({"did": "conduct-failed", "run": run, "error": repr(exc)[:200]})
                 continue
+            freed[run] = report["freed"]
             if report["freed"] or report["finished"]:
                 actions.append(dict(report, did="conduct"))
     supervise(bus, repo_cfg, account)  # before any wake: those run one Haiku call at a time, and a stop must not wait
+    vouch(bus, account)
     budget = {"calls": PASS_CALLS}
     for run in sorted(active_runs(bus), key=lambda r: last.get("woke", {}).get(r, 0)):  # or a failing walk starves all but the first
         if launch and run_state(bus, run)["action"] == GO:
-            pick = pick_lane(bus, run, account)
+            pick = pick_lane(bus, run, account, skip=freed.get(run, ()))
             if pick:
                 actions += start_lane(bus, repo_cfg, run, pick, account, last, budget)
                 if actions and actions[-1].get("sync_failed"):  # the checkout is not one to read: the next pass syncs again
@@ -2755,6 +3154,13 @@ def load_listener(domain):
     raise FbError("launchctl bootstrap failed: %s" % (proc.stderr or proc.stdout).strip()[:300])
 
 
+def kit_older(bus):
+    """Whether the bus's kit is a copy older than this one. A kit with no version to read is left alone: a person or a
+    publish may have put it there on purpose."""
+    found = re.search(r'^VERSION = "([0-9.]{1,20})"', bus.read("kit/fb.py") or "", re.M)
+    return bool(found) and version_tuple(found.group(1)) < version_tuple(VERSION)
+
+
 def announce_listener(bus, account, doc, proved=False):
     """Say this account is listening, and put the kit on the bus so its routine can poll before any run exists. A routine
     nothing has just `proved` never replaces the one on the bus: the config can be the stale side of the two."""
@@ -2764,7 +3170,7 @@ def announce_listener(bus, account, doc, proved=False):
         if not proved and isinstance(kept, str) and BUS_TRIGGER_RE.match(kept):
             doc["routine"] = kept
         files = {"listeners/%s.json" % account: dumps(doc)}
-        if not bus.exists("kit/fb.py"):
+        if not bus.exists("kit/fb.py") or kit_older(bus):  # cloud lanes run the bus's copy
             files.update(kit_files())
         return files
     bus.commit(mutate, "listener: %s" % account)
@@ -2795,6 +3201,10 @@ def listen_install(args):
     cloud = held.get("cloud") is not False if args.cloud is None else args.cloud
     local = held.get("local") is not False if args.local is None else args.local
     config["repos"][slug] = {"remote": remote, "permission_mode": mode, "cloud": cloud, "local": local, "routine_id": routine}
+    if args.max_local_lanes is not None:  # this computer's, so for every repo: 0 means no limit
+        config["max_local_lanes"] = args.max_local_lanes
+    if args.max_load_per_cpu is not None:
+        config["max_load_per_cpu"] = args.max_load_per_cpu
     save_config(config)
     script = os.path.join(HOME_DIR, "fb.py")
     os.makedirs(HOME_DIR, exist_ok=True)
@@ -2876,7 +3286,8 @@ def cmd_draft(args):
     draft = args.dir or tempfile.mkdtemp(prefix="fb-draft-")
     job = {"run": run, "repo": slug, "code": code.upper(), "stamp": today.strftime("%m-%d-%y"), "kicked_off": now_iso(), "goal": args.goal,
            "accounts": args.accounts or 0, "max_accounts": max_accounts, "where": args.where or "cloud", "autopilot": args.autopilot or "full",
-           "plan_file": plan_file, "deadline": args.deadline, "base": args.base or default_branch(), "created_by": bus.account, "lane_model": args.lane_model, "sizing": ""}
+           "plan_file": plan_file, "deadline": args.deadline, "base": args.base or default_branch(), "created_by": bus.account, "lane_model": args.lane_model, "sizing": "",
+           "min_version": VERSION, "lane_cap": args.lane_cap or DEFAULT_LANE_CAP}
     write_file(os.path.join(draft, "job.json"), dumps(job))
     out({"draft": draft, "run": run, "plan_file": plan_file, "max_accounts": max_accounts, "where": job["where"], "autopilot": job["autopilot"]})
 
@@ -2968,6 +3379,8 @@ def cmd_join(args):
     if args.lane in (None, "any", "<any open lane>") and out_of_usage(bus, account):
         raise FbError("%s ran out of usage at %s, so it is offered no lanes: name one with --lane, or have a person run resume" % (account, out_of_usage(bus, account)))
     run = pick_run(bus, argparse.Namespace(run=None if args.run in (None, "any") else args.run))
+    if too_old(bus, run):
+        raise FbError("run %s needs fast-builder %s or later, and this is %s: update the plugin first" % (run, re.sub(r"[^0-9.]", "", str(bus.doc("runs/%s/job.json" % run).get("min_version")))[:20], VERSION))
     lane = None if args.lane in (None, "any", "<any open lane>") else args.lane
     if lane and not NAME_RE.match(lane):
         raise FbError("bad lane name")
@@ -3007,11 +3420,45 @@ def answers_conductor(bus, session, holder):
     return is_steward(bus, session["run"], session["lane"]) and not any(r["account"] == holder and lane_is_live(bus, session["run"], r["lane"]) for r in lane_table(bus, session["run"]))
 
 
+def keep_lost_work(bus, session, path):
+    """A lane that lost its claim pushes what it has before it stops, so the account now on the lane can start from it
+    rather than rebuild it: its own unpushed branches, and a snapshot of the rest of its own files, as when an account runs
+    out. It costs no tokens, runs once per session, and says what it did in the lane's handoff. Returns what it saved."""
+    run, lane, account = session["run"], session["lane"], session["account"]
+    if session.get("lost_saved") or bus.doc("runs/%s/claims/%s.json" % (run, lane)).get("account") == account:
+        return None  # a later session of this same account has it, in this same clone, with everything here
+    session["lost_saved"] = True
+    save_session(path, session)
+    bus.release()  # a large push should not keep this account's other lanes off the bus
+    try:
+        saved = save_snapshot(session, path, read_json(os.path.join(os.path.dirname(path), "lanes.json")), why="another account took the lane")
+    except Exception as exc:  # whatever is wrong with the lane's files, it still has to stop
+        saved = {"failed": str(exc)[:200]}
+    if not any(saved.get(k) for k in ("branch", "pushed", "held", "left", "failed")):
+        return saved
+
+    def mutate():
+        handoff = "runs/%s/handoffs/%s.md" % (run, lane)
+        files = {handoff: (bus.read(handoff) or "") + snapshot_note(account, saved, "%s lost this lane at %s" % (account, now_iso()))}
+        if bus.doc("runs/%s/claims/%s.json" % (run, lane)).get("account") not in (None, account) and (saved.get("branch") or saved.get("pushed")):
+            add_message(files, run, account, lane, "note", "%s left unfinished work on this lane when it lost it. The lane's handoff says where." % account)
+        return files
+    try:
+        bus.commit(mutate, "handoff(%s): %s lost %s" % (run, account, lane))
+    except FbError:
+        pass  # what was pushed stays pushed: only the note did not land
+    return saved
+
+
 def cmd_tick(args):
     session, path, bus = need_session()
     bus.sync()
     result = build_tick(bus, session)
     remember_control(path, result["action"])
+    if result["action"] == LOST:
+        saved = keep_lost_work(bus, session, path)
+        if saved:
+            result["saved"] = {k: saved.get(k) for k in ("branch", "pushed", "held", "failed") if saved.get(k)}
     if result["action"] in (GO, DRAIN, PAUSE) and (time.time() - session.get("last_beat", 0) >= BEAT_SECONDS or args.note):
         # Before conducting: a lane's own quiet spell must not get it freed by its own tick.
         session["note"] = args.note or session.get("note", "")
@@ -3077,8 +3524,17 @@ def leave_session(path):
 
 def cmd_leave(args):
     session, path, bus = need_session()
+    saved = None
+    try:
+        if bus.sync() and build_tick(bus, session)["action"] == LOST:  # a lead told by its guard may come straight here
+            saved = keep_lost_work(bus, session, path)
+    except FbError:
+        pass  # leaving must always work
     leave_session(path)
-    out({"left": session["lane"], "run": session["run"]})
+    result = {"left": session["lane"], "run": session["run"]}
+    if saved:
+        result["saved"] = {k: saved.get(k) for k in ("branch", "pushed", "held", "failed") if saved.get(k)}
+    out(result)
 
 
 def cmd_wait(args):
@@ -3113,6 +3569,7 @@ def cmd_wait(args):
                     out({"woke": "resumed", "action": GO})
                     return
         except Lost:
+            keep_lost_work(bus, session, path)
             out({"woke": "lost", "action": LOST})
             return
         except FbError:
@@ -3310,10 +3767,10 @@ def cmd_poll(args):
         return
     asked = {}
     for run in active_runs(bus):
-        conduct(bus, run, account, asked=asked)
+        report = conduct(bus, run, account, asked=asked)
         if run_state(bus, run)["action"] != GO:
             continue
-        lane = pick_lane(bus, run, account)
+        lane = pick_lane(bus, run, account, skip=report["freed"])
         if lane and claim_picked(bus, run, lane, account):
             print("LANE run=%s lane=%s\n" % (run, lane))
             print(lane_prompt(run, lane, account))
@@ -3333,12 +3790,43 @@ def looks_secret(path):
     return bool(SECRET_RE.search(path) or (SECRET_NAME_RE.search(path) and not SOURCE_RE.search(path)))
 
 
-def save_snapshot(session, session_file, lanes):
+def push_lane_branches(snap, session, lanes):
+    """Push this lane's own branches, fb/<run>/<lane>/..., that have commits no remote has: a subagent's slice in its
+    worktree is one, and is exactly what a replacement would otherwise rebuild. Under their own names and never forced, so
+    one that moved on the remote is left alone. One whose commits touch another lane's files or look like secrets stays here."""
+    prefix = "fb/%s/%s/" % (session["run"], session["lane"])
+    pushed, held = [], []
+    for row in snap(["for-each-ref", "--format=%(refname:short) %(upstream:track)", "refs/heads/" + prefix]).split("\n"):
+        branch, _, track = row.partition(" ")
+        if not branch.startswith(prefix) or not BRANCH_RE.match(branch) or "gone" in track:  # gone: merged and deleted, most likely
+            continue
+        if snap(["rev-list", "--count", branch, "--not", "--remotes"]) == "0":
+            continue
+        try:
+            main = "origin/" + session.get("base", "main")
+            base = snap(["merge-base", branch, main])
+            mine = [n for n in snap(["log", "--format=", "--name-only", "-z", "--no-renames", "--no-merges", "%s..%s" % (base, branch)]).split("\0") if n.strip()]
+            same = run_cmd(["git", "-c", "safe.directory=*", "diff", "--quiet", main, branch, "--"] + mine, cwd=snap.top, check=False, timeout=15, env=dict(os.environ, GIT_LITERAL_PATHSPECS="1"))
+            if mine and same.returncode == 0:
+                continue  # its files already read so on the base: squash-merged, and pushing it again would bring it back
+            every = [n for n in snap(["log", "--format=", "--name-only", "-z", "--no-renames", "--diff-merges=first-parent", "%s..%s" % (base, branch)]).split("\0") if n.strip()]
+            if any(looks_secret(n) for n in every) or not lanes or any(not may_touch(n, session["lane"], lanes) for n in mine):
+                held.append(branch)
+                continue
+            snap(["push", "-q", "--no-verify", "origin", "refs/heads/%s:refs/heads/%s" % (branch, branch)], timeout=60)
+            pushed.append(branch)
+        except FbError:
+            held.append(branch)
+    return pushed, held
+
+
+def save_snapshot(session, session_file, lanes, why="its account ran out of usage"):
     """Put this lane's unfinished work on a branch of its own, for a replacement on another account who cannot read this
     clone. Returns what happened, for the handoff. It spends no tokens and leaves the clone as it was: the snapshot is built
     in a throwaway index, and status reads the real one, so a file hidden with --skip-worktree stays hidden. Only this lane's
     own files go, since it is unreviewed, and each firing gets a new branch, so nothing can overwrite an earlier save.
-    Names go to update-index, which takes them literally: a file called * must not read as a pattern."""
+    Names go to update-index, which takes them literally: a file called * must not read as a pattern. The lane's own
+    branches with unpushed commits go up first, under their own names."""
     git_dir = os.path.dirname(os.path.dirname(session_file))
     top = os.path.dirname(git_dir)
     plain = dict(os.environ, GIT_CONFIG_COUNT="0")  # this clone's own line endings, or every file would read as changed
@@ -3346,6 +3834,8 @@ def save_snapshot(session, session_file, lanes):
     def snap(args, timeout=15, env=plain, **kw):
         return run_cmd(["git", "-c", "safe.directory=*", "-c", "core.longpaths=true", "--no-optional-locks"] + args, cwd=top, env=env, timeout=timeout, **kw).stdout.rstrip("\n")
 
+    snap.top = top
+    pushed, held = push_lane_branches(snap, session, lanes)
     head = snap(["rev-parse", "--verify", "HEAD"])
     saved, left = [], []
     for entry in snap(["status", "--porcelain", "-z", "--no-renames", "--untracked-files=all"], timeout=45).split("\0"):
@@ -3366,7 +3856,7 @@ def save_snapshot(session, session_file, lanes):
         notes.append("It has other worktrees, such as a subagent's, and none of them was looked at.")
     if any(os.path.exists(os.path.join(git_dir, marker)) for marker in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD")):
         notes.append("It was in the middle of a rebase or merge, so this is not all of that work, and it may hold conflict markers.")
-    result = {"branch": None, "left": left, "notes": notes}
+    result = {"branch": None, "left": left, "notes": notes, "pushed": pushed, "held": held}
     pushed = bool(snap(["branch", "-r", "--contains", head]))
     if pushed and not saved:
         return result
@@ -3395,7 +3885,7 @@ def save_snapshot(session, session_file, lanes):
     sha = parent
     if tree != snap(["rev-parse", parent + "^{tree}"]):
         who = ["-c", "user.name=fast-builder", "-c", "user.email=fast-builder@noreply.local"]
-        sha = snap(who + ["commit-tree", tree, "-p", parent, "-m", "wip: %s stopped when its account ran out of usage" % session["lane"]])
+        sha = snap(who + ["commit-tree", tree, "-p", parent, "-m", "wip: %s stopped when %s" % (session["lane"], why)])
     elif pushed or suspect:
         return result  # staged and then undone, or commits of nothing but secrets: nothing here that the remote lacks
     branch = "fast-builder/wip/%s/%s/%s-%s" % (session["run"], session["lane"], session["account"], utcnow().strftime("%Y%m%dT%H%M%SZ"))
@@ -3404,9 +3894,13 @@ def save_snapshot(session, session_file, lanes):
     return result
 
 
-def snapshot_note(account, saved):
+def snapshot_note(account, saved, heading=None):
     """The part of a handoff that says what a replacement has to go on, and exactly what it does not have."""
-    lines = ["", "", "## %s ran out of usage at %s" % (account, now_iso()), ""]
+    lines = ["", "", "## %s" % (heading or "%s ran out of usage at %s" % (account, now_iso())), ""]
+    if saved.get("pushed"):
+        lines.append("Its lane branches that no remote had are pushed now, under their own names: %s." % ", ".join("`%s`" % b for b in saved["pushed"][:WIP_NAMES_SHOWN]))
+    if saved.get("held"):
+        lines.append("Its lane branches still only on that computer, because their commits touch another lane's files or files that look like secrets, share no history with the base, or would not push: %s." % ", ".join("`%s`" % b for b in saved["held"][:WIP_NAMES_SHOWN]))
     if saved.get("failed"):
         lines.append("Its unfinished work could not be pushed: %s. Anything uncommitted or unpushed is still in its clone." % saved["failed"])
     elif saved.get("branch"):
@@ -3460,8 +3954,11 @@ def hook_stop_failure(payload):
         except Exception as exc:  # whatever is wrong with the lane's files, it still has to move on, and lanes.json came off the bus
             saved = {"failed": str(exc)[:200]}
 
+    # The reset time, if the event carries the CLI's words. Not the model's: its last message may quote some other limit.
+    limit = usage_limit("\n".join(v for k, v in payload.items() if isinstance(v, str) and k not in ("last_assistant_message", "cwd", "transcript_path")))
+
     def mutate():
-        files = {"accounts/%s.json" % account: dumps({"out_of_usage": now_iso()})}
+        files = dry_files(bus, account, limit)
         now_claim, now_beat = bus.doc("runs/%s/claims/%s.json" % (run, lane)), beat_of(bus, run, lane)
         freeing = holds_claim(now_claim, session) and now_beat.get("status") in LIVE_BEATS
         if freeing:
@@ -3626,6 +4123,7 @@ def build_parser():
     p.add_argument("--code", help="short repo code for the plan's file name, such as HPH")
     p.add_argument("--base")
     p.add_argument("--lane-model", default="opus")
+    p.add_argument("--lane-cap", type=int, choices=range(1, 21), metavar="N", help="most lanes one account may hold (default %d)" % DEFAULT_LANE_CAP)
     p.add_argument("--dir")
     p.add_argument("--today", help="YYYY-MM-DD")
 
@@ -3741,6 +4239,8 @@ def build_parser():
         pair.add_argument("--" + name, dest=name, action="store_true", default=None)
         pair.add_argument("--no-" + name, dest=name, action="store_false", default=None)
     p.add_argument("--routine-id", help="this account's listener routine, so the daemon can start cloud lanes")
+    p.add_argument("--max-local-lanes", type=int, metavar="N", help="most local lanes this OS user runs at once, across repos (default %d, 0 for no limit)" % DEFAULT_MAX_LOCAL_LANES)
+    p.add_argument("--max-load-per-cpu", type=float, metavar="X", help="start no local lane while the 5-minute load is over X per core (default %s, 0 for no limit)" % LOAD_PER_CPU)
     p.add_argument("--dry-run", action="store_true")
 
     p = add("listen-uninstall", listen_uninstall, help="remove the listener")

@@ -26,6 +26,20 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
    `prompt`, to paste. (`claude --cloud` is not used: it needs a real terminal, and can stop at interactive dialogs.)
 5. Each lane loops on `tick`. The conductor frees quiet lanes, watches main, and closes the run.
 
+## Who gets a lane
+
+- A lane is quiet when neither its own beat nor its listener's word for the same session (`alive/<lane>.json`) is 45
+  minutes old. A listener gives that word only for its own live, working process, and its word counts for 4 hours at most.
+- A listener never takes a lane its own conductor freed in the same pass.
+- An account with no lane in the run may take any open lane. One that holds a lane may take a freed one only after it has
+  waited 10 minutes, or straight away if no listener heard from in the last 30 minutes could take it instead: one that
+  holds no lane, can run lanes where this run does, is not out of usage, is not cooling on that lane, and is new enough.
+  No account holds more than `lane_cap` lanes (default 2) unless a person joins one by name.
+- An account out of usage (`accounts/<account>.json`) is offered nothing until the `until` its limit gave, if that is
+  ahead and within 8 days, or else for 3 hours from `out_of_usage`. `resume` clears it.
+- `job.json` has `min_version`, the version that published the run. A copy older than that does not conduct the run, claim
+  in it, or join it, and the conductor tells a person about any listener heard from in the last day that is older.
+
 ## Control states
 
 `running`, `paused`, `draining` (finish what is in hand), `stopping` (now), `stopped`, `finished`. A file named `STOP`

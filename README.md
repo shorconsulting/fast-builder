@@ -67,7 +67,19 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   takes every check passing, and a re-run in place replaces what it re-ran.
 - **Lost lanes.** A lane freed for going quiet does not go back to that account for 3 hours, unless a person names it with
   `/fast-builder:join --lane` or `/fast-builder:resume --run`. A claim no session joined is freed after 20 minutes, and a local
-  lane out of restarts at once. A lane left open for 30 minutes tells a person.
+  lane out of restarts at once. A lane left open for 30 minutes tells a person. A lane that loses its claim pushes its own
+  unpushed branches and a snapshot of the rest before it stops, so the next account starts from them.
+- **Spreading lanes.** The listener that frees a lane never takes it in the same pass. For 10 minutes a freed lane waits
+  for a listening account that holds no lane, and no account holds more than 2 lanes in a run (`--lane-cap` at kickoff).
+- **Out of usage.** A local lane whose session prints a usage limit goes back at once, and its account is offered no
+  lanes until the reset time the limit gave, however many days off, instead of restarting into the same limit. Restarts
+  for any other exit come at 0, 1, 2, 4 and 8 minutes, so a network blip does not use them all up.
+- **Lanes that are working.** A listener speaks on the bus for its own local lanes while their process is alive and their
+  transcript, log or git is moving, so a slow network or a loaded computer does not get a working lane freed. A hung
+  process moves none of those and is still freed. A listener starts no new local lane while it runs 2 already, or while
+  the computer's load is over 2 per core (`listen-install --max-local-lanes`, `--max-load-per-cpu`).
+- **One version.** A run records the version that published it. An older listener takes no lanes in it and does not
+  conduct it, and a person is told about any older listener still heard from, since it frees and claims by older rules.
 - **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
   the conductor, before it marks itself done, and a lane done early with time left raises a request by itself. A request
   nobody is left to read, or nobody has read in an hour, tells a person.
@@ -99,7 +111,10 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - Local listeners run while the computer is on and that OS user is logged in, and on Linux only with `loginctl enable-linger` once they log out.
 - Each account needs a routine for instant cloud starts, created under the same login as that OS user's `claude` CLI,
   and its GitHub connection must reach the repo. `routine-check` proves the first.
-- Claude usage limits are per account. A lane that runs dry goes quiet, and is freed after 45 minutes.
+- Claude usage limits are per account. A local lane that runs dry is freed at once. A cloud lane, or a local one whose
+  limit message was not seen, goes quiet and is freed after 45 minutes.
+- The version gate only works from 0.1.12 on: a listener older than that does not read it, so update every account's
+  listener by hand once. A 0.1.12 listener brings the bus's `kit/fb.py`, which cloud lanes run, up to its own version.
 - A lead with subagents must loop on `fb.py wait` or it looks quiet too. That is the lead's own instructions, not something
   the tool can enforce: a lead stuck on a foreground subagent in a cloud session without the repo hook beats nothing.
 - Red main is only seen by a lease holder with `gh` logged in. Without one, main reads `unknown`, or stays at its last
@@ -116,7 +131,7 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   the other, read as a re-run. A reading across two commits is thrown away. All of a head's pages must arrive in 60 seconds, about 3,000 rows,
   so a head larger than that reads `unknown`, and a person hears after about 2 hours of it. A deadline in free text, such as `Friday`, reads
   as no deadline.
-- An account that hits a limit frees its lane at once, through Claude Code's `StopFailure` hook, which spends no tokens. Its current branch and that lane's changed files go to a new branch under `fast-builder/wip/`, and it is offered no lanes for 3 hours unless a person runs `/fast-builder:resume`. A brief 429 looks the same, so that is the way back. Files that look like secrets, other lanes' files, huge files and separate repos stay on that computer, and so does a subagent's worktree. The lane's handoff names what stayed. These branches are not cleaned up. A repo set up with `/fast-builder:install-repo` needs it run again for cloud lanes to do this, and the hook has not yet been seen firing on a real limit.
+- An account that hits a limit frees its lane at once, through Claude Code's `StopFailure` hook, which spends no tokens. Its current branch and that lane's changed files go to a new branch under `fast-builder/wip/`, and it is offered no lanes until its limit resets, or for 3 hours when no reset time was seen, unless a person runs `/fast-builder:resume`. A brief 429 looks the same, so that is the way back. Files that look like secrets, other lanes' files, huge files and separate repos stay on that computer, and so does a subagent's worktree. The lane's handoff names what stayed. These branches are not cleaned up. A repo set up with `/fast-builder:install-repo` needs it run again for cloud lanes to do this, and the hook has not yet been seen firing on a real limit.
 - The main session is whichever account published the run. If that account runs out while holding a lane, a person is told. A session that only planned and holds no lane has nothing to report this, and moving the role to another account is not built yet.
 - The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another
   account too, and its old process stays until it ticks or the run stops. With no other account, a person hears at 30 minutes.

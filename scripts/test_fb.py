@@ -6,6 +6,7 @@ import concurrent.futures
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -27,7 +28,8 @@ import fb  # noqa: E402
 # routines.json maps a routine id, or "*", to status, account, name, prompt, reply, is_error, raw (print this instead),
 # no_tool (the model answers without calling), on_run (touch this file), snapshot (copy children.json here), fail (exit 1
 # with this result subtype and result text, where <uuid> and <now> come out fresh), and steer (make this RemoteTrigger call
-# as well, on the action steer_on if given). lane_sleep at the top keeps a lane up for that many seconds.
+# as well, on the action steer_on if given). lane_sleep at the top keeps a lane up for that many seconds, and then it prints
+# lane_say, if given, and exits lane_exit.
 CLAUDE_SHIM = r"""#!/usr/bin/env python3
 import json, os, re, shutil, sys, time, uuid
 
@@ -41,7 +43,9 @@ except OSError:
     table = {}
 if not asked:
     time.sleep(table.get("lane_sleep", 0))
-    sys.exit(0)
+    if table.get("lane_say"):
+        print(table["lane_say"])
+    sys.exit(table.get("lane_exit", 0))
 action, trigger = asked.groups()
 answer = table.get(trigger, table.get("*", {"status": 200}))
 if action == "run" and answer.get("on_run"):
@@ -4550,6 +4554,524 @@ class OtherSystems(World):
         with open(path, "rb") as handle:
             self.assertEqual(handle.read(), '{"note": "caf\u00e9 \u2014 ok"}\n'.encode("utf-8"))
         self.assertEqual(fb.read_json(path)["note"], "caf\u00e9 \u2014 ok")
+
+
+class FakeBus:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def doc(self, rel):
+        return self.docs.get(rel, {})
+
+
+LIMIT_SAID = "You've hit your weekly limit · resets 3pm (America/Los_Angeles)"
+
+
+class LaneDrops(World):
+    """What run th-11-02-26 found: lanes freed and taken straight back by an account with no usage left, healthy lanes
+    freed when a loaded computer's pushes timed out, and work stranded on the computer that lost the lane."""
+    RUN = "hph-10-30-26"
+
+    def register(self, account, *extra):
+        self.fb(account, "listen-install", "--dry-run", "--remote", self.remote, "--routine-id", rid("123"), *extra)
+
+    def answers(self, table):
+        with open(self.shim_table, "w") as handle:
+            json.dump(table, handle)
+
+    def lane_starts(self):
+        if not os.path.exists(self.shim_log):
+            return []
+        with open(self.shim_log) as handle:
+            return [c for c in handle.read().splitlines() if " :: " in c and "account orchestrator" in c]
+
+    def until(self, check, seconds=20):
+        end = time.time() + seconds
+        while time.time() < end and not check():
+            time.sleep(0.1)
+        self.assertTrue(check())
+
+    def children(self, account):
+        path = os.path.join(self.env(account)["FB_HOME"], "children.json")
+        if not os.path.exists(path):
+            return {}, path
+        with open(path) as handle:
+            return json.load(handle), path
+
+    def lanes_gone(self, account):
+        return all(not fb.alive(c["pid"]) for c in self.children(account)[0].values())
+
+    def end_lanes(self, account):
+        for child in self.children(account)[0].values():
+            try:
+                os.killpg(child["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        self.until(lambda: self.lanes_gone(account))
+
+    def lanes(self):
+        return {r["lane"]: r for r in self.j("alpha", "status", "--run", self.RUN)["runs"][0]["lanes"]}
+
+    def human(self):
+        return [m["body"] for m in self.j("alpha", "inbox", "--run", self.RUN, "--who", "human")]
+
+    def on_bus(self, rel):
+        proc = sh(["git", "show", "refs/heads/fast-builder/bus:" + rel], cwd=self.remote, check=False)
+        return proc.stdout if proc.returncode == 0 else None
+
+    def bus_edit(self, files):
+        """Write to the bus as a person or another copy would, relative to its top. None removes a file."""
+        phone = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", "-b", "fast-builder/bus", self.remote, phone])
+        for rel, doc in files.items():
+            full = os.path.join(phone, rel)
+            if doc is None:
+                if os.path.exists(full):
+                    os.remove(full)
+                continue
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as handle:
+                handle.write(doc if isinstance(doc, str) else json.dumps(doc))
+        sh(["git", "add", "-A"], cwd=phone)
+        sh(["git", "-c", "user.name=p", "-c", "user.email=p@p", "commit", "-qm", "edit"], cwd=phone)
+        sh(["git", "push", "-q", "origin", "HEAD:fast-builder/bus"], cwd=phone)
+
+    def run_file(self, rel):
+        return "runs/%s/%s" % (self.RUN, rel)
+
+    def kill_all(self):
+        for account in ("bravo", "charlie", "delta"):
+            for child in self.children(account)[0].values():
+                try:
+                    os.killpg(child["pid"], signal.SIGKILL)
+                except OSError:
+                    pass
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(self.kill_all)
+
+    # Fix 1: an account out of usage says so, and is believed until its reset
+
+    def test_a_lane_that_prints_its_limit_goes_back_at_once_until_the_reset(self):
+        self.answers({"lane_say": LIMIT_SAID, "lane_exit": 1})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        self.until(lambda: self.lanes_gone("bravo"))
+        self.fb("bravo", "listen", "--once")
+        lanes = self.lanes()
+        self.assertIsNone(lanes["core"]["account"])
+        self.assertIn("bravo ran out of usage (weekly limit, back 20", lanes["core"]["note"])
+        doc = json.loads(self.on_bus("accounts/bravo.json"))
+        self.assertEqual(doc["said"], "weekly limit")
+        self.assertTrue(fb.dry_until(doc), doc)
+        self.assertIn("bravo", json.loads(self.on_bus(self.run_file("freed/core.json")))["lost"])
+        self.assertEqual(len(self.lane_starts()), 1, "no restart can work, so none is tried")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len(self.lane_starts()), 1)
+        self.assertTrue(all(r["account"] is None for r in self.lanes().values()), "and it takes no other lane either")
+        self.assertIn("bravo", [d["account"] for d in self.j("alpha", "status")["out_of_usage"]])
+        self.answers({"lane_sleep": 60})
+        self.register("charlie")
+        self.fb("charlie", "listen", "--once")
+        self.assertEqual(self.lanes()["core"]["account"], "charlie", "another account has it on its next pass")
+
+    def test_an_earlier_sessions_limit_in_the_log_is_not_this_ones(self):
+        self.answers({"lane_sleep": 0})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        log = os.path.join(self.env("bravo")["FB_HOME"], "logs", "%s-core.log" % self.RUN)
+        os.makedirs(os.path.dirname(log))
+        with open(log, "w") as handle:
+            handle.write(LIMIT_SAID + "\n")
+        self.fb("bravo", "listen", "--once")
+        self.until(lambda: self.lanes_gone("bravo"))
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.lanes()["core"]["account"], "bravo")
+        self.assertEqual(len(self.lane_starts()), 2, "an ordinary exit restarts as before")
+        self.assertIsNone(self.on_bus("accounts/bravo.json"))
+
+    def test_a_limit_quoted_before_the_last_lines_is_not_the_cli_saying_it(self):
+        self.answers({"lane_say": LIMIT_SAID + "\nSo the steward lane is waiting.\nLane summary follows.\nAll pushed.", "lane_exit": 0})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        self.until(lambda: self.lanes_gone("bravo"))
+        self.fb("bravo", "listen", "--once")
+        self.assertIsNone(self.on_bus("accounts/bravo.json"))
+        self.assertEqual(len(self.lane_starts()), 2)
+
+    def test_restarts_after_the_first_wait_longer_each_time(self):
+        self.answers({"lane_sleep": 0})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        self.until(lambda: self.lanes_gone("bravo"))
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len(self.lane_starts()), 2, "the first restart is at once")
+        self.until(lambda: self.lanes_gone("bravo"))
+        self.fb("bravo", "listen", "--once")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len(self.lane_starts()), 2, "the second waits a minute")
+        doc, path = self.children("bravo")
+        key = "%s/core" % self.RUN
+        self.assertIn("exited", doc[key])
+        doc[key]["exited"] -= fb.RESTART_BACKOFF_SECONDS + 1
+        with open(path, "w") as handle:
+            json.dump(doc, handle)
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(len(self.lane_starts()), 3)
+        self.assertEqual(self.lanes()["core"]["account"], "bravo", "and the lane stays its own meanwhile")
+
+    def test_an_account_stays_out_until_its_reset_and_no_longer(self):
+        def dry(**doc):
+            return fb.out_of_usage(FakeBus({"accounts/bravo.json": doc}), "bravo")
+        self.assertTrue(dry(out_of_usage=ago(240), until=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 7200))), "a weekly limit outlasts the cooldown")
+        self.assertFalse(dry(out_of_usage=ago(240)), "with no reset time, the cooldown is all")
+        self.assertTrue(dry(out_of_usage=ago(10)))
+        self.assertFalse(dry(out_of_usage=ago(240), until=ago(5)), "a reset time passed is no reason")
+        self.assertFalse(dry(out_of_usage=ago(240), until=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 30 * 86400))), "nor one past the longest limit")
+        self.assertFalse(dry(out_of_usage=ago(240), until="soon"))
+
+    def test_a_limit_the_bus_never_heard_holds_this_computer_back_only_for_a_while(self):
+        ahead = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        self.assertTrue(fb.dry_pending({"dry": {"said": "weekly limit", "until": ahead}, "exited": time.time()}))
+        self.assertFalse(fb.dry_pending({"dry": {"said": "weekly limit", "until": ago(5)}, "exited": time.time()}), "its reset has passed")
+        self.assertTrue(fb.dry_pending({"dry": {"said": "usage limit", "until": None}, "exited": time.time() - 60}))
+        self.assertFalse(fb.dry_pending({"dry": {"said": "usage limit", "until": None}, "exited": time.time() - fb.COOLDOWN_MINUTES * 60 - 1}), "nor past the cooldown")
+        self.assertFalse(fb.dry_pending({"exited": time.time()}))
+        self.assertEqual(fb.usage_limit("You've hit your usage limit · contact your admin to increase it"), {"said": "usage limit", "until": None})
+
+    def test_a_later_reset_already_known_is_kept(self):
+        later = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3 * 86400))
+        sooner = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+        bus = FakeBus({"accounts/bravo.json": {"out_of_usage": ago(60), "until": later, "said": "weekly limit"}})
+        doc = json.loads(fb.dry_files(bus, "bravo", {"said": "session limit", "until": sooner})["accounts/bravo.json"])
+        self.assertEqual(doc["until"], later)
+        doc = json.loads(fb.dry_files(FakeBus({}), "bravo", {"said": "bad\nwords", "until": sooner})["accounts/bravo.json"])
+        self.assertNotIn("said", doc)
+        self.assertEqual(doc["until"], sooner)
+
+    def test_reset_times_read_as_the_cli_writes_them(self):
+        import datetime
+        now = datetime.datetime(2026, 11, 4, 17, 30, tzinfo=datetime.timezone.utc)  # 9:30am in Los Angeles
+        def until(text):
+            got = fb.usage_limit(text, now)
+            return got and got["until"]
+        self.assertEqual(until(LIMIT_SAID), "2026-11-04T23:00:00Z")
+        self.assertEqual(until("You've hit your weekly limit · resets Nov 5 at 12am (America/Los_Angeles)"), "2026-11-05T08:00:00Z")
+        self.assertEqual(until("You've hit your weekly limit · resets 8am (America/Los_Angeles)"), "2026-11-05T16:00:00Z", "a time well past today is tomorrow's")
+        self.assertEqual(until("Claude usage limit reached. Your limit will reset at 3pm (America/Los_Angeles)."), "2026-11-04T23:00:00Z")
+        self.assertEqual(until("You've hit your session limit · resets 6:15pm (UTC)"), "2026-11-04T18:15:00Z")
+        self.assertIsNone(until("You've hit your weekly limit · resets Dec 31 at 11pm (Europe/London)"), "further than any limit runs")
+        self.assertIsNone(until("You've hit your weekly limit · resets 25pm (UTC)"))
+        self.assertEqual(fb.usage_limit("You've hit your weekly limit", now), {"said": "weekly limit", "until": None})
+        new_year = datetime.datetime(2026, 12, 30, 12, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(fb.usage_limit("You've hit your weekly limit · resets Jan 2 at 9am (UTC)", new_year)["until"], "2027-01-02T09:00:00Z")
+        self.assertIsNone(until("You've hit your weekly limit · resets 5pm (UTC)"), "just past: today's, over, and not tomorrow's")
+        for text in ("API Error: Can't reach the API server", "the weekly limit resets soon", "",
+                     "Users who hit your API limit now get a 429 page.", "Callers that hit your rate limit are told to wait.",
+                     "You have reached your monthly limit", "You've hit your weekly limit, so the steward lane waits on review.",
+                     "- You've hit your quota limit"):
+            self.assertIsNone(fb.usage_limit(text, now), text)
+
+    # Fixes 2 and 3: a lane goes to an account with none first, and no account carries the run
+
+    def two_lanes_one_quiet(self, *others):
+        """bravo and charlie each hold a lane on their own listener, and charlie's has gone quiet and its process is gone."""
+        self.answers({"lane_sleep": 60})
+        for who in ("bravo", "charlie") + others:
+            self.register(who)
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        self.fb("charlie", "listen", "--once")
+        for who in others:
+            self.fb(who, "listen", "--once")
+        lanes = self.lanes()
+        self.assertEqual((lanes["core"]["account"], lanes["money"]["account"]), ("bravo", "charlie"))
+        self.end_lanes("charlie")
+        self.bus_edit({self.run_file("beats/money.json"): {"at": "2026-01-01T00:00:00Z", "status": "working", "account": "charlie", "note": ""}})
+
+    def test_a_lane_freed_in_a_pass_is_not_taken_in_that_pass(self):
+        self.two_lanes_one_quiet()
+        self.fb("bravo", "listen", "--once")
+        self.assertIsNone(self.lanes()["money"]["account"], "bravo's conductor freed it, so bravo does not take it straight back")
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.lanes()["money"]["account"], "bravo", "with nobody else to take it, it does not wait")
+
+    def test_a_freed_lane_waits_for_an_account_with_no_lane(self):
+        self.two_lanes_one_quiet("delta")
+        self.fb("bravo", "listen", "--once")
+        self.fb("bravo", "listen", "--once")
+        self.assertIsNone(self.lanes()["money"]["account"], "delta is listening with no lane, so it gets the first go")
+        self.fb("delta", "listen", "--once")
+        self.assertEqual(self.lanes()["money"]["account"], "delta")
+
+    def test_after_the_wait_an_account_with_a_lane_may_take_it(self):
+        self.two_lanes_one_quiet("delta")
+        self.fb("bravo", "listen", "--once")
+        beat = json.loads(self.on_bus(self.run_file("beats/money.json")))
+        self.bus_edit({self.run_file("beats/money.json"): dict(beat, at=ago(fb.SPREAD_MINUTES + 1))})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.lanes()["money"]["account"], "bravo")
+
+    def test_no_account_holds_more_than_the_runs_lane_cap(self):
+        self.two_lanes_one_quiet()
+        job = json.loads(self.on_bus(self.run_file("job.json")))
+        self.assertEqual(job["lane_cap"], fb.DEFAULT_LANE_CAP)
+        self.bus_edit({self.run_file("job.json"): dict(job, lane_cap=1)})
+        for _ in range(2):
+            self.fb("bravo", "listen", "--once")
+        self.assertIsNone(self.lanes()["money"]["account"])
+        self.fb("bravo", "join", "--run", self.RUN, "--lane", "money", "--second")
+        self.assertEqual(self.lanes()["money"]["account"], "bravo", "a person may still say so")
+
+    def test_lanes_marked_done_do_not_count_against_the_cap(self):
+        self.answers({"lane_sleep": 60})
+        self.register("bravo")
+        self.publish(accounts=3, where="local")
+        done = {"at": fb.now_iso(), "status": "done", "account": "bravo", "note": "done"}
+        claim = {"account": "bravo", "at": fb.now_iso(), "session": "s", "where": "local"}
+        self.bus_edit({self.run_file("claims/core.json"): claim, self.run_file("beats/core.json"): done,
+                       self.run_file("claims/money.json"): claim, self.run_file("beats/money.json"): done,
+                       self.run_file("beats/ui.json"): {"at": ago(30), "status": "open", "account": None, "note": "freed: charlie went quiet"}})
+        self.fb("bravo", "listen", "--once")
+        self.assertEqual(self.lanes()["ui"]["account"], "bravo", "both its lanes are finished, so it has room")
+
+    # Fix 4: a listener speaks for its own lane while that lane is working
+
+    def vouched_lane(self):
+        """bravo's listener runs core, a session has joined it, and its own beat is half an hour old."""
+        self.more_env["CLAUDE_CONFIG_DIR"] = os.path.join(self.root, "claude-config")
+        self.answers({"lane_sleep": 60})
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        self.fb("bravo", "listen", "--once")
+        claim = json.loads(self.on_bus(self.run_file("claims/core.json")))
+        self.bus_edit({self.run_file("claims/core.json"): dict(claim, session="tok"),
+                       self.run_file("beats/core.json"): {"at": ago(30), "status": "working", "account": "bravo", "note": "joined"}})
+        clone = os.path.join(self.env("bravo")["FB_CACHE"], "work", hashlib_sha1(self.remote), "%s-core" % self.RUN)
+        transcripts = os.path.join(self.more_env["CLAUDE_CONFIG_DIR"], "projects", re.sub(r"[^A-Za-z0-9]", "-", clone))
+        os.makedirs(os.path.join(transcripts, "s", "subagents"))
+        with open(os.path.join(transcripts, "s", "subagents", "agent-1.jsonl"), "w") as handle:
+            handle.write("{}\n")
+        return clone, transcripts
+
+    def age_everything(self, clone, transcripts):
+        """Nothing of the lane has moved for an hour, as with a hung process."""
+        old = time.time() - 3600
+        paths = [os.path.join(self.env("bravo")["FB_HOME"], "logs", "%s-core.log" % self.RUN)]
+        for top in (os.path.join(clone, ".git"), transcripts):
+            for root, _, names in os.walk(top):
+                paths += [os.path.join(root, n) for n in names]
+        for path in paths:
+            if os.path.exists(path):
+                os.utime(path, (old, old))
+
+    def test_a_working_lane_its_listener_speaks_for_is_not_freed(self):
+        self.vouched_lane()
+        self.fb("bravo", "listen", "--once")
+        alive = json.loads(self.on_bus(self.run_file("alive/core.json")))
+        self.assertEqual((alive["account"], alive["session"]), ("bravo", "tok"))
+        self.bus_edit({self.run_file("beats/core.json"): {"at": ago(fb.STALE_MINUTES + 5), "status": "working", "account": "bravo", "note": "joined"}})
+        self.assertEqual(self.j("bravo", "conduct", "--run", self.RUN, "--remote", self.remote)["freed"], [])
+        self.assertEqual(self.lanes()["core"]["account"], "bravo")
+        self.assertIsNotNone(self.lanes()["core"]["alive_min"], "status shows it is the listener's word")
+
+    def test_a_hung_lane_is_not_spoken_for(self):
+        clone, transcripts = self.vouched_lane()
+        self.age_everything(clone, transcripts)
+        self.bus_edit({self.run_file("beats/core.json"): {"at": ago(fb.STALE_MINUTES + 5), "status": "working", "account": "bravo", "note": "joined"}})
+        self.fb("bravo", "listen", "--once")
+        self.assertIsNone(self.on_bus(self.run_file("alive/core.json")))
+        self.assertIsNone(self.lanes()["core"]["account"], "its process is alive, but nothing of it has moved")
+
+    def test_a_listeners_word_has_limits(self):
+        self.publish(accounts=2)
+        self.fb("alpha", "join", "--run", self.RUN, "--lane", "core")
+        token = json.loads(self.on_bus(self.run_file("claims/core.json")))["session"]
+        beat = {"status": "working", "account": "alpha", "note": "joined"}
+        self.bus_edit({self.run_file("alive/core.json"): {"account": "alpha", "session": "another", "at": fb.now_iso()},
+                       self.run_file("beats/core.json"): dict(beat, at=ago(fb.STALE_MINUTES + 5))})
+        self.assertEqual(self.j("alpha", "conduct", "--run", self.RUN)["freed"], ["core"], "it spoke for another session")
+        self.fb("alpha", "join", "--run", self.RUN, "--lane", "core")
+        token = json.loads(self.on_bus(self.run_file("claims/core.json")))["session"]
+        self.bus_edit({self.run_file("alive/core.json"): {"account": "alpha", "session": token, "at": fb.now_iso()},
+                       self.run_file("beats/core.json"): dict(beat, at=ago(fb.VOUCH_MAX_MINUTES + 5))})
+        self.assertEqual(self.j("alpha", "conduct", "--run", self.RUN)["freed"], ["core"], "and a lead unheard this long is freed whatever it says")
+
+    # Fix 5: a lane that lost its claim pushes its own work first
+
+    def lost_lane_with_branches(self):
+        self.publish(accounts=2)
+        self.fb("alpha", "join", "--run", self.RUN, "--lane", "core")
+        repo = self.clone("alpha")
+        prefix = "fb/%s/core/" % self.RUN
+        for name, rel in ((prefix + "slice", "src/auth/slice.ts"), (prefix + "stray", "src/pay/stray.ts"), (prefix + "secret", "src/auth/.env"), ("scratch", "src/auth/scratch.ts")):
+            sh(["git", "switch", "-qc", name, "origin/main"], cwd=repo)
+            path = os.path.join(repo, rel)
+            with open(path, "w") as handle:
+                handle.write(name + "\n")
+            sh(["git", "add", "-f", rel], cwd=repo)
+            sh(["git", "commit", "-qm", name], cwd=repo)
+        sh(["git", "switch", "-q", prefix + "slice"], cwd=repo)
+        claim = json.loads(self.on_bus(self.run_file("claims/core.json")))
+        self.bus_edit({self.run_file("claims/core.json"): dict(claim, account="bravo", session="theirs")})
+        return prefix
+
+    def remote_branches(self):
+        return sh(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/fb/"], cwd=self.remote).stdout.split()
+
+    def test_a_lane_that_lost_its_claim_pushes_its_own_branches_first(self):
+        prefix = self.lost_lane_with_branches()
+        result = self.j("alpha", "tick")
+        self.assertEqual(result["action"], "lost")
+        self.assertEqual(result["saved"]["pushed"], [prefix + "slice"])
+        self.assertEqual(result["saved"]["held"], [prefix + "secret", prefix + "stray"], "another lane's files, or a secret, stay here")
+        self.assertEqual(self.remote_branches(), [prefix + "slice"])
+        handoff = self.on_bus(self.run_file("handoffs/core.md"))
+        self.assertIn("alpha lost this lane", handoff)
+        self.assertIn("`%sslice`" % prefix, handoff)
+        self.assertIn("`%sstray`" % prefix, handoff)
+        told = [m for m in self.j("bravo", "inbox", "--run", self.RUN, "--who", "core") if "left unfinished work" in m["body"]]
+        self.assertEqual(len(told), 1)
+        self.assertNotIn("saved", self.j("alpha", "tick"), "once per session")
+        self.assertIn("pushed this lane's own unpushed branches", result["instruction"])
+
+    def test_a_later_session_of_the_same_account_is_left_the_work(self):
+        self.lost_lane_with_branches()
+        claim = json.loads(self.on_bus(self.run_file("claims/core.json")))
+        self.bus_edit({self.run_file("claims/core.json"): dict(claim, account="alpha", session="newer")})
+        result = self.j("alpha", "tick")
+        self.assertEqual(result["action"], "lost")
+        self.assertNotIn("saved", result, "it is in this same clone already")
+        self.assertEqual(self.remote_branches(), [])
+
+    def test_the_hooks_event_gives_the_reset_time_but_the_models_words_do_not(self):
+        self.publish(accounts=2)
+        self.fb("alpha", "join", "--run", self.RUN, "--lane", "core")
+        event = {"hook_event_name": "StopFailure", "error": "rate_limit", "cwd": self.clone("alpha"), "last_assistant_message": LIMIT_SAID}
+        self.fb("alpha", "hook", "stop-failure", stdin=json.dumps(event))
+        self.assertNotIn("until", json.loads(self.on_bus("accounts/alpha.json")))
+        self.fb("bravo", "join", "--run", self.RUN, "--lane", "money")
+        event = dict(event, cwd=self.clone("bravo"), error_details=LIMIT_SAID)
+        self.fb("bravo", "hook", "stop-failure", stdin=json.dumps(event))
+        self.assertTrue(fb.dry_until(json.loads(self.on_bus("accounts/bravo.json"))))
+
+    def test_a_slice_already_landed_or_deleted_on_the_remote_is_not_brought_back(self):
+        prefix = self.lost_lane_with_branches()
+        repo = self.clone("alpha")
+        for name in ("landed", "gone"):  # landed: its file squash-merged into main; gone: pushed once, then deleted there
+            sh(["git", "switch", "-qc", prefix + name, "origin/main"], cwd=repo)
+            with open(os.path.join(repo, "src/auth/%s.ts" % name), "w") as handle:
+                handle.write(name + "\n")
+            sh(["git", "add", "-A"], cwd=repo)
+            sh(["git", "commit", "-qm", name], cwd=repo)
+        sh(["git", "push", "-q", "-u", "origin", prefix + "gone"], cwd=repo)
+        sh(["git", "commit", "-q", "--allow-empty", "-m", "more"], cwd=repo)
+        sh(["git", "push", "-q", "origin", "--delete", prefix + "gone"], cwd=repo)
+        sh(["git", "fetch", "-q", "--prune", "origin"], cwd=repo)
+        main = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", self.remote, main])
+        with open(os.path.join(main, "src/auth/landed.ts"), "w") as handle:
+            handle.write("landed\n")
+        sh(["git", "add", "-A"], cwd=main)
+        sh(["git", "-c", "user.name=m", "-c", "user.email=m@m", "commit", "-qm", "squash of landed"], cwd=main)
+        sh(["git", "push", "-q", "origin", "HEAD:main"], cwd=main)
+        sh(["git", "fetch", "-q", "origin"], cwd=repo)
+        sh(["git", "switch", "-q", prefix + "slice"], cwd=repo)
+        result = self.j("alpha", "tick")
+        self.assertEqual(result["saved"]["pushed"], [prefix + "slice"])
+        self.assertNotIn(prefix + "landed", result["saved"].get("held", []))
+        self.assertNotIn(prefix + "gone", result["saved"].get("held", []))
+        self.assertEqual(self.remote_branches(), [prefix + "slice"])
+
+    def test_leaving_straight_after_the_guard_says_lost_saves_too(self):
+        prefix = self.lost_lane_with_branches()
+        self.assertEqual(self.j("alpha", "leave")["saved"]["pushed"], [prefix + "slice"])
+        self.assertEqual(self.remote_branches(), [prefix + "slice"])
+
+    def test_a_lane_branch_that_moved_on_the_remote_is_not_forced(self):
+        prefix = self.lost_lane_with_branches()
+        other = tempfile.mkdtemp(dir=self.root)
+        sh(["git", "clone", "-q", self.remote, other])
+        sh(["git", "switch", "-qc", prefix + "slice"], cwd=other)
+        with open(os.path.join(other, "src/auth/theirs.ts"), "w") as handle:
+            handle.write("theirs\n")
+        sh(["git", "add", "-A"], cwd=other)
+        sh(["git", "-c", "user.name=b", "-c", "user.email=b@b", "commit", "-qm", "theirs"], cwd=other)
+        sh(["git", "push", "-q", "origin", prefix + "slice"], cwd=other)
+        result = self.j("alpha", "tick")
+        self.assertIn(prefix + "slice", result["saved"]["held"])
+        self.assertIn("theirs.ts", sh(["git", "ls-tree", "-r", "--name-only", prefix + "slice"], cwd=self.remote).stdout)
+
+    # Fix 6: a copy older than the run asks for stays out of it
+
+    def test_a_copy_older_than_the_run_takes_no_lane_and_does_not_conduct(self):
+        self.register("bravo")
+        self.publish(accounts=2, where="local")
+        job = json.loads(self.on_bus(self.run_file("job.json")))
+        self.assertEqual(job["min_version"], fb.VERSION)
+        self.bus_edit({self.run_file("job.json"): dict(job, min_version="99.0.0")})
+        self.fb("bravo", "listen", "--once")
+        self.assertTrue(all(r["account"] is None for r in self.lanes().values()))
+        self.assertEqual(self.lane_starts(), [])
+        self.assertTrue(any("older than run %s needs" % self.RUN in b for b in self.human()), self.human())
+        self.assertTrue(self.j("bravo", "conduct", "--run", self.RUN, "--remote", self.remote).get("too_old"))
+        proc = self.fb("charlie", "join", "--run", self.RUN, "--lane", "core", check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("needs fast-builder 99.0.0", proc.stdout + proc.stderr)
+
+    def test_a_person_hears_about_a_listener_too_old_for_the_run(self):
+        self.publish(accounts=2)
+        self.bus_edit({"listeners/zed.json": {"account": "zed", "at": fb.now_iso(), "version": "0.1.7"},
+                       "listeners/old.json": {"account": "old", "at": ago(3 * 24 * 60), "version": "0.1.7"},
+                       "listeners/new.json": {"account": "new", "at": fb.now_iso(), "version": fb.VERSION}})
+        self.j("alpha", "conduct", "--run", self.RUN)
+        told = [b for b in self.human() if b.startswith("Listener ")]
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("Listener zed runs fast-builder 0.1.7", told[0])
+
+    def test_a_newer_listener_brings_the_kit_on_the_bus_up_to_date(self):
+        self.publish(accounts=2)
+        self.bus_edit({"kit/fb.py": 'VERSION = "0.1.0"\n'})
+        self.register("bravo")
+        self.fb("bravo", "listen", "--once")
+        self.assertIn('VERSION = "%s"' % fb.VERSION, self.on_bus("kit/fb.py"))
+
+    # Fix 7: a computer that is already full starts no more lanes
+
+    def test_no_new_local_lane_past_the_cap_or_the_load(self):
+        home = tempfile.mkdtemp(dir=self.root)
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        with unittest.mock.patch.object(fb, "HOME_DIR", home):
+            self.assertIsNone(fb.no_room_here({"max_load_per_cpu": 0}))
+            fb.write_file(os.path.join(home, "children.json"), json.dumps({"r/l": {"pid": sleeper.pid, "started": fb.process_start(sleeper.pid), "remote": "x"}}))
+            self.assertIn("max_local_lanes", fb.no_room_here({"max_local_lanes": 1, "max_load_per_cpu": 0}))
+            self.assertIsNone(fb.no_room_here({"max_local_lanes": 2, "max_load_per_cpu": 0}))
+            self.assertIsNone(fb.no_room_here({"max_local_lanes": 0, "max_load_per_cpu": 0}))
+            with unittest.mock.patch.object(fb.os, "getloadavg", return_value=(99.0, 99.0, 99.0), create=True), unittest.mock.patch.object(fb.os, "cpu_count", return_value=4):
+                self.assertIn("load is 99 on 4 cores", fb.no_room_here({"max_local_lanes": 0}))
+                self.assertIsNone(fb.no_room_here({"max_local_lanes": 0, "max_load_per_cpu": 100}))
+
+    def test_a_loaded_computer_leaves_the_lane_for_another(self):
+        self.answers({"lane_sleep": 60})
+        self.register("bravo", "--max-load-per-cpu", "0.0001")
+        self.publish(accounts=2, where="local")
+        said = self.fb("bravo", "listen", "--once").stdout
+        if not hasattr(os, "getloadavg"):
+            self.skipTest("no load average here")
+        self.assertIn('"did": "held"', said)
+        self.assertEqual(self.lane_starts(), [])
+        self.assertTrue(all(r["account"] is None for r in self.lanes().values()), "unclaimed, so another computer can have it")
+
+
+def hashlib_sha1(text):
+    import hashlib
+    return hashlib.sha1(text.encode()).hexdigest()[:10]
 
 
 if __name__ == "__main__":
