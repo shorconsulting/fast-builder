@@ -130,9 +130,21 @@ set each account up once: sign it in, then run `--both` or `--routine` above wit
 - A login that was never set up has no routine on the bus: the wake posts one blocker saying so, however often it retries,
   and nothing starts.
 
-An account that has run out of usage cannot wake anything, because the wake itself is a Claude call. Its lanes go quiet and
-are freed after 45 minutes for another account, which starts from the lane's last saved handoff. A lane is not handed back
-to the account that lost it for 3 hours, unless a person names it with `join --lane`.
+An account that has run out of usage cannot wake anything, because the wake itself is a Claude call. Its lane frees itself
+through the `StopFailure` hook, which spends no tokens, and pushes unfinished work to a new branch under `fast-builder/wip/`. A
+local lane whose session exits printing the limit is freed by its listener too, without a restart, and the account is
+marked out until the reset time the message gave. If neither happened, the lane goes quiet and is freed after 45 minutes.
+Either way another account starts from the lane's handoff. A lane is not handed back to the account that lost it for 3
+hours, unless a person names it with `join --lane`, and an account known to be out is offered no lanes until its reset,
+or for 3 hours when none was seen, unless a person runs `resume`.
+
+## Sharing a computer
+
+Every OS user's listener on a computer shares its CPU. A listener starts no new local lane while it already runs 2, or
+while the 5-minute load average is over 2 per core; the lane stays unclaimed for a listener elsewhere. Change either with
+`listen-install --max-local-lanes N` or `--max-load-per-cpu X`, 0 for no limit. While a local lane's process is alive and
+its transcript, log or git keeps moving, its listener vouches for it on the bus (`runs/<run>/alive/`), so a lead whose own
+beats time out on a busy computer keeps its lane.
 
 ## No computer
 

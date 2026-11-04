@@ -339,6 +339,37 @@ def stop_reaches_guard(world, run_name):
     expect(hook_says(world, {"tool_name": "Bash", "tool_input": {"command": "git status"}}) == "allow", "a stopped lane cannot even read")
 
 
+def out_of_usage_releases(world, run_name):
+    """Through the real hook: the run is stopped by now, which changes nothing here, and the lane's work has to reach a branch."""
+    clone = world.clone("alpha")
+    # A person's clone on Windows: autocrlf on and CRLF files, which fb.py's own git settings must not read as changes.
+    own = dict(os.environ, GIT_CONFIG_COUNT="0")
+    run(["git", "config", "core.autocrlf", "true"], cwd=clone, env=own)
+    run(["git", "rm", "-rq", "--cached", "."], cwd=clone, env=own)
+    run(["git", "reset", "-q", "--hard"], cwd=clone, env=own)
+    with open(os.path.join(clone, "src", "auth", "unfinished.ts"), "w") as handle:
+        handle.write("x\n")
+    with open(os.path.join(clone, ".env"), "w") as handle:
+        handle.write("SECRET\n")
+    before = run(["git", "status", "--porcelain"], cwd=clone).stdout
+    with open(os.path.join(HERE, "..", "hooks", "hooks.json")) as handle:
+        command = json.load(handle)["hooks"]["StopFailure"][0]["hooks"][0]["command"]
+    env = dict(world.env("alpha"), CLAUDE_PLUGIN_ROOT=os.path.dirname(HERE))
+    run([git_bash(), "-c", command], cwd=clone, env=env, stdin=json.dumps({"hook_event_name": "StopFailure", "error": "rate_limit", "cwd": clone}))
+    branches = run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/fast-builder/wip/"], cwd=world.remote).stdout.split()
+    expect(len(branches) == 1, "expected one snapshot branch, found %s" % branches)
+    changed = run(["git", "diff", "--name-only", "main", branches[0]], cwd=world.remote).stdout.split()
+    expect(changed == ["src/auth/unfinished.ts"], "the snapshot changed %s, and only the unfinished file should differ: line endings would do this" % changed[:6])
+    expect(run(["git", "status", "--porcelain"], cwd=clone).stdout == before, "the clone was changed")
+    claim = run(["git", "cat-file", "-e", "fast-builder/bus:runs/%s/claims/core.json" % run_name], cwd=world.remote, check_exit=False)
+    expect(claim.returncode != 0, "the lane was not freed")
+    bus = lambda rel: run(["git", "show", "fast-builder/bus:" + rel], cwd=world.remote, check_exit=False).stdout
+    expect("out_of_usage" in bus("accounts/alpha.json"), "the account was not marked")
+    expect(branches[0] in bus("runs/%s/handoffs/core.md" % run_name), "the handoff does not name the snapshot")
+    said = world.fb("alpha", "join", "--run", run_name, check_exit=False)
+    expect(said.returncode != 0 and "ran out of usage" in said.stderr, "an account out of usage was offered a lane: %s" % said.stdout[:200])
+
+
 def unreadable_bus_stops_lanes():
     """A file name Windows cannot hold, on a bus another computer pushed. Only Windows refuses to check that out."""
     if not WIN:
@@ -442,6 +473,7 @@ def main():
             if hasattr(world, "lane"):
                 check("a lane is recognised and stopped with what it started", lambda: lane_stops(world))
             check("a stop reaches the guard for Bash and PowerShell", lambda: stop_reaches_guard(world, names["local"]))
+            check("an account out of usage frees its lane and saves its work", lambda: out_of_usage_releases(world, names["local"]))
             check("a bus Windows cannot check out stops lanes", unreadable_bus_stops_lanes)
         if REAL_SERVICE:
             check("the real background job installs, runs and uninstalls", lambda: real_service(world))
