@@ -79,7 +79,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -169,6 +169,9 @@ MAIN_GREEN = ("success", "neutral", "skipped")
 MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
 CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
+FINAL_CHECK_SINCE = (0, 1, 14)  # runs published from this version on close only after a final check of the product
+FINAL_FILE = "final.json"  # the final check, recorded: who checked the product against the plan, and when
+FINAL_ASKED_FILE = "final-asked.json"  # the steward was reopened to make that check, once until a lane is reopened
 DRY_MAX_DAYS = 8  # the furthest ahead a limit's own reset time is believed: a weekly limit is the longest there is
 RESTART_BACKOFF_SECONDS = 60  # doubled for each restart in a row after the first: a network blip outlasts a minute
 SPREAD_MINUTES = 10  # how long a freed lane waits for an account with no lane before one with a lane may take it
@@ -1169,18 +1172,83 @@ def hours_left(deadline):
 
 
 def overflow_requests(bus, run, account, files, skip):
-    """A lane marked done while others work and time is left is a lane that may have stopped early. Once per lane: the
-    text is the marker, and it lands in the commit that checked for it."""
+    """A lane marked done while others work and time is left is a lane that may have stopped early. Once each time a lane
+    is marked done: the text, with the time it was marked, is the marker, and it lands in the commit that checked for it."""
     names = lane_names(bus, run)
     if not any(beat_of(bus, run, n).get("status") == "working" and n not in skip for n in names):
         return
     if hours_left(bus.doc("runs/%s/job.json" % run).get("deadline")) <= OVERFLOW_HOURS:
         return
     asked = [m.get("body") for m in messages_for(bus, run, "conductor")]
+    reopens = reopen_counts(bus, run)
     for name in names:
-        body = "Lane %s is marked done while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane." % name
+        again = " again, after %d reopening%s," % (reopens[name], "" if reopens[name] == 1 else "s") if reopens.get(name) else ""
+        body = "Lane %s is marked done%s while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane, and hand it over with fb.py reopen --lane %s --body \"the work\", which also restarts the lane if its session has ended." % (name, again, name)
         if beat_of(bus, run, name).get("status") == "done" and body not in asked:
             add_message(files, run, account, "conductor", "request", body)
+
+
+def reopen_counts(bus, run):
+    """How many times each lane was reopened with more work. Anything but a count reads as none."""
+    doc = bus.doc("runs/%s/reopens.json" % run)
+    return {k: v for k, v in doc.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+
+
+def reopen_lane(bus, run, lane, frm, body, files):
+    """Hand a lane more work, into files. The work goes to its inbox, and to its handoff, which is what a fresh session
+    reads first. A lane marked done or blocked is put back on offer, so whichever listener sees it next starts it fresh,
+    cloud or local, this account or another, and a lane nobody takes tells a person in 30 minutes as any open lane does.
+    A session of its own that is somehow still there finds the lane lost, saves its work and leaves.
+    The product is no longer known to be finished, so a final check already recorded no longer counts. Returns what it did."""
+    add_message(files, run, frm, lane, "request", body)
+    files["runs/%s/%s" % (run, FINAL_FILE)] = None
+    files["runs/%s/%s" % (run, FINAL_ASKED_FILE)] = None
+    beat = beat_of(bus, run, lane)
+    if beat.get("status") not in ("done", "blocked"):
+        return "sent"
+    counts = reopen_counts(bus, run)
+    counts[lane] = counts.get(lane, 0) + 1
+    files["runs/%s/reopens.json" % run] = dumps(counts)
+    handoff = "runs/%s/handoffs/%s.md" % (run, lane)
+    files[handoff] = (bus.read(handoff) or "") + "\n## Reopened by %s at %s\n\nThis lane was marked %s and has more work. Start here:\n\n%s\n" % (frm, now_iso(), beat.get("status"), body)
+    files["runs/%s/claims/%s.json" % (run, lane)] = None
+    files["runs/%s/beats/%s.json" % (run, lane)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "reopened with more work"})
+    return "freed"
+
+
+FINAL_CHECK = ("Every lane is marked done or blocked, so before run %s closes, check the product against the plan. Read the plan's Goal "
+               "and the Done means of every lane's rules (runs/%s/lanes/ on the bus). Check them against main as it is now, the open PRs "
+               "labelled fast-builder, and the open issues the plan names. For each gap in another lane's paths: fb.py reopen --lane <owner> "
+               "--body \"the work\". Build the gaps in your own paths. When nothing is left: fb.py final-check --note \"what you checked\", "
+               "then fb.py lane-state done. The run closes once every lane is done or blocked and that check is recorded.")
+
+
+def needs_final_check(bus, run):
+    """Whether this run closes only after a final check. Runs published by older copies never knew of one."""
+    return version_tuple(bus.doc("runs/%s/job.json" % run).get("min_version")) >= FINAL_CHECK_SINCE
+
+
+def close_or_check(bus, run, account, names, statuses, files):
+    """Every lane is done or blocked: what is done next. Close the run if the product was checked against the plan since
+    the last lane was reopened. Otherwise reopen the steward lane, once, with the final check as its work. If every lane
+    is done again and still nothing was recorded, close anyway and tell a person: a run must not stay open forever on a
+    check nobody makes. Returns whether the run closed."""
+    blocked = statuses.count("blocked")
+    reason = "every lane is done" if not blocked else "%d lanes done, %d blocked" % (statuses.count("done"), blocked)
+    final = bus.doc("runs/%s/%s" % (run, FINAL_FILE))
+    if needs_final_check(bus, run) and not final.get("at"):
+        steward = next((n for n in names if is_steward(bus, run, n)), None)
+        if steward and not bus.doc("runs/%s/%s" % (run, FINAL_ASKED_FILE)).get("at"):
+            reopen_lane(bus, run, steward, "conductor", FINAL_CHECK % (run, run), files)
+            files["runs/%s/%s" % (run, FINAL_ASKED_FILE)] = dumps({"at": now_iso(), "by": account, "lane": steward})
+            add_message(files, run, account, "all", "note", "Every lane is done or blocked. Lane %s is reopened to check the product against the plan before the run closes." % steward)
+            return False
+        reason += "; the final check of the product was asked for and never recorded"
+        add_message(files, run, account, "human", "needs-human", "Run %s closed with no final check of the product against the plan: every lane stopped without recording one. Look at the plan's Goal and each lane's Done means, and start a new run for what is missing." % run)
+    elif final.get("at"):
+        reason += "; final check by %s" % str(final.get("by"))[:60]
+    files["runs/%s/control.json" % run] = dumps({"state": "finished", "reason": reason, "by": account, "at": now_iso()})
+    return True
 
 
 def requests_doc(bus, run):
@@ -1286,10 +1354,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
             unread_requests(bus, run, account, files, report["freed"])
             statuses = [beat_of(bus, run, n).get("status") for n in names]
             if names and all(s in ("done", "blocked") for s in statuses):
-                blocked = statuses.count("blocked")
-                reason = "every lane is done" if not blocked else "%d lanes done, %d blocked" % (statuses.count("done"), blocked)
-                files["runs/%s/control.json" % run] = dumps({"state": "finished", "reason": reason, "by": account, "at": now_iso()})
-                report["finished"] = True
+                report["finished"] = close_or_check(bus, run, account, names, statuses, files)
         elif bus.doc("runs/%s/control.json" % run).get("state") in ("draining", "stopping"):
             quiet = _stale(bus, run, stale_minutes)
             if all(n in quiet or beat_of(bus, run, n).get("status") in ("done", "blocked", "stopped", "open", None) for n in names):
@@ -2082,7 +2147,7 @@ def hook_stop(payload):
         return
     session["stop_blocks"] = count + 1
     save_session(path, session)
-    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. CI is your lander's job, not a reason to stop: start the next slice, and fb.py wait only while subagents run. Finished: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
+    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. CI is your lander's job, not a reason to stop: start the next slice, and fb.py wait only while subagents run. Out of work: follow Finishing in lane-lead.md, which takes the plan's Overflow and then asks the conductor and waits for its answer, rather than ending here. Finished that way: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
 
 
 def hook_session_start(payload):
@@ -3593,6 +3658,40 @@ def cmd_send(args):
     out({"sent": True, "run": run, "from": frm, "to": args.to, "kind": args.kind})
 
 
+def cmd_reopen(args):
+    """The conductor's way to hand a lane more work, above all a lane already marked done: see reopen_lane."""
+    session = load_session()[0]
+    bus = get_bus(args)
+    bus.sync()
+    run = pick_run(bus, args)
+    if args.lane not in lane_names(bus, run):
+        raise FbError("run %s has no lane %s" % (run, args.lane))
+    if run_state(bus, run)["action"] in (STOP, FINISHED):
+        raise FbError("run %s is %s: resume it first" % (run, run_state(bus, run)["state"]))
+    frm = session["lane"] if session and session.get("run") == run else account_name(args)
+    did = {}
+
+    def mutate():
+        files = {}
+        did["did"] = reopen_lane(bus, run, args.lane, frm, args.body, files)
+        return files
+    bus.commit(mutate, "reopen(%s): %s" % (run, args.lane))
+    out({"run": run, "lane": args.lane, "did": did["did"]})
+
+
+def cmd_final_check(args):
+    """Record that the product was checked against the plan and nothing is left, so the run may close once every lane
+    is done or blocked."""
+    session = load_session()[0]
+    bus = get_bus(args)
+    bus.sync()
+    run = pick_run(bus, args)
+    by = "%s (%s)" % (session["lane"], session["account"]) if session and session.get("run") == run else account_name(args)
+    doc = {"at": now_iso(), "by": by, "note": str(args.note)[:2000]}
+    bus.commit(lambda: {"runs/%s/%s" % (run, FINAL_FILE): dumps(doc)}, "final-check(%s): %s" % (run, by))
+    out(dict(doc, run=run))
+
+
 def cmd_inbox(args):
     bus = get_bus(args)
     bus.sync()
@@ -4174,6 +4273,15 @@ def build_parser():
     p.add_argument("--kind", default="note", choices=["note", "request", "blocker", "decision", "needs-human", "answer"])
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="frm")
+
+    p = add("reopen", cmd_reopen, help="hand a lane more work, restarting it if it was marked done")
+    p.add_argument("--run")
+    p.add_argument("--lane", required=True)
+    p.add_argument("--body", required=True)
+
+    p = add("final-check", cmd_final_check, help="record that the product meets the plan, so the run may close")
+    p.add_argument("--run")
+    p.add_argument("--note", required=True)
 
     p = add("inbox", cmd_inbox, help="read messages")
     p.add_argument("--run")

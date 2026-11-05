@@ -8,12 +8,15 @@ Most of the role needs no model, and runs as code inside `fb.py tick`, `fb.py po
 
 - renews the lease,
 - frees lanes whose account has gone quiet, and tells the others,
-- closes the run when every lane is done or blocked,
+- closes the run when every lane is done or blocked and the product has been checked against the plan: before that it
+  reopens the steward lane, once, to make that check (`fb.py final-check` records it). If the steward finishes without
+  recording it, the run closes anyway and a person is told,
 - reads the base branch's checks about every 5 minutes into `main.json`, tells all lanes when main changes, and posts one
   `needs-human` if it stays red over 2 hours,
 - keeps a lane from going back to the account that just lost it to going quiet, for 3 hours, and posts one `needs-human`
   if a lane that was held sits open for 30 minutes,
 - raises one request here for a lane marked done while another is working and over an hour of the deadline is left,
+  again each time a reopened lane is marked done,
 - posts one `needs-human` for a request nobody has read in an hour, or at once if the steward lane is done and the holder
   has no lane working,
 - rewrites `STATUS.md` on the bus.
@@ -32,7 +35,7 @@ For each message:
 |---|---|
 | A lane needs a change in another lane | `send --to <owner> --kind request`, with the context the owner needs |
 | Two lanes disagree about a shared contract | Decide from the plan and the code, `send --to all --kind note`, and log it with `decide` |
-| A lane has run out of work, or was raised as done with time left | Send it what the plan's Overflow gives it, else the next item from the most loaded lane, moving ownership only by the rule below. Its session may have ended, and nothing restarts a done lane: if it has not beaten lately, also post `needs-human` naming the lane and its account, which can `/fast-builder:join --lane` it and run `lane-state working` |
+| A lane has run out of work, or was raised as done with time left | Find it work: what the plan's Overflow gives it, else the next item from the most loaded lane, moving ownership only by the rule below. A lane still `working` and waiting gets it with `send --to <lane> --kind request`. A lane marked done or blocked gets it with `reopen --lane <lane> --body "the work"`, which puts the lane back on offer so a listener starts it again, with the work in its inbox and handoff. Only if there is truly nothing for it, tell it so: `send --to <lane> --kind answer --body "nothing more: finish"` |
 | A lane is blocked on something a person must do | Check it was posted with `--kind needs-human`; if not, post it |
 
 Moving ownership is the one thing that can break the no-overlap guarantee. Do it only for paths with no open PR, and
