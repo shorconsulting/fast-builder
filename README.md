@@ -41,7 +41,7 @@ work item rather than within a minute.
 
 | Command | Does |
 |---|---|
-| `/fast-builder:status` | Where the main session is, every lane, account and heartbeat, and anything waiting on a person |
+| `/fast-builder:status` | Where the main session is, every lane, account and heartbeat, each lane's merged and open PRs, and anything waiting on a person |
 | `/fast-builder:stop` | Stops every account. `--drain` lets lanes finish what is in hand. `--all` covers every run |
 | `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes, lanes that went quiet, and accounts marked out of usage back on offer |
 | `/fast-builder:send --to LANE "text"` | Sends a note to one lane or `all` |
@@ -49,7 +49,7 @@ work item rather than within a minute.
 | `/fast-builder:switch` | Points this OS user's listener at its current login |
 
 To stop everything with no Claude at hand, add a file named `STOP` to the `fast-builder/bus` branch on GitHub, from a phone
-if you like. `STATUS.md` on that branch shows the state.
+if you like. `STATUS.md` on that branch shows the state, including each lane's PRs merged since the run began and open now.
 
 ## How it works
 

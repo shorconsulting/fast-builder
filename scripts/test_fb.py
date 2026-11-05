@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FB = os.path.join(HERE, "fb.py")
@@ -102,6 +103,10 @@ if table.get("fail"):
     sys.exit(1)
 if "raw" in table:
     print(table["raw"])
+    sys.exit(0)
+if any("/issues?" in a for a in sys.argv[1:]):  # the PR count: `issues` holds every page, one array each
+    for page in table.get("issues", [[]]):
+        print(json.dumps(page))
     sys.exit(0)
 rows = [dict(r, head_sha=table.get("sha", "a" * 40)) for r in table.get("runs", [])]
 print(json.dumps({"total_count": len(rows), "check_runs": rows}))
@@ -2166,8 +2171,10 @@ class Hardening(World):
         with open(self.gh_table, "w") as handle:
             json.dump(dict(table, runs=list(runs)), handle)
 
-    def gh_calls(self):
-        return [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
+    def gh_calls(self, prs=False):
+        """The calls about main, or with prs the calls counting each lane's PRs."""
+        calls = [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
+        return [c for c in calls if any("/issues?" in a for a in c) == prs]
 
     def due(self, account="alpha"):
         """Five minutes on, as far as this account's throttle goes."""
@@ -2205,6 +2212,65 @@ class Hardening(World):
         """Bring on a full conductor pass, with the lease due for renewing."""
         self.edit({"conductor.json": {"holder": account, "at": ago(11)}})
         return self.j(account, "conduct", "--run", RUN, *extra)
+
+    # Throughput
+
+    def pr(self, lane, state="open", merged=None, number=1):
+        row = {"number": number, "state": state, "labels": [{"name": "fast-builder"}, {"name": "lane:" + lane}], "pull_request": {"merged_at": merged}}
+        return row
+
+    def test_status_counts_each_lanes_merged_and_open_prs(self):
+        kicked = self.doc("job.json")["kicked_off"]
+        later = fb.now_iso()
+        self.checks(passed(), issues=[[self.pr("core", "closed", later), self.pr("core"), self.pr("core", "closed", later, 3)],
+                                      [self.pr("money"), self.pr("money", "closed", "2000-01-01T00:00:00Z"), self.pr("money", "closed", None),
+                                       {"number": 9, "state": "open", "labels": [{"name": "lane:core"}]}, self.pr("nosuch")]])
+        self.j("alpha", "tick")
+        calls = self.gh_calls(prs=True)
+        self.assertEqual(len(calls), 1, "only the lease holder counts")
+        self.assertIn("labels=fast-builder", calls[0][2])
+        self.assertIn("since=" + urllib.parse.quote(kicked, safe=""), calls[0][2])
+        text = self.on_bus("STATUS.md")
+        self.assertIn("Merged / open PRs", text)
+        self.assertIn("| core | alpha | working |", text)
+        row = lambda lane: [l for l in text.split("\n") if l.startswith("| %s |" % lane)][0]
+        self.assertIn("| 2 / 1 |", row("core"), "an issue is not a PR")
+        self.assertIn("| 0 / 1 |", row("money"), "one merged before the run began, one closed unmerged")
+        self.assertNotIn("nosuch", text, "a label names no lane the bus does not")
+        lanes = {r["lane"]: r for r in self.j("bravo", "status")["runs"][0]["lanes"]}
+        self.assertEqual(len(self.gh_calls(prs=True)), 2, "status counts afresh on its own computer")
+        self.assertEqual((lanes["core"]["prs_merged"], lanes["core"]["prs_open"]), (2, 1))
+        self.assertEqual((lanes["money"]["prs_merged"], lanes["money"]["prs_open"]), (0, 1))
+        self.j("alpha", "tick")
+        self.assertEqual(len(self.gh_calls(prs=True)), 2, "and not on every tick")
+
+    def test_a_count_gh_cannot_give_shows_a_dash_and_keeps_the_last(self):
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        self.j("alpha", "tick")
+        row = [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0]
+        self.assertIn("| - |", row)
+        self.assertNotIn("PRs merged since", self.on_bus("STATUS.md"))
+        self.checks(passed(), issues=[[self.pr("core")]])
+        for mark in glob.glob(os.path.join(self.env("alpha")["FB_CACHE"], "bus", "*.prs-*")):
+            os.utime(mark, (0, 0))
+        self.due()
+        self.next_pass()
+        self.assertIn("| 0 / 1 |", [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0])
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        for mark in glob.glob(os.path.join(self.env("alpha")["FB_CACHE"], "bus", "*.prs-*")):
+            os.utime(mark, (0, 0))
+        self.due()
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(12)}})
+        self.j("alpha", "conduct", "--run", RUN)
+        self.assertIn("| 0 / 1 |", [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0], "a failure keeps the last count")
+
+    def test_the_checkout_is_free_while_prs_are_counted(self):
+        self.checks(passed(), issues=[[self.pr("core")]])
+        self.j("alpha", "status")
+        self.assertTrue(self.gh_calls(prs=True))
+        self.assertEqual(set(p["locked"] for p in self.probes()), {False})
 
     # Red main
 
@@ -3061,7 +3127,7 @@ class Hardening(World):
     def test_the_checkout_is_free_while_gh_runs(self):
         self.checks(passed())
         self.j("alpha", "tick")
-        self.assertEqual([p["locked"] for p in self.probes()], [False])
+        self.assertEqual(set(p["locked"] for p in self.probes()), {False})
 
     def test_a_run_not_going_does_not_ask(self):
         self.checks(passed())
