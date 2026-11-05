@@ -83,6 +83,9 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
   the conductor, before it marks itself done, and a lane done early with time left raises a request by itself. A request
   nobody is left to read, or nobody has read in an hour, tells a person.
+- **Building ahead of CI.** Each lane runs two tracks. Builders open a PR and go straight to their next slice. One
+  lander per lane waits on checks, merges what is green, rebases PRs that fall behind, and hands real failures back
+  as fix slices. A lane is not done while any of its PRs are still open.
 - **Tokens.** `fb.py route` picks the model for every task: Opus for security-sensitive work and design, Sonnet for
   pattern work, Haiku for mechanical work, never Fable. Listening and waiting on CI use no tokens.
 - **Autopilot.** On `full` no lane stops to ask. Reversible decisions are logged under "Decided without you". Deleting

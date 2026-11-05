@@ -79,7 +79,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -2082,7 +2082,7 @@ def hook_stop(payload):
         return
     session["stop_blocks"] = count + 1
     save_session(path, session)
-    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. Waiting on CI: fb.py wait. Finished: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
+    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. CI is your lander's job, not a reason to stop: start the next slice, and fb.py wait only while subagents run. Finished: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
 
 
 def hook_session_start(payload):
