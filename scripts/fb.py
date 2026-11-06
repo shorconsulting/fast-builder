@@ -1095,6 +1095,88 @@ def look_at_main(bus, run, account, asked=None):
         return None
 
 
+def lane_prs(slug, since):
+    """Per lane, the fast-builder PRs merged since `since` and the ones open now, counted from each PR's lane:<lane>
+    label. REST, as main_checks. None when gh cannot say. Label names come from GitHub: callers look up only lanes the
+    bus names."""
+    if not (isinstance(slug, str) and SLUG_RE.match(slug) and isinstance(since, str) and shutil.which("gh")):
+        return None
+    try:
+        start = parse_iso(since)
+    except ValueError:
+        return None
+    url = "repos/%s/issues?state=all&labels=fast-builder&per_page=100&since=%s" % (slug, urllib.parse.quote(since, safe=""))
+    proc = run_cmd(["gh", "api", "--paginate", url], check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return None
+    rows, text, at = [], proc.stdout.strip(), 0
+    while at < len(text):  # one array per page, one after the other
+        page, at = json.JSONDecoder().raw_decode(text, at)
+        if not isinstance(page, list):
+            return None
+        rows += page
+        at += len(text[at:]) - len(text[at:].lstrip())
+    counts = {}
+    for row in rows:
+        pr = row.get("pull_request") if isinstance(row, dict) else None
+        if not isinstance(pr, dict):
+            continue  # an issue, not a PR
+        names = [l.get("name") for l in row.get("labels") or [] if isinstance(l, dict)]
+        merged = pr.get("merged_at")
+        for name in names:
+            if not (isinstance(name, str) and name.startswith("lane:")):
+                continue
+            tally = counts.setdefault(name[5:], {"merged": 0, "open": 0})
+            if row.get("state") == "open":
+                tally["open"] += 1
+            elif isinstance(merged, str) and parse_iso(merged) >= start:
+                tally["merged"] += 1
+    return counts
+
+
+def prs_mark(bus, run):
+    return "%s.prs-%s" % (bus.dir, run)
+
+
+def look_at_prs(bus, run, account=None):
+    """Refresh this machine's count of each lane's PRs for STATUS.md, at most every MAIN_SECONDS. Outside the commit, as
+    look_at_main: gh must not hold the bus checkout. With an account, only the lease holder asks, as for main.
+    Whatever goes wrong leaves the last count standing."""
+    try:
+        if account is not None:
+            lease = bus.doc("runs/%s/conductor.json" % run)
+            if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
+                return
+        if run_state(bus, run)["action"] != GO:
+            return
+        mark = prs_mark(bus, run)
+        if os.path.exists(mark) and abs(time.time() - os.path.getmtime(mark)) < MAIN_SECONDS:
+            return
+        since = bus.doc("runs/%s/job.json" % run).get("kicked_off")
+        if os.path.exists(mark):  # the throttle, even when gh fails, and the last count stays
+            os.utime(mark, None)
+        else:
+            write_file(mark, "{}")
+        bus.release()
+        counts = lane_prs(repo_slug(bus.remote), since)
+        if counts is not None:
+            write_file(mark, json.dumps({"at": now_iso(), "lanes": counts}))
+    except Exception:  # a count is for people to read: a conductor pass must not die from it
+        return
+
+
+def pr_counts(bus, run):
+    """This machine's last count, by lane name the bus knows: {"lane": {"merged": n, "open": n}}, and when it was taken."""
+    doc = read_json(prs_mark(bus, run)) or {}
+    lanes = doc.get("lanes") if isinstance(doc, dict) and isinstance(doc.get("lanes"), dict) else {}
+    out = {}
+    for name in lane_names(bus, run):
+        tally = lanes.get(name)
+        if isinstance(tally, dict) and all(isinstance(tally.get(k), int) for k in ("merged", "open")):
+            out[name] = {"merged": tally["merged"], "open": tally["open"]}
+    return out, doc.get("at") if isinstance(doc, dict) and isinstance(doc.get("at"), str) else None
+
+
 def main_view(bus, run, doc=None):
     """main.json as anyone may read it. It is on the bus, so nothing in it is taken on trust."""
     doc = bus.doc("runs/%s/main.json" % run) if doc is None else doc
@@ -1315,6 +1397,8 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
         report["too_old"] = True
         return report
     seen = look_at_main(bus, run, account, asked)
+    if not (asked and asked.get("hung")):
+        look_at_prs(bus, run, account)
 
     def mutate():
         files = {}
@@ -1455,12 +1539,17 @@ def render_status(bus, fresh=None):
         main = main_view(bus, run, (fresh or {}).get(run))
         if main["state"] != "unknown":
             lines += ["Main is %s at %s since %s.%s" % (main["state"], main["sha"][:7], main["since"], " Failing: %s." % ", ".join(main["failing"]) if main["failing"] else ""), ""]
-        lines += ["| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
+        prs, counted = pr_counts(bus, run)
+        lines += ["| Lane | Account | Status | Last beat (min) | Merged / open PRs | Note |", "|---|---|---|---|---|---|"]
         for row in lane_table(bus, run):
             note = row["note"]
             if row["alive_min"] is not None and row["beat_age_min"] is not None and row["alive_min"] < row["beat_age_min"]:
                 note = "working, says its listener %s min ago; %s" % (row["alive_min"], note)
-            lines.append("| %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-", note.replace("|", "/")[:80]))
+            tally = prs.get(row["lane"]) if counted else None
+            lines.append("| %s | %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-",
+                                                         "%d / %d" % (tally["merged"], tally["open"]) if tally else ("0 / 0" if counted else "-"), note.replace("|", "/")[:80]))
+        if counted:
+            lines += ["", "PRs merged since the run began, and open now, by `lane:` label, as of %s." % counted]
         human = [m for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]
         if human:
             lines += ["", "Waiting on a person:"] + ["- %s: %s" % (m["from"], m["body"]) for m in human]
@@ -3772,6 +3861,11 @@ def cmd_status(args):
         out({"bus": False, "note": "no bus on this repo yet"})
         return
     runs = [pick_run(bus, args)] if getattr(args, "run", None) else list_runs(bus)
+    for run in runs[-6:]:
+        look_at_prs(bus, run)
+    if bus.lock_handle is None and not bus.sync():  # gh ran with the checkout let go, so read it fresh
+        out({"bus": False, "note": "no bus on this repo yet"})
+        return
     if args.human:
         print(render_status(bus))
         return
@@ -3779,10 +3873,20 @@ def cmd_status(args):
     for run in runs:
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
-                       "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
+                       "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": with_prs(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
     dry = [{"account": n[:-5], "at": out_of_usage(bus, n[:-5])} for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5])]
     out({"runs": report, "out_of_usage": dry, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
+
+
+def with_prs(bus, run):
+    """lane_table with each lane's merged and open PR counts, or None for either when this machine has no count."""
+    prs, counted = pr_counts(bus, run)
+    rows = lane_table(bus, run)
+    for row in rows:
+        tally = prs.get(row["lane"], {"merged": 0, "open": 0}) if counted else {}
+        row.update(prs_merged=tally.get("merged"), prs_open=tally.get("open"), prs_at=counted)
+    return rows
 
 
 def cmd_report(args):
