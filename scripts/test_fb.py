@@ -5325,7 +5325,7 @@ class LanderRest(unittest.TestCase):
                          "head": {"ref": "fb/r/core/s%d" % n, "sha": "%d" % n * 40}, "base": {"ref": "main"}}, **kw)
         page = [pr(9, "lane:core"), pr(4, "lane:core", "fast-builder", auto_merge={"merge_method": "merge"}), pr(5, "lane:web"), pr(6)]
         with self.gh({"repos/o/a/pulls?state=open&per_page=100": json.dumps(page[:2]) + json.dumps(page[2:])}):
-            got = fb.lane_prs("o/a", "core")
+            got = fb.lane_queue("o/a", "core")
         self.assertEqual([p["number"] for p in got], [4, 9])
         self.assertEqual((got[0]["auto_merge"], got[1]["auto_merge"], got[0]["head"]), (True, False, "fb/r/core/s4"))
 
@@ -5365,6 +5365,19 @@ class LanderRest(unittest.TestCase):
                          "repos/o/a/commits/%s/check-runs?per_page=100" % new: iter([self.runs({"name": "ci", "status": "queued", "conclusion": None}),
                                                                                        self.runs({"name": "ci", "conclusion": "failure"})]).__next__})
         self.assertEqual((got["state"], got["sha"], got["failing"], got["mergeable_state"], got["auto_merge"]), ("red", new, ["ci"], "behind", False))
+
+    def test_throughput_counts_recent_merges_through_rest(self):
+        def at(days):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+        full = [{"merged_at": at(1)}] * 60 + [{"merged_at": None}] * 40
+        last = [{"merged_at": at(2)}] * 10 + [{"merged_at": at(30)}] * 5
+        base = "repos/o/a/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d"
+        calls = []
+        with self.gh({base % 1: full, base % 2: last}, calls), unittest.mock.patch("fb.cwd_remote", return_value="git@github.com:o/a.git"):
+            self.assertEqual(fb.throughput("/x"), round(70 / 14.0, 2))
+        self.assertEqual(calls, [base % 1, base % 2], "a short page is the last")
+        with self.gh({}), unittest.mock.patch("fb.cwd_remote", return_value="git@github.com:o/a.git"):
+            self.assertIsNone(fb.throughput("/x"))
 
     def test_pr_wait_says_merged_closed_or_still_pending(self):
         self.assertEqual(self.wait({"repos/o/a/pulls/7": {"state": "closed", "merged_at": "2026-11-05T00:00:00Z"}})["state"], "merged")

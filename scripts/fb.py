@@ -80,7 +80,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1120,7 +1120,7 @@ def merge_owner(slug, base):
     return "lander"
 
 
-def lane_prs(slug, lane):
+def lane_queue(slug, lane):
     """A lane's open PRs, oldest first, read with REST."""
     prs = []
     for page in gh_pages("repos/%s/pulls?state=open&per_page=100" % slug):
@@ -1797,13 +1797,25 @@ def throughput(root=None, days=14):
     """Merged PRs per day per active author-and-lane over the last fortnight, measured with gh. None when unknown."""
     if not shutil.which("gh"):
         return None
-    proc = run_cmd(["gh", "pr", "list", "--state", "merged", "--limit", "300", "--json", "mergedAt"], cwd=root, check=False, timeout=30)
-    if proc.returncode != 0:
-        return None
     try:
-        stamps = [parse_iso(row["mergedAt"]) for row in json.loads(proc.stdout) if row.get("mergedAt")]
-    except (ValueError, KeyError):
+        slug = repo_slug(cwd_remote(root))
+    except FbError:
         return None
+    if not SLUG_RE.match(slug):
+        return None
+    stamps = []
+    for page in range(1, 4):  # REST, as main_checks: `gh pr list` is GraphQL, which cloud sessions refuse. 300 at most, as before
+        url = "repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d" % (slug, page)
+        proc = run_cmd(["gh", "api", url], cwd=root, check=False, timeout=30)
+        if proc.returncode != 0:
+            return None
+        try:
+            rows = json.loads(proc.stdout)
+            stamps += [parse_iso(row["merged_at"]) for row in rows if isinstance(row, dict) and row.get("merged_at")]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(rows, list) or len(rows) < 100:
+            break
     recent = [s for s in stamps if (utcnow() - s).days < days]
     return round(len(recent) / float(days), 2) if recent else None
 
@@ -4006,7 +4018,7 @@ def cmd_prs(args):
     if not (isinstance(lane, str) and NAME_RE.match(lane)):
         raise FbError("which lane? pass --lane")
     base = args.base or default_branch()
-    out({"lane": lane, "base": base, "merge_by": merge_owner(slug, base), "prs": lane_prs(slug, lane)})
+    out({"lane": lane, "base": base, "merge_by": merge_owner(slug, base), "prs": lane_queue(slug, lane)})
 
 
 def cmd_pr_wait(args):
