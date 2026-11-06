@@ -24,7 +24,8 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
 4. Listeners see the bus move. For a local run they claim a lane and start `claude -p` in its own clone. For a cloud run
    they fire the account's routine, and the routine claims from inside the cloud. Whatever is left is printed by
    `prompt`, to paste. (`claude --cloud` is not used: it needs a real terminal, and can stop at interactive dialogs.)
-5. Each lane loops on `tick`. The conductor frees quiet lanes, watches main, and closes the run.
+5. Each lane loops on `tick`. The conductor frees quiet lanes, watches main, reopens lanes with more work, and closes the
+   run once every lane is done or blocked and the steward has checked the product against the plan.
 
 ## Who gets a lane
 
