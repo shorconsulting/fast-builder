@@ -2606,7 +2606,7 @@ class Hardening(World):
         self.assertEqual(self.j("alpha", "tick")["requests_for_conductor"], 1)
         self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 0)
 
-    def test_a_done_lane_near_the_deadline_or_with_nobody_working_raises_nothing(self):
+    def test_a_done_lane_near_the_deadline_raises_nothing_and_past_it_asks_again(self):
         self.fb("bravo", "lane-state", "done")
         job = self.doc("job.json")
         soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 1800))
@@ -2616,11 +2616,47 @@ class Hardening(World):
         past = time.strftime("%Y-%m-%d", time.gmtime(time.time() - 86400 * 3))
         self.edit({"job.json": dict(job, deadline=past)})
         self.next_pass()
-        self.assertFalse(self.said("conductor", "marked done"))
+        self.assertEqual(len(self.said("conductor", "marked done")), 1, "a run past its deadline is still running")
         later = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + 7200))
         self.edit({"job.json": dict(job, deadline=later)})
         self.next_pass()
-        self.assertEqual(len(self.said("conductor", "marked done")), 1)
+        self.assertEqual(len(self.said("conductor", "marked done")), 1, "asked once")
+
+    def test_every_working_lane_reads_when_neither_the_holder_nor_the_steward_is_working(self):
+        self.ask_conductor()
+        self.fb("alpha", "lane-state", "blocked", "--note", "waits on David")
+        self.edit({"conductor.json": {"holder": "listener-only", "at": ago(1)}})
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 1)
+        self.edit({"beats/core.json": dict(self.doc("beats/core.json"), status="working", at=ago(1)), "conductor.json": {"holder": "listener-only", "at": ago(1)}})
+        self.assertEqual(self.j("bravo", "tick")["requests_for_conductor"], 0, "a working steward reads it, so the others stay out")
+
+    def test_a_lane_stopped_on_a_running_run_goes_back_on_offer(self):
+        accounts = ["bravo", "charlie", "delta", "echo"]
+        for i, account in enumerate(accounts):
+            if i:
+                self.fb(account, "join", "--run", RUN, "--lane", "money")
+            self.fb(account, "lane-state", "stopped", "--note", "past the deadline")
+            report = self.next_pass()
+            if i < fb.STOPPED_OFFERS:
+                self.assertEqual(report["reoffered"], ["money"], i)
+                self.assertIsNone(self.doc("claims/money.json"))
+                self.assertEqual(self.doc("beats/money.json")["status"], "open")
+                self.assertEqual(self.doc("stopped.json"), {"money": i + 1})
+            else:
+                self.assertEqual(report["reoffered"], [])
+                self.assertEqual(self.doc("beats/money.json")["status"], "stopped")
+        told = self.said("money", "marked stopped while run %s is still running" % RUN)
+        self.assertEqual(len(told), fb.STOPPED_OFFERS)
+        self.assertEqual(told[0]["kind"], "request")
+        self.assertIn("The deadline is not a stop", self.on_bus("runs/%s/handoffs/money.md" % RUN))
+        self.next_pass()
+        self.assertEqual(len(self.said("human", "marked itself stopped")), 1, "told once")
+
+    def test_a_lane_stopped_by_a_drain_stays_stopped(self):
+        self.edit({"control.json": {"state": "draining", "reason": "x", "by": "alpha", "at": fb.now_iso()}})
+        self.fb("bravo", "lane-state", "stopped")
+        self.assertEqual(self.next_pass()["reoffered"], [])
+        self.assertEqual(self.doc("beats/money.json")["status"], "stopped")
 
     def test_a_blocked_or_quiet_other_lane_is_not_working(self):
         self.fb("bravo", "lane-state", "done")

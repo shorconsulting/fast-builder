@@ -79,7 +79,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -169,6 +169,8 @@ MAIN_GREEN = ("success", "neutral", "skipped")
 MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
 CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
+STOPPED_OFFERS = 3  # how often a lane that stopped itself on a running run is put back on offer before a person is told
+STOPPED_FILE = "stopped.json"  # how often each lane that stopped itself on a running run was put back on offer
 FINAL_CHECK_SINCE = (0, 1, 14)  # runs published from this version on close only after a final check of the product
 FINAL_FILE = "final.json"  # the final check, recorded: who checked the product against the plan, and when
 FINAL_ASKED_FILE = "final-asked.json"  # the steward was reopened to make that check, once until a lane is reopened
@@ -1254,20 +1256,55 @@ def hours_left(deadline):
 
 
 def overflow_requests(bus, run, account, files, skip):
-    """A lane marked done while others work and time is left is a lane that may have stopped early. Once each time a lane
-    is marked done: the text, with the time it was marked, is the marker, and it lands in the commit that checked for it."""
+    """A lane marked done while others work is a lane that may have stopped early, unless the deadline is under an hour
+    away. A deadline already passed does not count: it sized the run, and the run goes on until a person stops it. Once
+    each time a lane is marked done: the text, with the time it was marked, is the marker, and it lands in the commit that checked for it."""
     names = lane_names(bus, run)
     if not any(beat_of(bus, run, n).get("status") == "working" and n not in skip for n in names):
         return
-    if hours_left(bus.doc("runs/%s/job.json" % run).get("deadline")) <= OVERFLOW_HOURS:
-        return
+    if 0 < hours_left(bus.doc("runs/%s/job.json" % run).get("deadline")) <= OVERFLOW_HOURS:
+        return  # past the deadline it asks again: a run still running is not done, and only a person ends it
     asked = [m.get("body") for m in messages_for(bus, run, "conductor")]
     reopens = reopen_counts(bus, run)
     for name in names:
         again = " again, after %d reopening%s," % (reopens[name], "" if reopens[name] == 1 else "s") if reopens.get(name) else ""
-        body = "Lane %s is marked done%s while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane, and hand it over with fb.py reopen --lane %s --body \"the work\", which also restarts the lane if its session has ended." % (name, again, name)
+        body = "Lane %s is marked done%s while other lanes are still working. Find it more work from the plan's Overflow section or the most loaded lane, and hand it over with fb.py reopen --lane %s --body \"the work\", which also restarts the lane if its session has ended." % (name, again, name)
         if beat_of(bus, run, name).get("status") == "done" and body not in asked:
             add_message(files, run, account, "conductor", "request", body)
+
+
+STOPPED_NOTE = ("This lane was marked stopped while run %s is still running, so it is back on offer. Stopped is only the answer to "
+                "drain or stop. The deadline is not a stop: it sized the run, and the run goes on until a person stops it. Take the "
+                "next item on your list, then the plan's Overflow, then ask the conductor, as Finishing in lane-lead.md says. Only "
+                "if everything left waits on a person: fb.py lane-state blocked.")
+
+
+def stopped_lanes(bus, run, account, files, report):
+    """A lane marked stopped while the run is running is work nobody does: it keeps its claim, so no listener offers it,
+    nothing asks for more work for it, and the run cannot close around it. Lane leads have stopped this way at the
+    deadline. Put it back on offer with a note saying why, up to STOPPED_OFFERS times a lane, then tell a person once."""
+    counts = {k: v for k, v in bus.doc("runs/%s/%s" % (run, STOPPED_FILE)).items() if isinstance(v, int) and not isinstance(v, bool)}
+    told = set(m.get("body") for m in messages_for(bus, run, "human"))
+    changed = False
+    for name in lane_names(bus, run):
+        beat = beat_of(bus, run, name)
+        if beat.get("status") != "stopped" or name in report["freed"]:
+            continue
+        if counts.get(name, 0) >= STOPPED_OFFERS:
+            body = "Lane %s has marked itself stopped %d times while run %s is still running, so it is no longer put back on offer. Read its handoff: if it is finished, /fast-builder:stop --run %s or give it more work with fb.py reopen --lane %s --body \"the work\"; if it waits on you, answer it." % (name, counts[name] + 1, run, run, name)
+            if body not in told:
+                add_message(files, run, account, "human", "needs-human", body)
+            continue
+        counts[name] = counts.get(name, 0) + 1
+        changed = True
+        handoff = "runs/%s/handoffs/%s.md" % (run, name)
+        files[handoff] = (bus.read(handoff) or "") + "\n## Back on offer at %s\n\n%s\n" % (now_iso(), STOPPED_NOTE % run)
+        add_message(files, run, account, name, "request", STOPPED_NOTE % run)
+        files["runs/%s/claims/%s.json" % (run, name)] = None
+        files["runs/%s/beats/%s.json" % (run, name)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "stopped while the run is running: back on offer"})
+        report["reoffered"].append(name)
+    if changed:
+        files["runs/%s/%s" % (run, STOPPED_FILE)] = dumps(counts)
 
 
 def reopen_counts(bus, run):
@@ -1392,7 +1429,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
     Takes or renews the lease; frees lanes whose account went quiet, so another account takes them over; closes
     the run once every lane is done; watches main, unclaimed lanes and lanes done early; rewrites STATUS.md. Returns
     what it did and what needs judgement."""
-    report = {"run": run, "holder": None, "freed": [], "finished": False}
+    report = {"run": run, "holder": None, "freed": [], "reoffered": [], "finished": False}
     if too_old(bus, run):  # it would free and hand out lanes by rules the run has moved past
         report["too_old"] = True
         return report
@@ -1402,7 +1439,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
 
     def mutate():
         files = {}
-        report.update(freed=[], finished=False)
+        report.update(freed=[], reoffered=[], finished=False)
         lease = bus.doc("runs/%s/conductor.json" % run)
         report["holder"] = lease.get("holder")
         if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
@@ -1414,7 +1451,8 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
         if held and run_state(bus, run)["action"] == GO:
             stale = _stale(bus, run, stale_minutes)
             names = lane_names(bus, run)
-            if not main and not stale and not (names and all(beat_of(bus, run, n).get("status") in ("done", "blocked") for n in names)):
+            statuses = [beat_of(bus, run, n).get("status") for n in names]
+            if not main and not stale and "stopped" not in statuses and not (names and all(s in ("done", "blocked") for s in statuses)):
                 return {}
         report["holder"] = account
         files["runs/%s/conductor.json" % run] = dumps({"holder": account, "at": now_iso()})
@@ -1432,6 +1470,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
                 files["runs/%s/msgs/%s.json" % (run, make_id(account))] = dumps(note)
                 report["freed"].append(name)
             files.update(main)
+            stopped_lanes(bus, run, account, files, report)
             old_listener_alerts(bus, run, account, files)
             unclaimed_alerts(bus, run, account, files, report["freed"])
             overflow_requests(bus, run, account, files, report["freed"])
@@ -3568,10 +3607,17 @@ def is_steward(bus, run, lane):
 def answers_conductor(bus, session, holder):
     """Whether this lane reads the conductor's inbox: the lease holder's does, or the steward's when the holder has no live
     lane in this run. A listener holds the lease as long as it runs, even on an account with no usage left or whose lane
-    is done, and no session of its own would ever read a request. If both read, the first to mark it read has it."""
+    is done, and no session of its own would ever read a request. When neither has a live lane, as when the steward has
+    stopped or waits on a person, every live lane reads: a lane asking what next must not wait an hour on nobody. If
+    several read, the first to mark it read has it."""
     if holder == session["account"]:
         return True
-    return is_steward(bus, session["run"], session["lane"]) and not any(r["account"] == holder and lane_is_live(bus, session["run"], r["lane"]) for r in lane_table(bus, session["run"]))
+    run, table = session["run"], lane_table(bus, session["run"])
+    if any(r["account"] == holder and lane_is_live(bus, run, r["lane"]) for r in table):
+        return False
+    if is_steward(bus, run, session["lane"]):
+        return True
+    return not any(is_steward(bus, run, r["lane"]) and lane_is_live(bus, run, r["lane"]) for r in table)
 
 
 def keep_lost_work(bus, session, path):
