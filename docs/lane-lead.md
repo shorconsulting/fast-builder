@@ -191,16 +191,45 @@ one with `needs-human` and the reason. Before you mark it done:
        git fetch -q origin fast-builder/bus && git show FETCH_HEAD:runs/<run>/<plan file> | sed -n '/^## Overflow/,/^## /p'
 
    A run planned before that section existed prints nothing. Then go to the next step.
-2. Only if it holds nothing for you, ask, and wait a bounded time. Up to 3 rounds of `wait` (Bash timeout 600000), with a
-   `tick` after each. Take whatever comes in your inbox. With no answer after that, finish.
+2. Only if it holds nothing for you, ask the conductor, and wait for its answer:
 
        python3 "$FB" send --to conductor --kind request --body "lane <lane> has cleared its list: what next?"
        python3 "$FB" wait --seconds 540
 
-3. Then:
+   Run `wait` (Bash timeout 600000) and then `tick`, again and again, with your status still `working`. Waiting costs no
+   tokens, and it keeps the lane alive, so the run stays open while you are still useful to it. Take whatever work comes
+   in your inbox. Go on to step 3 only when the conductor says there is nothing more for you, when `tick` says
+   `finished`, `drain` or `stop`, or after an hour with no answer. A request nobody reads in that hour tells a person, and
+   the final check below can still hand you more work later.
+3. If you are the steward and every other lane is done or blocked (`python3 "$FB" status`), check the product before you
+   finish, as in "The final check" below.
+4. Then:
 
        python3 "$FB" lane-state done --note "one line"
 
-Everything left blocked: `lane-state blocked --note "what on"`. The run closes when every lane is done or blocked.
+Everything left blocked: `lane-state blocked --note "what on"`.
+
+Done is not for good. The conductor hands a done lane more work with `fb.py reopen`: that puts the lane back on offer,
+with the work in its inbox and at the end of its handoff, and the next listener starts it fresh. If you joined a lane
+whose handoff ends with "Reopened", that is your first work item.
+
+## The final check
+
+The run does not close just because every lane is done or blocked. Then the conductor reopens the steward lane, once,
+to check the product against the plan. If you are the steward and that is in your inbox, or you are about to finish
+last:
+
+1. Read the plan's Goal and the Done means of every lane's rules (`runs/<run>/lanes/` on the bus).
+2. Check them against main as it is now, the open PRs labelled `fast-builder`, and the open issues the plan names.
+3. Each gap in another lane's paths: `python3 "$FB" reopen --lane <owner> --body "the work, and how you know it is missing"`.
+   Gaps in your own paths: build them. Open PRs: their lanes land them, or they are parked with `needs-human`.
+4. When nothing is left:
+
+       python3 "$FB" final-check --note "what you checked, in a few lines"
+       python3 "$FB" lane-state done --note "final check recorded"
+
+The run closes once every lane is done or blocked and the check is recorded. Reopening any lane clears the record, so
+once every lane is done again the steward is reopened to check again. If the steward finishes without recording one, the run closes anyway and a person
+is told.
 
 On Windows, use `py -3` in place of `python3`, unless this is a lane a listener started, which has its own `python3`.

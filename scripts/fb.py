@@ -170,6 +170,9 @@ MAIN_GREEN = ("success", "neutral", "skipped")
 MAIN_VERDICT = MAIN_RED + ("success",)  # what can replace an earlier row of a check. A skip says nothing about the code
 CHECK_UNDERWAY = ("queued", "in_progress", "waiting", "requested", "pending")
 OVERFLOW_HOURS = 1  # a lane finishing closer to the deadline than this is not worth finding more work for
+FINAL_CHECK_SINCE = (0, 1, 14)  # runs published from this version on close only after a final check of the product
+FINAL_FILE = "final.json"  # the final check, recorded: who checked the product against the plan, and when
+FINAL_ASKED_FILE = "final-asked.json"  # the steward was reopened to make that check, once until a lane is reopened
 DRY_MAX_DAYS = 8  # the furthest ahead a limit's own reset time is believed: a weekly limit is the longest there is
 RESTART_BACKOFF_SECONDS = 60  # doubled for each restart in a row after the first: a network blip outlasts a minute
 SPREAD_MINUTES = 10  # how long a freed lane waits for an account with no lane before one with a lane may take it
@@ -1169,6 +1172,88 @@ def look_at_main(bus, run, account, asked=None):
         return None
 
 
+def lane_prs(slug, since):
+    """Per lane, the fast-builder PRs merged since `since` and the ones open now, counted from each PR's lane:<lane>
+    label. REST, as main_checks. None when gh cannot say. Label names come from GitHub: callers look up only lanes the
+    bus names."""
+    if not (isinstance(slug, str) and SLUG_RE.match(slug) and isinstance(since, str) and shutil.which("gh")):
+        return None
+    try:
+        start = parse_iso(since)
+    except ValueError:
+        return None
+    url = "repos/%s/issues?state=all&labels=fast-builder&per_page=100&since=%s" % (slug, urllib.parse.quote(since, safe=""))
+    proc = run_cmd(["gh", "api", "--paginate", url], check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return None
+    rows, text, at = [], proc.stdout.strip(), 0
+    while at < len(text):  # one array per page, one after the other
+        page, at = json.JSONDecoder().raw_decode(text, at)
+        if not isinstance(page, list):
+            return None
+        rows += page
+        at += len(text[at:]) - len(text[at:].lstrip())
+    counts = {}
+    for row in rows:
+        pr = row.get("pull_request") if isinstance(row, dict) else None
+        if not isinstance(pr, dict):
+            continue  # an issue, not a PR
+        names = [l.get("name") for l in row.get("labels") or [] if isinstance(l, dict)]
+        merged = pr.get("merged_at")
+        for name in names:
+            if not (isinstance(name, str) and name.startswith("lane:")):
+                continue
+            tally = counts.setdefault(name[5:], {"merged": 0, "open": 0})
+            if row.get("state") == "open":
+                tally["open"] += 1
+            elif isinstance(merged, str) and parse_iso(merged) >= start:
+                tally["merged"] += 1
+    return counts
+
+
+def prs_mark(bus, run):
+    return "%s.prs-%s" % (bus.dir, run)
+
+
+def look_at_prs(bus, run, account=None):
+    """Refresh this machine's count of each lane's PRs for STATUS.md, at most every MAIN_SECONDS. Outside the commit, as
+    look_at_main: gh must not hold the bus checkout. With an account, only the lease holder asks, as for main.
+    Whatever goes wrong leaves the last count standing."""
+    try:
+        if account is not None:
+            lease = bus.doc("runs/%s/conductor.json" % run)
+            if lease.get("holder") not in (None, account) and age_minutes(lease.get("at")) < LEASE_MINUTES:
+                return
+        if run_state(bus, run)["action"] != GO:
+            return
+        mark = prs_mark(bus, run)
+        if os.path.exists(mark) and abs(time.time() - os.path.getmtime(mark)) < MAIN_SECONDS:
+            return
+        since = bus.doc("runs/%s/job.json" % run).get("kicked_off")
+        if os.path.exists(mark):  # the throttle, even when gh fails, and the last count stays
+            os.utime(mark, None)
+        else:
+            write_file(mark, "{}")
+        bus.release()
+        counts = lane_prs(repo_slug(bus.remote), since)
+        if counts is not None:
+            write_file(mark, json.dumps({"at": now_iso(), "lanes": counts}))
+    except Exception:  # a count is for people to read: a conductor pass must not die from it
+        return
+
+
+def pr_counts(bus, run):
+    """This machine's last count, by lane name the bus knows: {"lane": {"merged": n, "open": n}}, and when it was taken."""
+    doc = read_json(prs_mark(bus, run)) or {}
+    lanes = doc.get("lanes") if isinstance(doc, dict) and isinstance(doc.get("lanes"), dict) else {}
+    out = {}
+    for name in lane_names(bus, run):
+        tally = lanes.get(name)
+        if isinstance(tally, dict) and all(isinstance(tally.get(k), int) for k in ("merged", "open")):
+            out[name] = {"merged": tally["merged"], "open": tally["open"]}
+    return out, doc.get("at") if isinstance(doc, dict) and isinstance(doc.get("at"), str) else None
+
+
 def main_view(bus, run, doc=None):
     """main.json as anyone may read it. It is on the bus, so nothing in it is taken on trust."""
     doc = bus.doc("runs/%s/main.json" % run) if doc is None else doc
@@ -1246,18 +1331,83 @@ def hours_left(deadline):
 
 
 def overflow_requests(bus, run, account, files, skip):
-    """A lane marked done while others work and time is left is a lane that may have stopped early. Once per lane: the
-    text is the marker, and it lands in the commit that checked for it."""
+    """A lane marked done while others work and time is left is a lane that may have stopped early. Once each time a lane
+    is marked done: the text, with the time it was marked, is the marker, and it lands in the commit that checked for it."""
     names = lane_names(bus, run)
     if not any(beat_of(bus, run, n).get("status") == "working" and n not in skip for n in names):
         return
     if hours_left(bus.doc("runs/%s/job.json" % run).get("deadline")) <= OVERFLOW_HOURS:
         return
     asked = [m.get("body") for m in messages_for(bus, run, "conductor")]
+    reopens = reopen_counts(bus, run)
     for name in names:
-        body = "Lane %s is marked done while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane." % name
+        again = " again, after %d reopening%s," % (reopens[name], "" if reopens[name] == 1 else "s") if reopens.get(name) else ""
+        body = "Lane %s is marked done%s while other lanes are still working and there is time left. Find it more work from the plan's Overflow section or the most loaded lane, and hand it over with fb.py reopen --lane %s --body \"the work\", which also restarts the lane if its session has ended." % (name, again, name)
         if beat_of(bus, run, name).get("status") == "done" and body not in asked:
             add_message(files, run, account, "conductor", "request", body)
+
+
+def reopen_counts(bus, run):
+    """How many times each lane was reopened with more work. Anything but a count reads as none."""
+    doc = bus.doc("runs/%s/reopens.json" % run)
+    return {k: v for k, v in doc.items() if isinstance(v, int) and not isinstance(v, bool) and v > 0}
+
+
+def reopen_lane(bus, run, lane, frm, body, files):
+    """Hand a lane more work, into files. The work goes to its inbox, and to its handoff, which is what a fresh session
+    reads first. A lane marked done or blocked is put back on offer, so whichever listener sees it next starts it fresh,
+    cloud or local, this account or another, and a lane nobody takes tells a person in 30 minutes as any open lane does.
+    A session of its own that is somehow still there finds the lane lost, saves its work and leaves.
+    The product is no longer known to be finished, so a final check already recorded no longer counts. Returns what it did."""
+    add_message(files, run, frm, lane, "request", body)
+    files["runs/%s/%s" % (run, FINAL_FILE)] = None
+    files["runs/%s/%s" % (run, FINAL_ASKED_FILE)] = None
+    beat = beat_of(bus, run, lane)
+    if beat.get("status") not in ("done", "blocked"):
+        return "sent"
+    counts = reopen_counts(bus, run)
+    counts[lane] = counts.get(lane, 0) + 1
+    files["runs/%s/reopens.json" % run] = dumps(counts)
+    handoff = "runs/%s/handoffs/%s.md" % (run, lane)
+    files[handoff] = (bus.read(handoff) or "") + "\n## Reopened by %s at %s\n\nThis lane was marked %s and has more work. Start here:\n\n%s\n" % (frm, now_iso(), beat.get("status"), body)
+    files["runs/%s/claims/%s.json" % (run, lane)] = None
+    files["runs/%s/beats/%s.json" % (run, lane)] = dumps({"at": now_iso(), "status": "open", "account": None, "note": "reopened with more work"})
+    return "freed"
+
+
+FINAL_CHECK = ("Every lane is marked done or blocked, so before run %s closes, check the product against the plan. Read the plan's Goal "
+               "and the Done means of every lane's rules (runs/%s/lanes/ on the bus). Check them against main as it is now, the open PRs "
+               "labelled fast-builder, and the open issues the plan names. For each gap in another lane's paths: fb.py reopen --lane <owner> "
+               "--body \"the work\". Build the gaps in your own paths. When nothing is left: fb.py final-check --note \"what you checked\", "
+               "then fb.py lane-state done. The run closes once every lane is done or blocked and that check is recorded.")
+
+
+def needs_final_check(bus, run):
+    """Whether this run closes only after a final check. Runs published by older copies never knew of one."""
+    return version_tuple(bus.doc("runs/%s/job.json" % run).get("min_version")) >= FINAL_CHECK_SINCE
+
+
+def close_or_check(bus, run, account, names, statuses, files):
+    """Every lane is done or blocked: what is done next. Close the run if the product was checked against the plan since
+    the last lane was reopened. Otherwise reopen the steward lane, once, with the final check as its work. If every lane
+    is done again and still nothing was recorded, close anyway and tell a person: a run must not stay open forever on a
+    check nobody makes. Returns whether the run closed."""
+    blocked = statuses.count("blocked")
+    reason = "every lane is done" if not blocked else "%d lanes done, %d blocked" % (statuses.count("done"), blocked)
+    final = bus.doc("runs/%s/%s" % (run, FINAL_FILE))
+    if needs_final_check(bus, run) and not final.get("at"):
+        steward = next((n for n in names if is_steward(bus, run, n)), None)
+        if steward and not bus.doc("runs/%s/%s" % (run, FINAL_ASKED_FILE)).get("at"):
+            reopen_lane(bus, run, steward, "conductor", FINAL_CHECK % (run, run), files)
+            files["runs/%s/%s" % (run, FINAL_ASKED_FILE)] = dumps({"at": now_iso(), "by": account, "lane": steward})
+            add_message(files, run, account, "all", "note", "Every lane is done or blocked. Lane %s is reopened to check the product against the plan before the run closes." % steward)
+            return False
+        reason += "; the final check of the product was asked for and never recorded"
+        add_message(files, run, account, "human", "needs-human", "Run %s closed with no final check of the product against the plan: every lane stopped without recording one. Look at the plan's Goal and each lane's Done means, and start a new run for what is missing." % run)
+    elif final.get("at"):
+        reason += "; final check by %s" % str(final.get("by"))[:60]
+    files["runs/%s/control.json" % run] = dumps({"state": "finished", "reason": reason, "by": account, "at": now_iso()})
+    return True
 
 
 def requests_doc(bus, run):
@@ -1324,6 +1474,8 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
         report["too_old"] = True
         return report
     seen = look_at_main(bus, run, account, asked)
+    if not (asked and asked.get("hung")):
+        look_at_prs(bus, run, account)
 
     def mutate():
         files = {}
@@ -1363,10 +1515,7 @@ def conduct(bus, run, account, stale_minutes=STALE_MINUTES, asked=None):
             unread_requests(bus, run, account, files, report["freed"])
             statuses = [beat_of(bus, run, n).get("status") for n in names]
             if names and all(s in ("done", "blocked") for s in statuses):
-                blocked = statuses.count("blocked")
-                reason = "every lane is done" if not blocked else "%d lanes done, %d blocked" % (statuses.count("done"), blocked)
-                files["runs/%s/control.json" % run] = dumps({"state": "finished", "reason": reason, "by": account, "at": now_iso()})
-                report["finished"] = True
+                report["finished"] = close_or_check(bus, run, account, names, statuses, files)
         elif bus.doc("runs/%s/control.json" % run).get("state") in ("draining", "stopping"):
             quiet = _stale(bus, run, stale_minutes)
             if all(n in quiet or beat_of(bus, run, n).get("status") in ("done", "blocked", "stopped", "open", None) for n in names):
@@ -1467,12 +1616,17 @@ def render_status(bus, fresh=None):
         main = main_view(bus, run, (fresh or {}).get(run))
         if main["state"] != "unknown":
             lines += ["Main is %s at %s since %s.%s" % (main["state"], main["sha"][:7], main["since"], " Failing: %s." % ", ".join(main["failing"]) if main["failing"] else ""), ""]
-        lines += ["| Lane | Account | Status | Last beat (min) | Note |", "|---|---|---|---|---|"]
+        prs, counted = pr_counts(bus, run)
+        lines += ["| Lane | Account | Status | Last beat (min) | Merged / open PRs | Note |", "|---|---|---|---|---|---|"]
         for row in lane_table(bus, run):
             note = row["note"]
             if row["alive_min"] is not None and row["beat_age_min"] is not None and row["alive_min"] < row["beat_age_min"]:
                 note = "working, says its listener %s min ago; %s" % (row["alive_min"], note)
-            lines.append("| %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-", note.replace("|", "/")[:80]))
+            tally = prs.get(row["lane"]) if counted else None
+            lines.append("| %s | %s | %s | %s | %s | %s |" % (row["lane"], row["account"] or "-", row["status"], row["beat_age_min"] if row["beat_age_min"] is not None else "-",
+                                                         "%d / %d" % (tally["merged"], tally["open"]) if tally else ("0 / 0" if counted else "-"), note.replace("|", "/")[:80]))
+        if counted:
+            lines += ["", "PRs merged since the run began, and open now, by `lane:` label, as of %s." % counted]
         human = [m for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]
         if human:
             lines += ["", "Waiting on a person:"] + ["- %s: %s" % (m["from"], m["body"]) for m in human]
@@ -2159,7 +2313,7 @@ def hook_stop(payload):
         return
     session["stop_blocks"] = count + 1
     save_session(path, session)
-    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. CI is your lander's job, not a reason to stop: start the next slice, and fb.py wait only while subagents run. Finished: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
+    print(json.dumps({"decision": "block", "reason": "Lane %s is not finished and this run is on autopilot. Run fb.py tick and take the next work item. CI is your lander's job, not a reason to stop: start the next slice, and fb.py wait only while subagents run. Out of work: follow Finishing in lane-lead.md, which takes the plan's Overflow and then asks the conductor and waits for its answer, rather than ending here. Finished that way: fb.py lane-state done. Everything left is blocked: fb.py lane-state blocked." % session["lane"]}))
 
 
 def hook_session_start(payload):
@@ -3670,6 +3824,40 @@ def cmd_send(args):
     out({"sent": True, "run": run, "from": frm, "to": args.to, "kind": args.kind})
 
 
+def cmd_reopen(args):
+    """The conductor's way to hand a lane more work, above all a lane already marked done: see reopen_lane."""
+    session = load_session()[0]
+    bus = get_bus(args)
+    bus.sync()
+    run = pick_run(bus, args)
+    if args.lane not in lane_names(bus, run):
+        raise FbError("run %s has no lane %s" % (run, args.lane))
+    if run_state(bus, run)["action"] in (STOP, FINISHED):
+        raise FbError("run %s is %s: resume it first" % (run, run_state(bus, run)["state"]))
+    frm = session["lane"] if session and session.get("run") == run else account_name(args)
+    did = {}
+
+    def mutate():
+        files = {}
+        did["did"] = reopen_lane(bus, run, args.lane, frm, args.body, files)
+        return files
+    bus.commit(mutate, "reopen(%s): %s" % (run, args.lane))
+    out({"run": run, "lane": args.lane, "did": did["did"]})
+
+
+def cmd_final_check(args):
+    """Record that the product was checked against the plan and nothing is left, so the run may close once every lane
+    is done or blocked."""
+    session = load_session()[0]
+    bus = get_bus(args)
+    bus.sync()
+    run = pick_run(bus, args)
+    by = "%s (%s)" % (session["lane"], session["account"]) if session and session.get("run") == run else account_name(args)
+    doc = {"at": now_iso(), "by": by, "note": str(args.note)[:2000]}
+    bus.commit(lambda: {"runs/%s/%s" % (run, FINAL_FILE): dumps(doc)}, "final-check(%s): %s" % (run, by))
+    out(dict(doc, run=run))
+
+
 def cmd_inbox(args):
     bus = get_bus(args)
     bus.sync()
@@ -3750,6 +3938,11 @@ def cmd_status(args):
         out({"bus": False, "note": "no bus on this repo yet"})
         return
     runs = [pick_run(bus, args)] if getattr(args, "run", None) else list_runs(bus)
+    for run in runs[-6:]:
+        look_at_prs(bus, run)
+    if bus.lock_handle is None and not bus.sync():  # gh ran with the checkout let go, so read it fresh
+        out({"bus": False, "note": "no bus on this repo yet"})
+        return
     if args.human:
         print(render_status(bus))
         return
@@ -3757,10 +3950,20 @@ def cmd_status(args):
     for run in runs:
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
-                       "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": lane_table(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
+                       "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": with_prs(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
     dry = [{"account": n[:-5], "at": out_of_usage(bus, n[:-5])} for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5])]
     out({"runs": report, "out_of_usage": dry, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
+
+
+def with_prs(bus, run):
+    """lane_table with each lane's merged and open PR counts, or None for either when this machine has no count."""
+    prs, counted = pr_counts(bus, run)
+    rows = lane_table(bus, run)
+    for row in rows:
+        tally = prs.get(row["lane"], {"merged": 0, "open": 0}) if counted else {}
+        row.update(prs_merged=tally.get("merged"), prs_open=tally.get("open"), prs_at=counted)
+    return rows
 
 
 def cmd_report(args):
@@ -4293,6 +4496,15 @@ def build_parser():
     p.add_argument("--kind", default="note", choices=["note", "request", "blocker", "decision", "needs-human", "answer"])
     p.add_argument("--body", required=True)
     p.add_argument("--from", dest="frm")
+
+    p = add("reopen", cmd_reopen, help="hand a lane more work, restarting it if it was marked done")
+    p.add_argument("--run")
+    p.add_argument("--lane", required=True)
+    p.add_argument("--body", required=True)
+
+    p = add("final-check", cmd_final_check, help="record that the product meets the plan, so the run may close")
+    p.add_argument("--run")
+    p.add_argument("--note", required=True)
 
     p = add("inbox", cmd_inbox, help="read messages")
     p.add_argument("--run")

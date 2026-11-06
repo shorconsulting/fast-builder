@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FB = os.path.join(HERE, "fb.py")
@@ -103,6 +104,10 @@ if table.get("fail"):
     sys.exit(1)
 if "raw" in table:
     print(table["raw"])
+    sys.exit(0)
+if any("/issues?" in a for a in sys.argv[1:]):  # the PR count: `issues` holds every page, one array each
+    for page in table.get("issues", [[]]):
+        print(json.dumps(page))
     sys.exit(0)
 rows = [dict(r, head_sha=table.get("sha", "a" * 40)) for r in table.get("runs", [])]
 print(json.dumps({"total_count": len(rows), "check_runs": rows}))
@@ -568,6 +573,7 @@ class BusTests(World):
         self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "lane-state", "blocked")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.assertTrue(self.j("alpha", "conduct", "--run", "hph-10-30-26")["finished"])
 
     def test_resuming_one_run_does_not_cancel_a_global_stop(self):
@@ -651,6 +657,7 @@ class BusTests(World):
         self.fb("bravo", "join", "--lane", "money", "--run", "hph-10-30-26")
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "lane-state", "done")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.j("alpha", "conduct", "--run", "hph-10-30-26")
         self.assertEqual(self.j("alpha", "resume", "--run", "hph-10-30-26")["runs"], [])
         self.assertEqual(self.j("alpha", "status")["runs"][0]["state"], "finished")
@@ -722,6 +729,7 @@ class BusTests(World):
         self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "money")
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "lane-state", "done")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.assertTrue(self.j("alpha", "conduct", "--run", "hph-10-30-26")["finished"])
         self.assertEqual(self.j("alpha", "status")["runs"][0]["state"], "finished")
 
@@ -2167,8 +2175,10 @@ class Hardening(World):
         with open(self.gh_table, "w") as handle:
             json.dump(dict(table, runs=list(runs)), handle)
 
-    def gh_calls(self):
-        return [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
+    def gh_calls(self, prs=False):
+        """The calls about main, or with prs the calls counting each lane's PRs."""
+        calls = [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
+        return [c for c in calls if any("/issues?" in a for a in c) == prs]
 
     def due(self, account="alpha"):
         """Five minutes on, as far as this account's throttle goes."""
@@ -2206,6 +2216,65 @@ class Hardening(World):
         """Bring on a full conductor pass, with the lease due for renewing."""
         self.edit({"conductor.json": {"holder": account, "at": ago(11)}})
         return self.j(account, "conduct", "--run", RUN, *extra)
+
+    # Throughput
+
+    def pr(self, lane, state="open", merged=None, number=1):
+        row = {"number": number, "state": state, "labels": [{"name": "fast-builder"}, {"name": "lane:" + lane}], "pull_request": {"merged_at": merged}}
+        return row
+
+    def test_status_counts_each_lanes_merged_and_open_prs(self):
+        kicked = self.doc("job.json")["kicked_off"]
+        later = fb.now_iso()
+        self.checks(passed(), issues=[[self.pr("core", "closed", later), self.pr("core"), self.pr("core", "closed", later, 3)],
+                                      [self.pr("money"), self.pr("money", "closed", "2000-01-01T00:00:00Z"), self.pr("money", "closed", None),
+                                       {"number": 9, "state": "open", "labels": [{"name": "lane:core"}]}, self.pr("nosuch")]])
+        self.j("alpha", "tick")
+        calls = self.gh_calls(prs=True)
+        self.assertEqual(len(calls), 1, "only the lease holder counts")
+        self.assertIn("labels=fast-builder", calls[0][2])
+        self.assertIn("since=" + urllib.parse.quote(kicked, safe=""), calls[0][2])
+        text = self.on_bus("STATUS.md")
+        self.assertIn("Merged / open PRs", text)
+        self.assertIn("| core | alpha | working |", text)
+        row = lambda lane: [l for l in text.split("\n") if l.startswith("| %s |" % lane)][0]
+        self.assertIn("| 2 / 1 |", row("core"), "an issue is not a PR")
+        self.assertIn("| 0 / 1 |", row("money"), "one merged before the run began, one closed unmerged")
+        self.assertNotIn("nosuch", text, "a label names no lane the bus does not")
+        lanes = {r["lane"]: r for r in self.j("bravo", "status")["runs"][0]["lanes"]}
+        self.assertEqual(len(self.gh_calls(prs=True)), 2, "status counts afresh on its own computer")
+        self.assertEqual((lanes["core"]["prs_merged"], lanes["core"]["prs_open"]), (2, 1))
+        self.assertEqual((lanes["money"]["prs_merged"], lanes["money"]["prs_open"]), (0, 1))
+        self.j("alpha", "tick")
+        self.assertEqual(len(self.gh_calls(prs=True)), 2, "and not on every tick")
+
+    def test_a_count_gh_cannot_give_shows_a_dash_and_keeps_the_last(self):
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        self.j("alpha", "tick")
+        row = [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0]
+        self.assertIn("| - |", row)
+        self.assertNotIn("PRs merged since", self.on_bus("STATUS.md"))
+        self.checks(passed(), issues=[[self.pr("core")]])
+        for mark in glob.glob(os.path.join(self.env("alpha")["FB_CACHE"], "bus", "*.prs-*")):
+            os.utime(mark, (0, 0))
+        self.due()
+        self.next_pass()
+        self.assertIn("| 0 / 1 |", [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0])
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        for mark in glob.glob(os.path.join(self.env("alpha")["FB_CACHE"], "bus", "*.prs-*")):
+            os.utime(mark, (0, 0))
+        self.due()
+        self.edit({"conductor.json": {"holder": "alpha", "at": ago(12)}})
+        self.j("alpha", "conduct", "--run", RUN)
+        self.assertIn("| 0 / 1 |", [l for l in self.on_bus("STATUS.md").split("\n") if l.startswith("| core |")][0], "a failure keeps the last count")
+
+    def test_the_checkout_is_free_while_prs_are_counted(self):
+        self.checks(passed(), issues=[[self.pr("core")]])
+        self.j("alpha", "status")
+        self.assertTrue(self.gh_calls(prs=True))
+        self.assertEqual(set(p["locked"] for p in self.probes()), {False})
 
     # Red main
 
@@ -2564,6 +2633,7 @@ class Hardening(World):
     def test_every_lane_done_closes_the_run_and_asks_nothing(self):
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "lane-state", "done")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.assertTrue(self.j("alpha", "conduct", "--run", RUN)["finished"])
         self.assertFalse(self.said("conductor", "marked done"))
 
@@ -2872,6 +2942,7 @@ class Hardening(World):
         self.ask_conductor()
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "lane-state", "done")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.assertTrue(self.next_pass(account="zulu")["finished"])
         self.assertEqual(len(self.unread_said()), 1)
 
@@ -3062,7 +3133,7 @@ class Hardening(World):
     def test_the_checkout_is_free_while_gh_runs(self):
         self.checks(passed())
         self.j("alpha", "tick")
-        self.assertEqual([p["locked"] for p in self.probes()], [False])
+        self.assertEqual(set(p["locked"] for p in self.probes()), {False})
 
     def test_a_run_not_going_does_not_ask(self):
         self.checks(passed())
@@ -3419,6 +3490,7 @@ class Hardening(World):
     def test_a_tick_that_closes_the_run_says_so(self):
         for lane, account in (("core", "alpha"), ("money", "bravo")):
             self.fb(account, "lane-state", "done")
+        self.fb("alpha", "final-check", "--note", "checked")
         self.checks(passed("lint"))
         self.edit({"conductor.json": {"holder": "alpha", "at": ago(11)}})
         # a done lane's tick conducts, and that is what finishes the run
@@ -3669,6 +3741,141 @@ class Hardening(World):
         self.assertIn("a4ead91b", last)
         self.assertIn("git fetch --unshallow", last)
         self.assertIn("test_an_old_session_on_a_new_listeners_claim_keeps_the_full_limit", last)
+
+
+class KeepGoing(World):
+    """Lanes stopping before the product is done: a done lane can be handed more work and restarted, and the run closes
+    only once the product has been checked against the plan."""
+    def setUp(self):
+        World.setUp(self)
+        self.publish()
+        self.fb("alpha", "join", "--run", RUN, "--lane", "core")
+        self.fb("bravo", "join", "--run", RUN, "--lane", "money")
+
+    edit, on_bus, doc, said, next_pass = Hardening.edit, Hardening.on_bus, Hardening.doc, Hardening.said, Hardening.next_pass
+    register, calls = Listener.register, Listener.calls
+
+    def lanes(self):
+        return {r["lane"]: r for r in self.j("alpha", "status", "--run", RUN)["runs"][0]["lanes"]}
+
+    def all_done(self):
+        self.fb("alpha", "lane-state", "done")
+        self.fb("bravo", "lane-state", "done")
+
+    def test_every_lane_done_reopens_the_steward_for_the_final_check_and_does_not_close(self):
+        self.all_done()
+        report = self.j("alpha", "conduct", "--run", RUN)
+        self.assertFalse(report["finished"])
+        self.assertEqual(self.j("alpha", "status")["runs"][0]["state"], "running")
+        self.assertIsNone(self.doc("claims/core.json"), "freed, so a listener starts the steward again")
+        self.assertEqual(self.doc("beats/core.json")["status"], "open")
+        self.assertEqual(self.doc("beats/money.json")["status"], "done", "only the steward is reopened")
+        asked = self.said("core", "before run %s closes, check the product" % RUN)
+        self.assertEqual(len(asked), 1)
+        self.assertEqual(asked[0]["kind"], "request")
+        self.assertIn("Reopened by conductor", self.on_bus("runs/%s/handoffs/core.md" % RUN))
+        self.assertEqual(self.doc("final-asked.json")["lane"], "core")
+        self.assertEqual(len(self.said("all", "reopened to check the product")), 1)
+        self.next_pass()
+        self.assertEqual(len(self.said("core", "before run %s closes, check the product" % RUN)), 1, "asked once")
+
+    def test_a_recorded_final_check_closes_the_run(self):
+        self.all_done()
+        self.j("alpha", "conduct", "--run", RUN)
+        self.fb("charlie", "join", "--run", RUN, "--lane", "core")
+        self.assertTrue(self.said("core", "check the product"))
+        got = self.j("charlie", "final-check", "--note", "goal and every Done means met on main; no open PRs")
+        self.assertEqual(got["by"], "core (charlie)")
+        self.fb("charlie", "lane-state", "done")
+        self.assertTrue(self.next_pass()["finished"])
+        run = self.j("alpha", "status")["runs"][0]
+        self.assertEqual(run["state"], "finished")
+        self.assertEqual(self.doc("final.json")["note"], "goal and every Done means met on main; no open PRs")
+        self.assertIn("final check by core (charlie)", self.doc("control.json")["reason"])
+
+    def test_a_steward_that_finishes_without_the_check_closes_the_run_and_tells_a_person(self):
+        self.all_done()
+        self.j("alpha", "conduct", "--run", RUN)
+        self.fb("charlie", "join", "--run", RUN, "--lane", "core")
+        self.fb("charlie", "lane-state", "done")
+        self.assertTrue(self.next_pass()["finished"])
+        self.assertIn("never recorded", self.doc("control.json")["reason"])
+        self.assertEqual(len(self.said("human", "no final check")), 1)
+
+    def test_a_run_from_before_the_final_check_closes_as_it_did(self):
+        self.edit({"job.json": dict(self.doc("job.json"), min_version="0.1.13")})
+        self.all_done()
+        self.assertTrue(self.j("alpha", "conduct", "--run", RUN)["finished"])
+        self.assertFalse(self.said("core", "check the product"))
+
+    def test_reopening_a_done_lane_frees_it_with_the_work_in_its_inbox_and_handoff(self):
+        self.fb("bravo", "lane-state", "done", "--note", "cleared")
+        got = self.j("alpha", "reopen", "--lane", "money", "--body", "build the refund endpoint from Overflow")
+        self.assertEqual(got["did"], "freed")
+        self.assertEqual(self.j("bravo", "tick")["action"], "lost", "its old session leaves")
+        self.assertIsNone(self.lanes()["money"]["account"])
+        self.assertEqual(self.doc("beats/money.json")["status"], "open")
+        self.assertEqual(self.doc("reopens.json"), {"money": 1})
+        self.assertIn("build the refund endpoint from Overflow", self.on_bus("runs/%s/handoffs/money.md" % RUN))
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        inbox = self.j("charlie", "tick")["inbox"]
+        self.assertTrue(any(m["body"] == "build the refund endpoint from Overflow" and m["from"] == "core" and m["kind"] == "request" for m in inbox), inbox)
+
+    def test_reopening_a_working_lane_only_sends_the_work(self):
+        got = self.j("alpha", "reopen", "--lane", "money", "--body", "and the refunds page")
+        self.assertEqual(got["did"], "sent")
+        self.assertEqual(self.lanes()["money"]["account"], "bravo")
+        self.assertEqual(self.j("bravo", "tick")["action"], "continue")
+        self.assertIsNone(self.doc("reopens.json"))
+
+    def test_reopening_clears_a_recorded_final_check(self):
+        self.fb("alpha", "final-check", "--note", "looked")
+        self.fb("bravo", "lane-state", "done")
+        self.fb("alpha", "reopen", "--lane", "money", "--body", "gap: refunds")
+        self.assertIsNone(self.doc("final.json"))
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        self.fb("charlie", "lane-state", "done")
+        self.fb("alpha", "lane-state", "done")
+        self.assertFalse(self.j("alpha", "conduct", "--run", RUN)["finished"], "the product changed, so it is checked again")
+
+    def test_a_reopened_lane_done_again_with_time_left_raises_a_new_request(self):
+        self.fb("bravo", "lane-state", "done")
+        self.next_pass()
+        self.fb("alpha", "reopen", "--lane", "money", "--body", "more")
+        self.fb("charlie", "join", "--run", RUN, "--lane", "money")
+        self.fb("charlie", "lane-state", "done")
+        self.next_pass()
+        self.next_pass()
+        got = self.said("conductor", "marked done")
+        self.assertEqual(len(got), 2, [m["body"] for m in got])
+        self.assertIn("after 1 reopening", got[1]["body"])
+        self.assertIn("fb.py reopen --lane money", got[1]["body"])
+
+    def test_reopen_refuses_an_unknown_lane_and_a_finished_run(self):
+        self.assertIn("no lane", self.fb("alpha", "reopen", "--lane", "nope", "--body", "x", check=False).stderr)
+        self.edit({"control.json": {"state": "finished", "reason": "done", "by": "alpha", "at": fb.now_iso()}})
+        self.assertIn("resume it first", self.fb("alpha", "reopen", "--lane", "money", "--body", "x", check=False).stderr)
+
+    def test_a_listener_restarts_a_reopened_local_lane(self):
+        self.publish(accounts=2, where="local", today="2026-10-31")
+        run = "hph-10-31-26"
+        self.fb("alpha", "join", "--run", run, "--lane", "core")
+        self.fb("bravo", "join", "--run", run, "--lane", "money")
+        self.fb("bravo", "lane-state", "done")
+        self.register("charlie")
+        open(self.shim_log, "a").close()
+        self.fb("charlie", "listen", "--once")
+        self.assertEqual([c for c in self.calls() if "account orchestrator" in c], [], "nothing to start: a done lane stays done")
+        self.fb("alpha", "reopen", "--run", run, "--lane", "money", "--body", "refunds")
+        self.fb("charlie", "listen", "--once")
+        Listener.until(self, self.calls)
+        self.assertEqual(len([c for c in self.calls() if "account orchestrator" in c]), 1, self.calls())
+        lanes = {r["lane"]: r for r in self.j("alpha", "status", "--run", run)["runs"][0]["lanes"]}
+        self.assertEqual(lanes["money"]["account"], "charlie")
+
+    def test_the_stop_hook_points_a_lane_out_of_work_at_finishing(self):
+        with open(FB) as handle:
+            self.assertIn("asks the conductor and waits for its answer, rather than ending here", handle.read())
 
 
 class CloudBootstrap(World):

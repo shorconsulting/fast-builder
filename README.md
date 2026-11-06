@@ -41,7 +41,7 @@ work item rather than within a minute.
 
 | Command | Does |
 |---|---|
-| `/fast-builder:status` | Where the main session is, every lane, account and heartbeat, and anything waiting on a person |
+| `/fast-builder:status` | Where the main session is, every lane, account and heartbeat, each lane's merged and open PRs, and anything waiting on a person |
 | `/fast-builder:stop` | Stops every account. `--drain` lets lanes finish what is in hand. `--all` covers every run |
 | `/fast-builder:pause`, `/fast-builder:resume` | Pauses; resuming puts stopped lanes, lanes that went quiet, and accounts marked out of usage back on offer |
 | `/fast-builder:send --to LANE "text"` | Sends a note to one lane or `all` |
@@ -49,7 +49,7 @@ work item rather than within a minute.
 | `/fast-builder:switch` | Points this OS user's listener at its current login |
 
 To stop everything with no Claude at hand, add a file named `STOP` to the `fast-builder/bus` branch on GitHub, from a phone
-if you like. `STATUS.md` on that branch shows the state.
+if you like. `STATUS.md` on that branch shows the state, including each lane's PRs merged since the run began and open now.
 
 ## How it works
 
@@ -81,8 +81,12 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - **One version.** A run records the version that published it. An older listener takes no lanes in it and does not
   conduct it, and a person is told about any older listener still heard from, since it frees and claims by older rules.
 - **Running out of work.** Every plan says what each lane takes next if it clears its list. A lane reads that, then asks
-  the conductor, before it marks itself done, and a lane done early with time left raises a request by itself. A request
-  nobody is left to read, or nobody has read in an hour, tells a person.
+  the conductor and waits for its answer, still working, before it marks itself done. A lane done early with time left
+  raises a request by itself. A request nobody is left to read, or nobody has read in an hour, tells a person.
+- **Done is not for good.** `fb.py reopen` hands a lane more work and, if it was marked done or blocked, puts it back on
+  offer so a listener starts it again. The run does not close when every lane is done: the steward lane is reopened to
+  check the product against the plan's Goal and every lane's Done means, reopens the lanes with gaps, and records the
+  check with `fb.py final-check`. Only then does the run close.
 - **Building ahead of CI.** Each lane runs two tracks. Builders open a PR and go straight to their next slice. One
   lander per lane waits on checks, merges what is green, rebases PRs that fall behind, and hands real failures back
   as fix slices. A lane is not done while any of its PRs are still open. The lander reads GitHub through REST
@@ -140,7 +144,9 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
 - The main session is whichever account published the run. If that account runs out while holding a lane, a person is told. A session that only planned and holds no lane has nothing to report this, and moving the role to another account is not built yet.
 - The 3-hour rule cannot tell an account out of usage from a session that hung, so a hung local lane goes to another
   account too, and its old process stays until it ticks or the run stops. With no other account, a person hears at 30 minutes.
-- Nothing restarts a lane marked done, so a request raised for a done lane whose session has ended needs a person.
+- A lane reopened with `fb.py reopen` restarts only where a listener runs: a cloud run needs an account listening with a
+  routine, as any open lane does. With none, a person is told after 30 minutes.
+- The final check is a model's judgement of the product against the plan. A run published before 0.1.14 closes without one.
 - All of this is in the copy of `fb.py` each account runs. A listener gets it at `/fast-builder:listen`, and cloud lanes at
   the next kickoff. While an older copy holds the conductor lease, main goes unwatched and nothing is raised, and an older
   listener ignores the 3-hour rule. An older session reads requests without marking them read, so a person can hear of one
