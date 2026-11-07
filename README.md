@@ -89,7 +89,9 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   check with `fb.py final-check`. Only then does the run close.
 - **Building ahead of CI.** Each lane runs two tracks. Builders open a PR and go straight to their next slice. One
   lander per lane waits on checks, merges what is green, rebases PRs that fall behind, and hands real failures back
-  as fix slices. A lane is not done while any of its PRs are still open.
+  as fix slices. A lane is not done while any of its PRs are still open. The lander reads GitHub through REST
+  (`fb.py prs`, `fb.py pr-wait`), so it works in cloud sessions, which refuse GraphQL. In a repo whose
+  `.github/autopilot.json` says it has its own merge pipeline, the lander leaves merging to it.
 - **Tokens.** `fb.py route` picks the model for every task: Opus for security-sensitive work and design, Sonnet for
   pattern work, Haiku for mechanical work, never Fable. Listening and waiting on CI use no tokens.
 - **Autopilot.** On `full` no lane stops to ask. Reversible decisions are logged under "Decided without you". Deleting

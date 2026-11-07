@@ -90,13 +90,22 @@ slice that needs one not yet merged branches from that slice's branch, and its P
 
 **Land track.** One lander per lane. Start it once, in the background, with `route --kind land` (the `lander` agent),
 and keep re-tasking that one agent. Its brief names the lane, its paths and the full path to `fb.py`. It is not one of the 3 writers: it spends most of its time blocked on
-`gh pr checks --watch`, which costs no tokens. Its queue is the lane's open PRs:
+`fb.py pr-wait`, which costs no tokens. Its queue is the lane's open PRs:
 
-    gh pr list --label lane:<lane> --state open --json number,title,headRefName,baseRefName,mergeStateStatus
+    python3 "$FB" prs --lane <lane>
+
+Both read GitHub through REST. Never use `gh pr checks` or `gh pr list` in their place: they go through GraphQL, which
+cloud sessions refuse, and a lander that cannot read its queue leaves the lead waiting on CI again.
+
+`prs` also says who merges, as `merge_by`, read from the repo's `.github/autopilot.json`. `lander`: the lander merges.
+`repo`: the repo has its own review and merge automation (`pipeline` own or gate), which merges green PRs by itself, so
+the lander never merges, approves or turns on auto-merge there, and only keeps the PRs mergeable. `person` or `unknown`:
+nothing merges without a person. This holds in either autopilot mode: a second merger only races the repo's own.
 
 For each PR it waits on checks, then:
 
-- **Green, and what the repo needs to merge is met:** merges it the way the plan's "Build, test and land" section says.
+- **Green, and what the repo needs to merge is met:** with `merge_by` lander, merges it the way the plan's "Build, test
+  and land" section says. Otherwise leaves it for the repo's automation, or for a person.
 - **Behind the base branch or in conflict:** updates or rebases the PR, runs `check-diff`, and pushes. This is
   allowed only when the conflict is inside the lane's own paths. Anything else goes to the lead.
 - **Failed in a way unrelated to the diff** (runner or network trouble, a timeout, a test the diff cannot reach): re-runs
