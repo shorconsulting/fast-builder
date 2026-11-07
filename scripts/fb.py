@@ -36,6 +36,7 @@ Layout of the bus:
 See docs/protocol.md. Everything is a subcommand: fb.py --help.
 """
 import argparse
+import base64
 import datetime
 import glob as globlib
 import hashlib
@@ -79,7 +80,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -1057,6 +1058,82 @@ def main_checks(slug, base, only):
     return None
 
 
+def gh_pages(path, timeout=MAIN_ASK_SECONDS):
+    """Every page of a REST read, as a list of the decoded pages. REST and never GraphQL, because cloud sessions refuse
+    GraphQL, and with it `gh pr checks` and `gh pr list`. Raises FbError when gh fails or answers with something else."""
+    proc = run_cmd(["gh", "api", "--paginate", path], check=False, timeout=timeout)
+    if proc.returncode != 0:
+        said = (proc.stderr or proc.stdout or "").strip().splitlines()
+        raise FbError("gh api %s failed: %s" % (path, said[0][:200] if said else "exit %d" % proc.returncode))
+    pages, text, at = [], proc.stdout.strip(), 0
+    try:
+        while at < len(text):  # --paginate prints one page after another, with nothing between them
+            page, at = json.JSONDecoder().raw_decode(text, at)
+            pages.append(page)
+            at += len(text[at:]) - len(text[at:].lstrip())
+    except ValueError:
+        raise FbError("gh api %s answered with something that is not JSON" % path)
+    return pages
+
+
+def pr_slug(args):
+    slug = repo_slug(getattr(args, "remote", None) or cwd_remote())
+    if not SLUG_RE.match(slug):
+        raise FbError("cannot tell owner/name from the remote %s: pass --remote" % slug)
+    return slug
+
+
+def pr_checks(slug, sha):
+    """Where one commit's checks stand: `pending` while any that stands is unfinished or none has reported yet, else
+    `red` if any ended in failure, else `green`. The same reading of reruns as main's (standing_checks)."""
+    rows = []
+    for page in gh_pages("repos/%s/commits/%s/check-runs?per_page=100" % (slug, sha)):
+        rows += page.get("check_runs", []) if isinstance(page, dict) else []
+    rows = standing_checks([r for r in rows if isinstance(r, dict) and isinstance(r.get("name"), str)])
+    unfinished = [r["name"] for r in rows if r.get("status") != "completed"]
+    failing = [r["name"] for r in rows if r.get("status") == "completed" and r.get("conclusion") in MAIN_RED]
+    if not rows or unfinished:
+        state = "pending"
+    else:
+        state = "red" if failing else "green"
+    return {"state": state, "failing": clean_names(sorted(failing)), "unfinished": clean_names(sorted(unfinished)), "checks": len(rows)}
+
+
+def merge_owner(slug, base):
+    """Who merges this repo's PRs, from .github/autopilot.json on the base branch. `repo`: the repo has its own review
+    and merge automation (pipeline own or gate), so a lander only keeps PRs mergeable and never merges. `person`: the
+    policy stops at the open PR. `lander`: nothing says otherwise. `unknown` when the file cannot be read: merge nothing."""
+    path = "repos/%s/contents/.github/autopilot.json?ref=%s" % (slug, urllib.parse.quote(base, safe=""))
+    proc = run_cmd(["gh", "api", path], check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return "lander" if "404" in (proc.stderr or "") + (proc.stdout or "") else "unknown"
+    try:
+        policy = json.loads(base64.b64decode(json.loads(proc.stdout)["content"]).decode("utf-8"))
+    except Exception:
+        return "unknown"
+    if not isinstance(policy, dict):
+        return "unknown"
+    if policy.get("pipeline") in ("own", "gate"):
+        return "repo"
+    if policy.get("pipeline") == "none" or policy.get("level") in ("manual", "ai-review"):
+        return "person"
+    return "lander"
+
+
+def lane_queue(slug, lane):
+    """A lane's open PRs, oldest first, read with REST."""
+    prs = []
+    for page in gh_pages("repos/%s/pulls?state=open&per_page=100" % slug):
+        for pr in page if isinstance(page, list) else []:
+            labels = [l.get("name") for l in pr.get("labels") or [] if isinstance(l, dict)]
+            if "lane:%s" % lane not in labels:
+                continue
+            prs.append({"number": pr.get("number"), "title": pr.get("title"), "head": (pr.get("head") or {}).get("ref"),
+                        "sha": (pr.get("head") or {}).get("sha"), "base": (pr.get("base") or {}).get("ref"),
+                        "draft": bool(pr.get("draft")), "auto_merge": pr.get("auto_merge") is not None})
+    return sorted(prs, key=lambda pr: pr["number"] or 0)
+
+
 def look_at_main(bus, run, account, asked=None):
     """A fresh reading of main if this pass is the one to take it, else None. Outside the commit: a retry must not ask
     again, and gh must not hold the bus checkout. The throttle is a local file, so a reading with no news costs the bus
@@ -1720,13 +1797,25 @@ def throughput(root=None, days=14):
     """Merged PRs per day per active author-and-lane over the last fortnight, measured with gh. None when unknown."""
     if not shutil.which("gh"):
         return None
-    proc = run_cmd(["gh", "pr", "list", "--state", "merged", "--limit", "300", "--json", "mergedAt"], cwd=root, check=False, timeout=30)
-    if proc.returncode != 0:
-        return None
     try:
-        stamps = [parse_iso(row["mergedAt"]) for row in json.loads(proc.stdout) if row.get("mergedAt")]
-    except (ValueError, KeyError):
+        slug = repo_slug(cwd_remote(root))
+    except FbError:
         return None
+    if not SLUG_RE.match(slug):
+        return None
+    stamps = []
+    for page in range(1, 4):  # REST, as main_checks: `gh pr list` is GraphQL, which cloud sessions refuse. 300 at most, as before
+        url = "repos/%s/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d" % (slug, page)
+        proc = run_cmd(["gh", "api", url], cwd=root, check=False, timeout=30)
+        if proc.returncode != 0:
+            return None
+        try:
+            rows = json.loads(proc.stdout)
+            stamps += [parse_iso(row["merged_at"]) for row in rows if isinstance(row, dict) and row.get("merged_at")]
+        except (ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(rows, list) or len(rows) < 100:
+            break
     recent = [s for s in stamps if (utcnow() - s).days < days]
     return round(len(recent) / float(days), 2) if recent else None
 
@@ -3922,6 +4011,39 @@ def cmd_route(args):
     out(route(args.kind, args.paths or [], sensitive_globs(args.root), args.changes_verdicts, args.stalled))
 
 
+def cmd_prs(args):
+    """The lander's queue: the lane's open PRs and who merges them, without GraphQL."""
+    slug = pr_slug(args)
+    lane = args.lane or (load_session()[0] or {}).get("lane")
+    if not (isinstance(lane, str) and NAME_RE.match(lane)):
+        raise FbError("which lane? pass --lane")
+    base = args.base or default_branch()
+    out({"lane": lane, "base": base, "merge_by": merge_owner(slug, base), "prs": lane_queue(slug, lane)})
+
+
+def cmd_pr_wait(args):
+    """Wait on one PR's checks without tokens, the REST stand-in for `gh pr checks --watch`. Returns when its checks have
+    all finished, when it closes or merges, or at --seconds with state `pending`. A new push restarts the reading."""
+    slug = pr_slug(args)
+    end = time.time() + args.seconds
+    while True:
+        pr = gh_pages("repos/%s/pulls/%d" % (slug, args.number))[0]
+        head = (pr.get("head") or {}).get("sha")
+        if pr.get("merged_at"):
+            out({"pr": args.number, "state": "merged"})
+            return
+        if pr.get("state") != "open":
+            out({"pr": args.number, "state": "closed"})
+            return
+        if not (isinstance(head, str) and SHA_RE.match(head)):
+            raise FbError("PR %d has no head commit to read" % args.number)
+        checks = pr_checks(slug, head)
+        if checks["state"] != "pending" or time.time() >= end:
+            out(dict(checks, pr=args.number, sha=head, mergeable_state=pr.get("mergeable_state"), auto_merge=pr.get("auto_merge") is not None))
+            return
+        time.sleep(min(args.poll, max(0.0, end - time.time())))
+
+
 def cmd_check_diff(args):
     session, path, _ = need_session()
     lanes = read_json(os.path.join(os.path.dirname(path), "lanes.json")) or {"lanes": []}
@@ -4370,6 +4492,15 @@ def build_parser():
     p.add_argument("--seconds", type=float, default=540)
     p.add_argument("--poll", type=float, default=30)
     p.add_argument("--until-resumed", action="store_true")
+
+    p = add("prs", cmd_prs, help="a lane's open PRs and who merges them (REST)")
+    p.add_argument("--lane")
+    p.add_argument("--base")
+
+    p = add("pr-wait", cmd_pr_wait, help="wait on one PR's checks without tokens (REST)")
+    p.add_argument("number", type=int)
+    p.add_argument("--seconds", type=float, default=540)
+    p.add_argument("--poll", type=float, default=60)
 
     p = add("send", cmd_send, help="message a lane, all, conductor or human")
     p.add_argument("--run")

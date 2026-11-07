@@ -2,6 +2,7 @@
 """End-to-end tests. Each account is a separate FB_HOME and FB_CACHE (and clone) against a local bare remote, so what
 passes here passed through real git pushes and real races. A shim stands in for the claude binary."""
 import atexit
+import base64
 import concurrent.futures
 import glob
 import json
@@ -5274,6 +5275,116 @@ class LaneDrops(World):
         self.assertIn('"did": "held"', said)
         self.assertEqual(self.lane_starts(), [])
         self.assertTrue(all(r["account"] is None for r in self.lanes().values()), "unclaimed, so another computer can have it")
+
+
+class LanderRest(unittest.TestCase):
+    """The lander's reads go through REST, because cloud sessions refuse GraphQL and with it `gh pr checks` and
+    `gh pr list`. gh is faked by path: each test maps a REST path to what gh prints for it."""
+
+    def gh(self, answers, calls=None):
+        def fake(args, cwd=None, check=True, timeout=60, env=None, stdin_text=None):
+            self.assertEqual(args[:2], ["gh", "api"])
+            self.assertNotIn("graphql", " ".join(args))
+            if calls is not None:
+                calls.append(args[-1])
+            said = answers.get(args[-1])
+            if callable(said):
+                said = said()
+            if said is None:
+                return subprocess.CompletedProcess(args, 1, "", "gh: Not Found (HTTP 404)")
+            return subprocess.CompletedProcess(args, 0, said if isinstance(said, str) else json.dumps(said), "")
+        return unittest.mock.patch("fb.run_cmd", side_effect=fake)
+
+    def runs(self, *rows):
+        return {"check_runs": [dict({"status": "completed", "conclusion": "success"}, **r) for r in rows]}
+
+    def test_a_commit_is_pending_until_every_check_has_finished(self):
+        path = "repos/o/a/commits/%s/check-runs?per_page=100" % ("a" * 40)
+        for rows, state in (([], "pending"),
+                            ([{"name": "ci", "status": "in_progress", "conclusion": None}, {"name": "lint"}], "pending"),
+                            ([{"name": "ci"}, {"name": "lint", "conclusion": "skipped"}], "green"),
+                            ([{"name": "ci", "conclusion": "failure"}, {"name": "lint"}], "red")):
+            with self.gh({path: self.runs(*rows)}):
+                self.assertEqual(fb.pr_checks("o/a", "a" * 40)["state"], state, rows)
+        with self.gh({path: self.runs({"name": "ci", "conclusion": "failure"}, {"name": "e2e", "status": "queued", "conclusion": None})}):
+            got = fb.pr_checks("o/a", "a" * 40)
+        self.assertEqual((got["state"], got["failing"], got["unfinished"]), ("pending", ["ci"], ["e2e"]), "red early, but not done")
+
+    def test_pages_are_read_one_after_another(self):
+        path = "repos/o/a/commits/%s/check-runs?per_page=100" % ("a" * 40)
+        two = json.dumps(self.runs({"name": "a"})) + "\n" + json.dumps(self.runs({"name": "b", "conclusion": "failure"}))
+        with self.gh({path: two}):
+            self.assertEqual(fb.pr_checks("o/a", "a" * 40)["failing"], ["b"])
+        for bad in (None, "<html>rate limited</html>"):
+            with self.gh({path: bad}), self.assertRaises(fb.FbError):
+                fb.pr_checks("o/a", "a" * 40)
+
+    def test_a_lanes_queue_is_its_own_open_prs_oldest_first(self):
+        def pr(n, *labels, **kw):
+            return dict({"number": n, "title": "t%d" % n, "labels": [{"name": l} for l in labels], "draft": False, "auto_merge": None,
+                         "head": {"ref": "fb/r/core/s%d" % n, "sha": "%d" % n * 40}, "base": {"ref": "main"}}, **kw)
+        page = [pr(9, "lane:core"), pr(4, "lane:core", "fast-builder", auto_merge={"merge_method": "merge"}), pr(5, "lane:web"), pr(6)]
+        with self.gh({"repos/o/a/pulls?state=open&per_page=100": json.dumps(page[:2]) + json.dumps(page[2:])}):
+            got = fb.lane_queue("o/a", "core")
+        self.assertEqual([p["number"] for p in got], [4, 9])
+        self.assertEqual((got[0]["auto_merge"], got[1]["auto_merge"], got[0]["head"]), (True, False, "fb/r/core/s4"))
+
+    def test_a_repo_with_its_own_merge_pipeline_is_never_merged_by_the_lander(self):
+        path = "repos/o/a/contents/.github/autopilot.json?ref=main"
+
+        def policy(doc):
+            return {"content": base64.b64encode(json.dumps(doc).encode()).decode()}
+        for answer, owner in ((policy({"pipeline": "own", "level": "autopilot"}), "repo"),
+                              (policy({"pipeline": "gate"}), "repo"),
+                              (policy({"pipeline": "none", "level": "autopilot"}), "person"),
+                              (policy({"level": "manual"}), "person"),
+                              (policy({"level": "autopilot"}), "lander"),
+                              (None, "lander"),
+                              ({"content": "not base64 json"}, "unknown"),
+                              (policy(["a list"]), "unknown")):
+            with self.gh({path: answer}):
+                self.assertEqual(fb.merge_owner("o/a", "main"), owner, answer)
+        with unittest.mock.patch("fb.run_cmd", return_value=subprocess.CompletedProcess([], 1, "", "HTTP 502")):
+            self.assertEqual(fb.merge_owner("o/a", "main"), "unknown", "a failed read merges nothing")
+
+    def wait(self, answers, *extra):
+        args = fb.build_parser().parse_args(["pr-wait", "7", "--remote", "https://github.com/o/a.git", "--poll", "0"] + list(extra))
+        printed = []
+        with self.gh(answers), unittest.mock.patch("fb.out", side_effect=printed.append), unittest.mock.patch("fb.time.sleep"):
+            args.func(args)
+        return printed[0]
+
+    def test_pr_wait_returns_when_the_checks_finish_and_follows_a_new_push(self):
+        old, new = "a" * 40, "b" * 40
+        heads = iter([old, new, new])
+
+        def pr():
+            return {"state": "open", "merged_at": None, "head": {"sha": next(heads)}, "mergeable_state": "behind", "auto_merge": None}
+        got = self.wait({"repos/o/a/pulls/7": pr,
+                         "repos/o/a/commits/%s/check-runs?per_page=100" % old: self.runs({"name": "ci", "status": "in_progress", "conclusion": None}),
+                         "repos/o/a/commits/%s/check-runs?per_page=100" % new: iter([self.runs({"name": "ci", "status": "queued", "conclusion": None}),
+                                                                                       self.runs({"name": "ci", "conclusion": "failure"})]).__next__})
+        self.assertEqual((got["state"], got["sha"], got["failing"], got["mergeable_state"], got["auto_merge"]), ("red", new, ["ci"], "behind", False))
+
+    def test_throughput_counts_recent_merges_through_rest(self):
+        def at(days):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400))
+        full = [{"merged_at": at(1)}] * 60 + [{"merged_at": None}] * 40
+        last = [{"merged_at": at(2)}] * 10 + [{"merged_at": at(30)}] * 5
+        base = "repos/o/a/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=%d"
+        calls = []
+        with self.gh({base % 1: full, base % 2: last}, calls), unittest.mock.patch("fb.cwd_remote", return_value="git@github.com:o/a.git"):
+            self.assertEqual(fb.throughput("/x"), round(70 / 14.0, 2))
+        self.assertEqual(calls, [base % 1, base % 2], "a short page is the last")
+        with self.gh({}), unittest.mock.patch("fb.cwd_remote", return_value="git@github.com:o/a.git"):
+            self.assertIsNone(fb.throughput("/x"))
+
+    def test_pr_wait_says_merged_closed_or_still_pending(self):
+        self.assertEqual(self.wait({"repos/o/a/pulls/7": {"state": "closed", "merged_at": "2026-11-05T00:00:00Z"}})["state"], "merged")
+        self.assertEqual(self.wait({"repos/o/a/pulls/7": {"state": "closed", "merged_at": None}})["state"], "closed")
+        got = self.wait({"repos/o/a/pulls/7": {"state": "open", "head": {"sha": "c" * 40}},
+                         "repos/o/a/commits/%s/check-runs?per_page=100" % ("c" * 40): self.runs()}, "--seconds", "0")
+        self.assertEqual((got["state"], got["checks"]), ("pending", 0), "no check has reported yet")
 
 
 def hashlib_sha1(text):
