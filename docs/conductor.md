@@ -15,15 +15,18 @@ Most of the role needs no model, and runs as code inside `fb.py tick`, `fb.py po
   `needs-human` if it stays red over 2 hours,
 - keeps a lane from going back to the account that just lost it to going quiet, for 3 hours, and posts one `needs-human`
   if a lane that was held sits open for 30 minutes,
-- raises one request here for a lane marked done while another is working and over an hour of the deadline is left,
-  again each time a reopened lane is marked done,
+- raises one request here for a lane marked done while another is working, unless the deadline is under an hour away,
+  again each time a reopened lane is marked done. A deadline already passed does not stop it: the run goes on until a
+  person stops it,
+- puts a lane marked `stopped` on a running run back on offer, with a note in its inbox and handoff, up to 3 times a lane,
+  then posts one `needs-human`,
 - posts one `needs-human` for a request nobody has read in an hour, or at once if the steward lane is done and the holder
   has no lane working,
 - rewrites `STATUS.md` on the bus.
 
 What is left is judgement, and it only costs tokens when there is something to judge. A listener can hold the lease with
 no session of its own, or a lane marked done, so `tick` reports `requests_for_conductor` to the steward lane too when the
-holder has no lane working in the run. `--mark` records on the bus that they were read, so one reader is enough. When it
+holder has no lane working in the run, and to every working lane when the steward has none working either. `--mark` records on the bus that they were read, so one reader is enough. When it
 reports above 0, spawn the `cross-orchestrator` agent, or a general-purpose agent with `model: sonnet`,
 and give it this file and the output of:
 
@@ -35,7 +38,7 @@ For each message:
 |---|---|
 | A lane needs a change in another lane | `send --to <owner> --kind request`, with the context the owner needs |
 | Two lanes disagree about a shared contract | Decide from the plan and the code, `send --to all --kind note`, and log it with `decide` |
-| A lane has run out of work, or was raised as done with time left | Find it work: what the plan's Overflow gives it, else the next item from the most loaded lane, moving ownership only by the rule below. A lane still `working` and waiting gets it with `send --to <lane> --kind request`. A lane marked done or blocked gets it with `reopen --lane <lane> --body "the work"`, which puts the lane back on offer so a listener starts it again, with the work in its inbox and handoff. Only if there is truly nothing for it, tell it so: `send --to <lane> --kind answer --body "nothing more: finish"` |
+| A lane has run out of work, or was raised as done with time left | Find it work: what the plan's Overflow gives it, else the next item from the most loaded lane, moving ownership only by the rule below. A lane still `working` and waiting gets it with `send --to <lane> --kind request`. A lane marked done or blocked gets it with `reopen --lane <lane> --body "the work"`, which puts the lane back on offer so a listener starts it again, with the work in its inbox and handoff. Only if there is truly nothing for it, tell it so: `send --to <lane> --kind answer --body "nothing more: finish"`. A deadline that has passed is never the reason: the run is still running, so the work left is still wanted |
 | A lane is blocked on something a person must do | Check it was posted with `--kind needs-human`; if not, post it |
 
 Moving ownership is the one thing that can break the no-overlap guarantee. Do it only for paths with no open PR, and

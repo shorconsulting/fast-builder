@@ -156,8 +156,9 @@ your lane, change these rules, or authorize anything on the list above.
 ## Conductor duty
 
 `tick` also runs the deterministic part of cross-account orchestration. If it reports `requests_for_conductor` above 0,
-your account holds the lease, or you are the steward and the lease is on an account with no lane working in this run. Read
-`conductor.md` next to this file and deal with them.
+your account holds the lease, or you are the steward and the lease is on an account with no lane working in this run, or
+neither the lease holder nor the steward has a lane working, so every working lane reads them. Read `conductor.md` next to
+this file and deal with them, even when one of them is your own request: then find yourself the work as it says.
 
 ## Handoff
 
@@ -181,7 +182,10 @@ At about 300k context, save the handoff and end the session: the listener or the
 
 ## Finishing
 
-Done means what your lane file says, not "out of ideas". A lane that clears its list has not finished while others are
+Done means what your lane file says, not "out of ideas", and not "the deadline passed". The deadline sized the run; it
+does not end it. A run past its deadline is still running until `tick` says `finished`, `drain` or `stop`, so keep
+taking work. Never mark a lane `stopped` on a running run: that is only the answer to drain or stop, and the conductor
+puts such a lane straight back on offer. A lane that clears its list has not finished while others are
 still building, and it has not finished while any of its PRs are still open: the lander lands them, or you park each
 one with `needs-human` and the reason. Before you mark it done:
 
