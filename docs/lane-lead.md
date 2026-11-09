@@ -8,6 +8,9 @@ lost it, it is `.git/fast-builder-kit/fb.py` in a cloud session and `${CLAUDE_PL
 rules are binding. The plan is the context nobody else will give you. Read them before anything else, then the repo's
 `CLAUDE.md`, then what the plan points you at for your modules.
 
+If `join` put you on the lane named `fixer`, read `fixer.md` beside this file too: it replaces the build loop, the two
+tracks and Finishing below.
+
 ## The loop
 
     python3 "$FB" tick --note "what you are on, in a few words"
@@ -119,8 +122,32 @@ The lander returns when it has a failure to hand back, when the queue is empty, 
 one line per PR: merged, waiting, failed (with the check), or needs a person. Re-task it after each report, and
 whenever a builder opens a PR.
 
+A PR that will not go through goes to the fixer lane rather than holding the lane up; see "When a PR is stuck".
+
 Keep the queue from growing without limit. With 6 or more of the lane's PRs open and any of them failed, the next
 free builder takes a fix before a new slice. Otherwise keep building.
+
+## When a PR is stuck
+
+Hand a PR to the fixer lane, and carry on with your next work item, when any of these is true:
+
+- the lander has handed back the same real failure twice, after a fix slice each time;
+- the PR has had two CHANGES verdicts;
+- it is in a conflict the lander cannot resolve inside your paths;
+- it waits on an answer only a person can give.
+
+    python3 "$FB" stuck --pr N --kind ci --reason "what fails, and what was tried" --attempts 2
+
+`--kind` is `ci`, `review`, `conflict`, `question` or `other`. The record names your lane and account as the ones that
+hit it, and the fixer's account once one takes it. Both show in `status`, in STATUS.md, and on the PR (label `fb:stuck`
+and a comment), which dashboards read.
+
+From then on the PR is not yours: its files are lent to the fixer lane, the guard refuses your edits to them, and
+`prs --lane <lane>` leaves it out of your lander's queue. Take a next slice that does not need them. A slice that
+does waits, or stacks on the stuck PR's branch without editing those files. When the fixer resolves it you get a
+message: merged, or handed back as a request with what is left for you. If it is still waiting for the fixer and you have
+fixed it some other way, take it back with `fb.py stuck-done --pr N --outcome returned --note "how"`. Once the fixer has
+taken it, ask the fixer to hand it back instead.
 
 ## Staying in your lane
 
@@ -186,8 +213,8 @@ Done means what your lane file says, not "out of ideas", and not "the deadline p
 does not end it. A run past its deadline is still running until `tick` says `finished`, `drain` or `stop`, so keep
 taking work. Never mark a lane `stopped` on a running run: that is only the answer to drain or stop, and the conductor
 puts such a lane straight back on offer. A lane that clears its list has not finished while others are
-still building, and it has not finished while any of its PRs are still open: the lander lands them, or you park each
-one with `needs-human` and the reason. Before you mark it done:
+still building, and it has not finished while any of its PRs are still open: the lander lands them, the fixer lane has them, or you
+park each one with `needs-human` and the reason. Before you mark it done:
 
 1. Re-read the plan's Overflow section, and take the work it gives your lane. `<run>` and `<plan file>` are at the top of
    your lane rules:

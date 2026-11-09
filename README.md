@@ -36,6 +36,7 @@ work item rather than within a minute.
 | `--where cloud or local` | `cloud` | Where the lanes run |
 | `--autopilot full or policy` | `full` | `full`: nobody is asked anything. `policy`: follow `.github/autopilot.json` |
 | `--code HPH` | Repo name | Gives `HPH-10-30-26-orchestration-plan.md` |
+| `--fixer-account NAME` | Whichever account takes it first | The account the fixer lane is kept for |
 
 ## While it runs
 
@@ -92,6 +93,15 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   as fix slices. A lane is not done while any of its PRs are still open. The lander reads GitHub through REST
   (`fb.py prs`, `fb.py pr-wait`), so it works in cloud sessions, which refuse GraphQL. In a repo whose
   `.github/autopilot.json` says it has its own merge pipeline, the lander leaves merging to it.
+- **Stuck PRs.** A lane that cannot get a PR through (the same real failure twice, two CHANGES verdicts, a conflict
+  outside its paths, or a question for a person) hands it over with `fb.py stuck` and keeps building. Every run has a
+  `fixer` lane, added at publish, that owns no paths and rests until something is handed to it. The PR's files are lent
+  to it until it is resolved, so the guard keeps the lane and the fixer off each other's edits, and the lane's lander
+  drops it from its queue. The fixer routes the fix to Opus, lands it, and resolves it with `fb.py stuck-done` (merged,
+  returned to its lane with a note, or closed). The lane is kept for the account that held it last, or the one
+  `--fixer-account` names, so stuck work stays in one place. Each record says which account hit it and which took it
+  over; `fb.py stuck-list`, `status` and STATUS.md show them, and the PR carries the `fb:stuck` label and a comment
+  with a machine-readable marker that GitHub Throughput's Stuck tab reads.
 - **Tokens.** `fb.py route` picks the model for every task: Opus for security-sensitive work and design, Sonnet for
   pattern work, Haiku for mechanical work, never Fable. Listening and waiting on CI use no tokens.
 - **Autopilot.** On `full` no lane stops to ask. Reversible decisions are logged under "Decided without you". Deleting

@@ -24,7 +24,7 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
 4. Listeners see the bus move. For a local run they claim a lane and start `claude -p` in its own clone. For a cloud run
    they fire the account's routine, and the routine claims from inside the cloud. Whatever is left is printed by
    `prompt`, to paste. (`claude --cloud` is not used: it needs a real terminal, and can stop at interactive dialogs.)
-5. Each lane loops on `tick`. The conductor frees quiet lanes, watches main, reopens lanes with more work, and closes the
+5. Each lane loops on `tick`. A lane stuck on a PR hands it to the `fixer` lane with `stuck` and goes on. The conductor frees quiet lanes, watches main, reopens lanes with more work, and closes the
    run once every lane is done or blocked and the steward has checked the product against the plan.
 
 ## Who gets a lane
@@ -40,6 +40,30 @@ If a repo's rulesets restrict branch creation, allow `fast-builder/**`.
   ahead and within 8 days, or else for 3 hours from `out_of_usage`. `resume` clears it.
 - `job.json` has `min_version`, the version that published the run. A copy older than that does not conduct the run, claim
   in it, or join it, and the conductor tells a person about any listener heard from in the last day that is older.
+
+## Stuck PRs and the fixer lane
+
+`publish` adds a lane named `fixer` to every run: it owns no paths, starts marked done with no claim, and is not
+offered while it rests. `stuck --pr N` (from the lane that owns every file the PR changes) writes
+`runs/<run>/stuck/<N>.json` with the lane and account that hit it, and reopens the fixer lane as `reopen` would.
+
+- **Loans.** While a record is `waiting`, each of its files that its lane owns is on hold: no lane may edit it. Once
+  the fixer takes it, the file is the fixer's and its own lane is still refused. So a file is never two lanes' at once,
+  even while each session's copy of the rules catches up. Only a file the record's lane owns can be lent, and a
+  `loans` key in `lanes.json` is ignored, so a record moves a file from one lane to the fixer and nowhere else.
+  The guard rewrites its session's copy of the rules whenever it re-reads the bus, so a loan or its return reaches
+  every lane within 15 seconds, without waiting for its next tick. Paths compare without regard to case.
+- **Keeping it with one account.** Whoever claims the fixer lane is written to `runs/<run>/fixer.json`. Back on offer,
+  the lane waits for that account while it could take it (listener live, usage left, new enough, room under its lane
+  cap): 15 minutes, or 60 if `--fixer-account` pinned it at draft. Then any account may take it.
+- **GitHub.** The PR gets the label `fb:stuck` and one comment ending in `<!-- fast-builder:stuck {json} -->`, kept up
+  to date as it is taken and resolved; the JSON's `<`, `>` and `&` are escaped. This is best effort: the bus record
+  is what counts, and the command says what failed.
+- **Queues.** `prs --lane fixer` lists the open stuck PRs and `prs --lane <lane>` leaves them out, read from the bus
+  records when there is a session, from the label otherwise.
+- **Resolving.** `stuck-done` by the fixer (`merged`, `returned`, `closed`), or by the lane that hit it while nobody
+  has taken it yet, ends the loan, removes the label, and tells the other side. A label that will not come off is
+  reported, not passed over.
 
 ## Control states
 
