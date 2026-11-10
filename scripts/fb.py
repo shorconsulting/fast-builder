@@ -32,6 +32,8 @@ Layout of the bus:
   runs/<run>/desk.json            which account and computer hold the session a person talks to
   accounts/<account>.json         when this account ran out of usage, and when its limit said it resets
   runs/<run>/msgs/<id>.json       messages between lanes, the conductor and the human
+  runs/<run>/stuck/<pr>.json      a PR a lane handed to the fixer lane: who hit it, why, who took it, how it ended
+  runs/<run>/fixer.json           the account the fixer lane is kept for
 
 See docs/protocol.md. Everything is a subcommand: fb.py --help.
 """
@@ -80,7 +82,7 @@ if WINDOWS:
 NO_WINDOW = {"creationflags": 0x08000000} if WINDOWS else {}  # pythonw has no console, so each child would open its own
 DETACHED = {"creationflags": 0x08000200} if WINDOWS else {"start_new_session": True}  # adds CREATE_NEW_PROCESS_GROUP
 
-VERSION = "0.1.16"
+VERSION = "0.2.0"
 BUS_BRANCH = os.environ.get("FB_BUS_BRANCH", "fast-builder/bus")
 FORMAT = 1
 HOME_DIR = os.environ.get("FB_HOME") or os.path.join(os.path.expanduser("~"), ".config", "fast-builder")
@@ -179,6 +181,18 @@ DRY_MAX_DAYS = 8  # the furthest ahead a limit's own reset time is believed: a w
 RESTART_BACKOFF_SECONDS = 60  # doubled for each restart in a row after the first: a network blip outlasts a minute
 SPREAD_MINUTES = 10  # how long a freed lane waits for an account with no lane before one with a lane may take it
 DEFAULT_LANE_CAP = 2  # lanes one account may hold in a run, unless the job says otherwise
+FIXER = "fixer"  # the lane publish adds to every run: it takes over the PRs other lanes get stuck on
+FIXER_FILE = "fixer.json"  # the account the fixer lane is kept for, so stuck work stays with one account
+FIXER_KEEP_MINUTES = 15  # how long the fixer lane, back on offer, waits for its own account before any account may take it
+FIXER_PINNED_MINUTES = 60  # the same for the account the job named: longer, but never for good
+STUCK_LABEL = "fb:stuck"
+STUCK_MARK = "<!-- fast-builder:stuck "
+STUCK_KINDS = ("ci", "review", "conflict", "question", "other")
+STUCK_OPEN = ("waiting", "taken")
+STUCK_OUTCOMES = ("merged", "returned", "closed")
+STUCK_MAX_FILES = 300  # a PR wider than this is no slice to hand over
+STUCK_REASON_LEN = 500
+ON_HOLD = "-"  # what a waiting stuck PR's files are lent to: no lane, so nobody edits them until the fixer takes the PR
 LISTENER_BEAT_SECONDS = 600
 LISTENER_LIVE_MINUTES = 30  # a listener heard from this recently counts as one that could take a lane
 VOUCH_AFTER_MINUTES = 10  # a lane's own beat this old, and its listener speaks for it if its process is working
@@ -427,7 +441,28 @@ def owner_of(path, lanes):
 
 
 def may_touch(path, lane, lanes):
-    return matches(path, lanes.get("shared_ok", [])) or owner_of(path, lanes) == lane
+    """Shared files are anyone's. A file a stuck PR lent to the fixer lane is the fixer's alone until the PR is resolved,
+    and its own lane's again after. Everything else is its owner's."""
+    if matches(path, lanes.get("shared_ok", [])):
+        return True
+    lent = loan_of(path, lanes)
+    if lent:
+        return lent == lane
+    return owner_of(path, lanes) == lane
+
+
+def loan_of(path, lanes):
+    """The lane a path is lent to, if any. Without regard to case: on macOS and Windows CHARGE.ts is charge.ts."""
+    loans = lanes.get("loans")
+    if not isinstance(loans, dict):
+        return None
+    key = path.casefold()
+    return next((v for k, v in loans.items() if isinstance(k, str) and isinstance(v, str) and k.casefold() == key), None)
+
+
+def holder_of(path, lanes):
+    """Who may edit a path now, for the guard to name: the fixer while it holds the path on loan, else its owner."""
+    return loan_of(path, lanes) or owner_of(path, lanes)
 
 
 def allocate_digits(count):
@@ -636,7 +671,11 @@ def lanes_of(bus, run):
     doc = bus.json("runs/%s/lanes.json" % run)
     rows = doc.get("lanes") if isinstance(doc, dict) else None
     good = [l for l in rows if isinstance(l, dict) and isinstance(l.get("name"), str)] if isinstance(rows, list) else []
-    return dict(doc, lanes=good) if good else {"lanes": []}
+    if not good:
+        return {"lanes": []}
+    out = dict(doc, lanes=good)
+    out.pop("loans", None)  # loans come from the stuck records alone, never from what lanes.json says
+    return out
 
 
 def lane_names(bus, run):
@@ -871,6 +910,8 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
             candidates = names
         open_lanes = [n for n in candidates if not bus.exists("runs/%s/claims/%s.json" % (run, n))]
         if not lane:  # naming a lane is a person's call, and still works; taking whatever is open is not
+            # A resting fixer lane has no claim and nothing to do; one back on offer waits a while for its own account.
+            open_lanes = [n for n in open_lanes if beat_of(bus, run, n).get("status") not in ("done", "blocked") and not fixer_kept_for(bus, run, n, account)]
             cool = [n for n in open_lanes if cooling(bus, run, n, account)]
             open_lanes = [n for n in open_lanes if n not in cool]
             if cool and not open_lanes:
@@ -880,8 +921,13 @@ def claim_lane(bus, run, account, lane=None, where=None, allow_second=False, tok
         won["lane"] = open_lanes[0]
         doc = {"account": account, "at": now_iso(), "session": token, "where": where or bus.doc("runs/%s/job.json" % run).get("where", "cloud")}
         beat = {"at": now_iso(), "status": "working", "account": account, "note": "joined" if token else "claimed"}
-        return {"runs/%s/claims/%s.json" % (run, won["lane"]): dumps(doc),
-                "runs/%s/beats/%s.json" % (run, won["lane"]): dumps(beat)}
+        files = {"runs/%s/claims/%s.json" % (run, won["lane"]): dumps(doc),
+                 "runs/%s/beats/%s.json" % (run, won["lane"]): dumps(beat)}
+        if won["lane"] == fixer_lane(lanes_of(bus, run)):
+            kept = bus.doc("runs/%s/%s" % (run, FIXER_FILE))
+            if kept.get("account") != account and not kept.get("pinned"):
+                files["runs/%s/%s" % (run, FIXER_FILE)] = dumps({"account": account, "at": now_iso(), "pinned": False})
+        return files
 
     bus.commit(mutate, "claim(%s): %s" % (run, account))
     return won.get("lane")
@@ -1122,13 +1168,15 @@ def merge_owner(slug, base):
     return "lander"
 
 
-def lane_queue(slug, lane):
-    """A lane's open PRs, oldest first, read with REST."""
+def lane_queue(slug, lane, stuck=None):
+    """A lane's open PRs, oldest first, read with REST. A stuck PR is the fixer lane's queue, not its own lane's: by the
+    bus's open stuck records when the caller could read them (stuck, a set of PR numbers), else by the label."""
     prs = []
     for page in gh_pages("repos/%s/pulls?state=open&per_page=100" % slug):
         for pr in page if isinstance(page, list) else []:
             labels = [l.get("name") for l in pr.get("labels") or [] if isinstance(l, dict)]
-            if "lane:%s" % lane not in labels:
+            held = pr.get("number") in stuck if stuck is not None else STUCK_LABEL in labels
+            if (not held) if lane == FIXER else (held or "lane:%s" % lane not in labels):
                 continue
             prs.append({"number": pr.get("number"), "title": pr.get("title"), "head": (pr.get("head") or {}).get("ref"),
                         "sha": (pr.get("head") or {}).get("sha"), "base": (pr.get("base") or {}).get("ref"),
@@ -1343,7 +1391,10 @@ def overflow_requests(bus, run, account, files, skip):
         return  # past the deadline it asks again: a run still running is not done, and only a person ends it
     asked = [m.get("body") for m in messages_for(bus, run, "conductor")]
     reopens = reopen_counts(bus, run)
+    fixer = fixer_lane(lanes_of(bus, run))
     for name in names:
+        if name == fixer:
+            continue  # done is where the fixer lane rests between stuck PRs, not a lane that stopped early
         again = " again, after %d reopening%s," % (reopens[name], "" if reopens[name] == 1 else "s") if reopens.get(name) else ""
         body = "Lane %s is marked done%s while other lanes are still working. Find it more work from the plan's Overflow section or the most loaded lane, and hand it over with fb.py reopen --lane %s --body \"the work\", which also restarts the lane if its session has ended." % (name, again, name)
         if beat_of(bus, run, name).get("status") == "done" and body not in asked:
@@ -1666,11 +1717,424 @@ def render_status(bus, fresh=None):
                                                          "%d / %d" % (tally["merged"], tally["open"]) if tally else ("0 / 0" if counted else "-"), note.replace("|", "/")[:80]))
         if counted:
             lines += ["", "PRs merged since the run began, and open now, by `lane:` label, as of %s." % counted]
+        lines += stuck_status_lines(bus, run)
         human = [m for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]
         if human:
             lines += ["", "Waiting on a person:"] + ["- %s: %s" % (m["from"], m["body"]) for m in human]
         lines.append("")
     return "\n".join(lines) + "\n"
+
+
+# Stuck PRs and the fixer lane. A lane that cannot get a PR through hands it to the fixer lane and carries on with its
+# next work item. The PR's files go on loan to the fixer until it is resolved, so the two never edit the same file, and
+# the record says which account hit it and which took it over. Labelled and marked on GitHub too, for dashboards.
+
+
+def fixer_lane(lanes):
+    return next((l["name"] for l in lanes.get("lanes", []) if l.get("fixer") and l["name"] == FIXER), None)
+
+
+def fixer_kept_for(bus, run, lane, account):
+    """The other account the fixer lane is kept for, or None. Whoever held it last, or the account the job named, gets
+    it back while its listener is live and it has usage: for FIXER_KEEP_MINUTES after the lane went back on offer, or
+    for as long as that holds when the job pinned it."""
+    if lane != FIXER or fixer_lane(lanes_of(bus, run)) != FIXER:
+        return None
+    kept = bus.doc("runs/%s/%s" % (run, FIXER_FILE))
+    who = kept.get("account")
+    if not isinstance(who, str) or not NAME_RE.match(who) or who == account:
+        return None
+    listener, job = bus.doc("listeners/%s.json" % who), bus.doc("runs/%s/job.json" % run)
+    if out_of_usage(bus, who) or abs(age_minutes(listener.get("at"))) >= LISTENER_LIVE_MINUTES or cooling(bus, run, lane, who):
+        return None
+    if version_tuple(listener.get("version")) < version_tuple(job.get("min_version")):
+        return None
+    if not (listener.get("local", True) if job.get("where", "cloud") == "local" else listener.get("cloud", True) and listener.get("routine")):
+        return None
+    if len([r for r in lane_table(bus, run) if r["account"] == who and r["status"] in LIVE_BEATS]) >= lane_cap(bus, run):
+        return None  # it could not take the lane, so holding it for that account holds it for nobody
+    waited = abs(age_minutes(beat_of(bus, run, lane).get("at")))
+    if waited >= (FIXER_PINNED_MINUTES if kept.get("pinned") else FIXER_KEEP_MINUTES):
+        return None
+    return who
+
+
+def clean_text(value, limit):
+    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+
+
+def stuck_record(doc):
+    """A stuck record as anyone may read it: anyone can push anything to the bus. None for one that is not one."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("pr"), int) or isinstance(doc.get("pr"), bool) or not 0 < doc["pr"] < 10 ** 8:
+        return None
+    if not NAME_RE.match(str(doc.get("lane"))) or doc.get("state") not in STUCK_OPEN + ("resolved",):
+        return None
+    files = [p for p in doc.get("files") or [] if isinstance(p, str) and p and not p.startswith("/") and ".." not in p.split("/")] if isinstance(doc.get("files"), list) else []
+
+    def who(key):
+        return doc[key] if NAME_RE.match(str(doc.get(key))) else None
+    branch = doc.get("branch") if isinstance(doc.get("branch"), str) and BRANCH_RE.match(doc["branch"]) and ".." not in doc["branch"] else ""
+    return {"pr": doc["pr"], "url": clean_text(doc.get("url"), 300), "branch": branch, "title": clean_text(doc.get("title"), 200),
+            "files": files[:STUCK_MAX_FILES], "lane": doc["lane"], "account": who("account"), "kind": doc.get("kind") if doc.get("kind") in STUCK_KINDS else "other",
+            "reason": clean_text(doc.get("reason"), STUCK_REASON_LEN), "attempts": doc["attempts"] if isinstance(doc.get("attempts"), int) and not isinstance(doc.get("attempts"), bool) else 1,
+            "at": clean_text(doc.get("at"), 40), "state": doc["state"], "claimed_by": who("claimed_by"), "claimed_at": clean_text(doc.get("claimed_at"), 40) or None,
+            "fixer_note": clean_text(doc.get("fixer_note"), STUCK_REASON_LEN) or None, "outcome": doc.get("outcome") if doc.get("outcome") in STUCK_OUTCOMES else None,
+            "resolved_at": clean_text(doc.get("resolved_at"), 40) or None, "resolved_by": who("resolved_by")}
+
+
+def stuck_records(bus, run, open_only=False):
+    out = []
+    for name in bus.listdir("runs/%s/stuck" % run):
+        if re.match(r"^\d{1,8}\.json\Z", name):
+            rec = stuck_record(bus.json("runs/%s/stuck/%s" % (run, name)))
+            if rec and rec["pr"] == int(name[:-5]) and (rec["state"] in STUCK_OPEN or not open_only):
+                out.append(rec)
+    return sorted(out, key=lambda r: (r["at"], r["pr"]))
+
+
+def loans_of(bus, run, lanes):
+    """{path: lane} for every file of an open stuck PR: the fixer's once it has taken the PR, on hold for nobody while it
+    waits, so the file is never two lanes' at once even while copies of the rules catch up. Only a file its own lane
+    owns can be lent, so a record can move a file from its lane to the fixer and nowhere else."""
+    fixer = fixer_lane(lanes)
+    names = set(l["name"] for l in lanes.get("lanes", []))
+    out = {}
+    if not fixer:
+        return out
+    for rec in stuck_records(bus, run, open_only=True):
+        if rec["lane"] == fixer or rec["lane"] not in names:
+            continue
+        for path in rec["files"]:
+            if not matches(path, lanes.get("shared_ok", [])) and owner_of(path, lanes) == rec["lane"]:
+                out[path] = fixer if rec["state"] == "taken" else ON_HOLD
+    return out
+
+
+def lane_rules(bus, run):
+    """lanes.json as a lane session keeps it for its hooks: ownership, plus what stuck PRs have lent the fixer."""
+    doc = lanes_of(bus, run)
+    doc["loans"] = loans_of(bus, run, doc)
+    return doc
+
+
+def save_lane_rules(bus, session, path):
+    write_file(os.path.join(os.path.dirname(path), "lanes.json"), dumps(lane_rules(bus, session["run"])))
+
+
+def gh_rows(path):
+    """Every row of a paged REST list."""
+    return [row for page in gh_pages(path) if isinstance(page, list) for row in page]
+
+
+def gh_json(args, stdin=None, timeout=60):
+    proc = run_cmd(["gh", "api"] + args, check=False, timeout=timeout, stdin_text=stdin)
+    if proc.returncode != 0:
+        raise FbError("gh api %s: %s" % (args[-1] if args else "", (proc.stderr or proc.stdout).strip()[:200]))
+    return proc.stdout
+
+
+def pr_facts(slug, number):
+    """The PR's state, head and changed files, from GitHub."""
+    if not shutil.which("gh"):
+        raise FbError("gh is not installed, so the PR cannot be looked up")
+    pr = (gh_pages("repos/%s/pulls/%d" % (slug, number)) or [None])[0]
+    if not isinstance(pr, dict):
+        raise FbError("PR #%d: GitHub said something unexpected" % number)
+    files = gh_rows("repos/%s/pulls/%d/files?per_page=100" % (slug, number))
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    names = []
+    for row in files:
+        if isinstance(row, dict) and isinstance(row.get("filename"), str):
+            names.append(row["filename"])
+            if isinstance(row.get("previous_filename"), str):  # a rename takes the old path away from its lane too
+                names.append(row["previous_filename"])
+    ref = head.get("ref")
+    return {"state": "merged" if pr.get("merged_at") else str(pr.get("state")), "branch": ref if isinstance(ref, str) and BRANCH_RE.match(ref) and ".." not in ref else "", "url": clean_text(pr.get("html_url"), 300),
+            "title": clean_text(pr.get("title"), 200), "files": sorted(set(names))}
+
+
+def stuck_marker(rec, run):
+    """The machine-readable line dashboards read. < and > are escaped, so nothing in it can end the HTML comment."""
+    doc = {"v": 1, "run": run, "lane": rec["lane"], "account": rec["account"], "kind": rec["kind"], "reason": rec["reason"], "at": rec["at"], "attempts": rec["attempts"],
+           "claimed_by": rec["claimed_by"], "claimed_at": rec["claimed_at"], "fixer_note": rec["fixer_note"], "state": rec["state"], "outcome": rec["outcome"]}
+    return STUCK_MARK + json.dumps(doc, sort_keys=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026") + " -->"
+
+
+def stuck_comment(rec, run):
+    def plain(text):
+        return (text or "").replace("<", "&lt;").replace(">", "&gt;")
+    if rec["state"] == "resolved":
+        lines = ["**fast-builder: no longer stuck** (%s by `%s`)." % (rec["outcome"], rec["resolved_by"] or "-")]
+        if rec["fixer_note"]:
+            lines.append("Note: " + plain(rec["fixer_note"]))
+    else:
+        lines = ["**fast-builder: this PR is stuck** (%s). Lane `%s` on account `%s` handed it to the fixer lane after %d attempt%s:" % (
+            rec["kind"], rec["lane"], rec["account"] or "-", rec["attempts"], "" if rec["attempts"] == 1 else "s"), "", "> " + plain(rec["reason"]), ""]
+        lines.append("Fixer: taken by `%s` at %s." % (rec["claimed_by"], rec["claimed_at"]) if rec["claimed_by"] else "Fixer: not taken yet.")
+        if rec["fixer_note"]:
+            lines.append("Fixer note: " + plain(rec["fixer_note"]))
+    return "\n".join(lines) + "\n\n" + stuck_marker(rec, run) + "\n"
+
+
+def stuck_on_github(slug, rec, run):
+    """Label the PR and keep one marker comment on it current. Best effort: the bus record is what counts, so this says
+    what went wrong rather than failing the command."""
+    if not shutil.which("gh"):
+        return "gh is not installed"
+    problems = []
+    try:
+        if rec["state"] == "resolved":
+            proc = run_cmd(["gh", "api", "-X", "DELETE", "repos/%s/issues/%d/labels/%s" % (slug, rec["pr"], urllib.parse.quote(STUCK_LABEL, safe=""))], check=False, timeout=30)
+            said = (proc.stderr or proc.stdout or "").strip()
+            if proc.returncode != 0 and "404" not in said and "Label does not exist" not in said:
+                raise FbError("%s is still on PR #%d (%s): remove it by hand, or dashboards keep showing it stuck" % (STUCK_LABEL, rec["pr"], said[:150]))
+        else:
+            run_cmd(["gh", "api", "-X", "POST", "repos/%s/labels" % slug, "--input", "-"], check=False, timeout=30,
+                    stdin_text=json.dumps({"name": STUCK_LABEL, "color": "d93f0b", "description": "fast-builder: handed to the fixer lane"}))
+            gh_json(["-X", "POST", "repos/%s/issues/%d/labels" % (slug, rec["pr"]), "--input", "-"], stdin=json.dumps({"labels": [STUCK_LABEL]}), timeout=30)
+    except FbError as exc:
+        problems.append("label: %s" % exc)
+    try:
+        me = (gh_pages("user") or [{}])[0].get("login")
+        comments = gh_rows("repos/%s/issues/%d/comments?per_page=100" % (slug, rec["pr"]))
+        ours = [c for c in comments if isinstance(c, dict) and STUCK_MARK in str(c.get("body")) and isinstance(c.get("id"), int)
+                and isinstance(c.get("user"), dict) and c["user"].get("login") == me]
+        body = json.dumps({"body": stuck_comment(rec, run)})
+        if ours:
+            gh_json(["-X", "PATCH", "repos/%s/issues/comments/%d" % (slug, ours[-1]["id"]), "--input", "-"], stdin=body, timeout=30)
+        elif rec["state"] != "resolved":
+            gh_json(["-X", "POST", "repos/%s/issues/%d/comments" % (slug, rec["pr"]), "--input", "-"], stdin=body, timeout=30)
+    except (FbError, ValueError) as exc:
+        problems.append("comment: %s" % exc)
+    return "; ".join(problems) or "ok"
+
+
+def stuck_brief(rec):
+    return ("PR #%d (%s, branch %s) is stuck and handed to you by lane %s on account %s: %s: %s. Its files are lent to this lane until "
+            "you resolve it. fb.py stuck-list shows the queue; fb.py stuck-take --pr %d starts it." % (
+                rec["pr"], rec["title"] or "untitled", rec["branch"] or "?", rec["lane"], rec["account"] or "?", rec["kind"], rec["reason"], rec["pr"]))
+
+
+def update_stuck(bus, run, number, change, message_text):
+    """Fetch, change one stuck record with change(rec, files) and write it back, in one bus commit. Returns the record."""
+    got = {}
+
+    def mutate():
+        rel = "runs/%s/stuck/%d.json" % (run, number)
+        rec = stuck_record(bus.json(rel))
+        files = {}
+        rec = change(rec, files)
+        got["rec"] = rec
+        if rec is None:
+            return {}
+        files[rel] = dumps(rec)
+        return files
+
+    bus.commit(mutate, message_text)
+    return got.get("rec")
+
+
+def lane_session(cmd):
+    session, path, bus = need_session()
+    bus.sync()
+    claim = bus.doc("runs/%s/claims/%s.json" % (session["run"], session["lane"]))
+    if not holds_claim(claim, session):
+        raise Lost("this session no longer holds lane %s: %s is not yours to run" % (session["lane"], cmd))
+    return session, path, bus
+
+
+def cmd_stuck(args):
+    session, path, bus = lane_session("stuck")
+    run, lane, account = session["run"], session["lane"], session["account"]
+    rules = lane_rules(bus, run)
+    fixer = fixer_lane(rules)
+    if not fixer:
+        raise FbError("run %s has no fixer lane (it was published before fast-builder 0.2.0): mark the lane blocked or ask the conductor instead" % run)
+    if lane == fixer:
+        raise FbError("the fixer lane cannot hand a PR to itself: hand it back with fb.py stuck-done --outcome returned, or mark the lane blocked")
+    slug = repo_slug(bus.remote)
+    bus.release()  # gh must not hold the bus checkout
+    facts = pr_facts(slug, args.pr)
+    if facts["state"] != "open":
+        raise FbError("PR #%d is %s, not open: nothing to hand over" % (args.pr, facts["state"]))
+    if not facts["files"]:
+        raise FbError("PR #%d changes no files GitHub can list" % args.pr)
+    if len(facts["files"]) > STUCK_MAX_FILES:
+        raise FbError("PR #%d changes %d files, more than %d: split it before handing it over" % (args.pr, len(facts["files"]), STUCK_MAX_FILES))
+    outside = [p for p in facts["files"] if not may_touch(p, lane, rules)]
+    if outside:
+        raise FbError("PR #%d changes files lane %s does not hold, so it is not this lane's to hand over: %s" % (args.pr, lane, ", ".join(outside[:5])))
+    reason = clean_text(args.reason, STUCK_REASON_LEN)
+    if not reason:
+        raise FbError("say why it is stuck with --reason")
+    did = {}
+
+    def change(rec, files):
+        if rec and rec["state"] in STUCK_OPEN:
+            if rec["lane"] != lane:
+                raise FbError("PR #%d is already on the fixer's list from lane %s" % (args.pr, rec["lane"]))
+            rec.update(kind=args.kind, reason=reason, attempts=max(rec["attempts"], args.attempts))
+            did["did"] = "updated"
+            add_message(files, run, lane, fixer, "note", "PR #%d is still stuck: %s" % (args.pr, reason))
+            return rec
+        rec = {"pr": args.pr, "url": facts["url"], "branch": facts["branch"], "title": facts["title"], "files": facts["files"], "lane": lane, "account": account,
+               "kind": args.kind, "reason": reason, "attempts": args.attempts, "at": now_iso(), "state": "waiting", "claimed_by": None, "claimed_at": None,
+               "fixer_note": None, "outcome": None, "resolved_at": None, "resolved_by": None}
+        did["fixer"] = reopen_lane(bus, run, fixer, lane, stuck_brief(rec), files)
+        did["did"] = "handed over"
+        return rec
+
+    rec = update_stuck(bus, run, args.pr, change, "stuck(%s): %s hands PR #%d to %s" % (run, lane, args.pr, fixer))
+    bus.sync()
+    save_lane_rules(bus, session, path)
+    bus.release()
+    github = stuck_on_github(slug, rec, run)
+    out({"pr": args.pr, "did": did.get("did"), "fixer": did.get("fixer", "told"), "account": account, "lent": len(loans_of(bus, run, lanes_of(bus, run))), "github": github,
+         "next": "Take PR #%d out of your lander's queue and leave its branch alone: its files are lent to the fixer lane until it is resolved, and the guard "
+                 "refuses edits to them here. Carry on with your next work item; a slice that needs those files waits." % args.pr})
+
+
+def fixer_session(cmd):
+    session, path, bus = lane_session(cmd)
+    if session["lane"] != fixer_lane(lanes_of(bus, session["run"])):
+        raise FbError("%s is for the fixer lane, and this is lane %s" % (cmd, session["lane"]))
+    return session, path, bus
+
+
+def stuck_numbers():
+    """The open stuck PRs of this session's run, or None when there is no session or the bus cannot be read."""
+    session = load_session()[0]
+    if not session:
+        return None
+    bus = Bus(session["remote"], session["account"])
+    try:
+        bus.sync()
+        return set(r["pr"] for r in stuck_records(bus, session["run"], open_only=True))
+    except FbError:
+        return None
+    finally:
+        bus.release()
+
+
+def cmd_stuck_list(args):
+    bus = get_bus(args)
+    if not bus.sync():
+        raise FbError("no bus on this repo yet")
+    run = pick_run(bus, args)
+    rows = stuck_records(bus, run, open_only=not args.all)
+    out({"run": run, "stuck": rows, "lent": len(loans_of(bus, run, lanes_of(bus, run)))})
+
+
+def cmd_stuck_take(args):
+    session, path, bus = fixer_session("stuck-take")
+    run, account = session["run"], session["account"]
+
+    def change(rec, files):
+        if not rec or rec["state"] not in STUCK_OPEN:
+            raise FbError("PR #%d is not on the stuck list" % args.pr)
+        if rec["state"] == "taken" and rec["claimed_by"] == account:
+            return rec
+        rec.update(state="taken", claimed_by=account, claimed_at=now_iso())
+        add_message(files, run, session["lane"], rec["lane"], "note", "The fixer lane (%s) has taken PR #%d over. Leave its branch alone until it is resolved." % (account, args.pr))
+        return rec
+
+    rec = update_stuck(bus, run, args.pr, change, "stuck(%s): %s takes PR #%d" % (run, account, args.pr))
+    bus.sync()
+    save_lane_rules(bus, session, path)
+    slug = repo_slug(bus.remote)
+    bus.release()
+    out({"pr": args.pr, "record": rec, "github": stuck_on_github(slug, rec, run),
+         "next": "git fetch origin %s and work on that branch. Its files are lent to you; fb.py stuck-widen adds one more of its lane's files. Resolve it with fb.py stuck-done." % (rec["branch"] or "<its branch>")})
+
+
+def cmd_stuck_widen(args):
+    session, path, bus = fixer_session("stuck-widen")
+    run = session["run"]
+    lanes = lanes_of(bus, run)
+    paths = [clean_path(p) for p in args.path]
+
+    def change(rec, files):
+        if not rec or rec["state"] not in STUCK_OPEN:
+            raise FbError("PR #%d is not on the stuck list" % args.pr)
+        lent = loans_of(bus, run, lanes)
+        for p in paths:
+            if not p or p.startswith("/") or ".." in p.split("/"):
+                raise FbError("bad path %r" % p)
+            if owner_of(p, lanes) != rec["lane"]:
+                raise FbError("%s belongs to lane %s, not %s, so PR #%d cannot borrow it: ask that lane with fb.py send" % (p, owner_of(p, lanes), rec["lane"], args.pr))
+            if p not in rec["files"] and p in lent:
+                raise FbError("%s is already lent for another stuck PR" % p)
+        if len(set(rec["files"]) | set(paths)) > STUCK_MAX_FILES:
+            raise FbError("that would lend more than %d files" % STUCK_MAX_FILES)
+        rec["files"] = sorted(set(rec["files"]) | set(paths))
+        add_message(files, run, session["lane"], rec["lane"], "note", "The fixer lane borrowed %s for PR #%d too." % (", ".join(paths), args.pr))
+        return rec
+
+    rec = update_stuck(bus, run, args.pr, change, "stuck(%s): widen PR #%d" % (run, args.pr))
+    bus.sync()
+    save_lane_rules(bus, session, path)
+    out({"pr": args.pr, "files": rec["files"]})
+
+
+def cmd_stuck_done(args):
+    session, path, bus = lane_session("stuck-done")
+    run, lane, account = session["run"], session["lane"], session["account"]
+    fixer = fixer_lane(lanes_of(bus, run))
+    note = clean_text(args.note, STUCK_REASON_LEN)
+
+    def change(rec, files):
+        if not rec or rec["state"] not in STUCK_OPEN:
+            raise FbError("PR #%d is not on the stuck list" % args.pr)
+        if lane not in (fixer, rec["lane"]):
+            raise FbError("PR #%d is lane %s's and the fixer's to resolve, not lane %s's" % (args.pr, rec["lane"], lane))
+        if lane != fixer and rec["state"] != "waiting":
+            raise FbError("the fixer lane (%s) has taken PR #%d and may be editing it: ask it to hand it back with fb.py send --to %s --kind request --body ..." % (rec["claimed_by"], args.pr, fixer))
+        rec.update(state="resolved", outcome=args.outcome, resolved_at=now_iso(), resolved_by=account, fixer_note=note or rec["fixer_note"])
+        if lane == fixer:
+            said = {"merged": "fixed and merged", "returned": "handed back to you", "closed": "closed"}[args.outcome]
+            kind = "request" if args.outcome == "returned" else "note"
+            add_message(files, run, lane, rec["lane"], kind, "PR #%d was %s by the fixer lane (%s)%s. Its files are yours again." % (args.pr, said, account, ": " + note if note else ""))
+        else:
+            add_message(files, run, lane, fixer, "note", "Lane %s took PR #%d back (%s)%s. Drop it." % (lane, args.pr, args.outcome, ": " + note if note else ""))
+        return rec
+
+    rec = update_stuck(bus, run, args.pr, change, "stuck(%s): PR #%d %s" % (run, args.pr, args.outcome))
+    bus.sync()
+    save_lane_rules(bus, session, path)
+    left = len(stuck_records(bus, run, open_only=True))
+    slug = repo_slug(bus.remote)
+    bus.release()
+    out({"pr": args.pr, "outcome": args.outcome, "still_stuck": left, "github": stuck_on_github(slug, rec, run)})
+
+
+def fixer_tick(bus, session, result):
+    """The fixer lane's tick: its queue, and what to do with it."""
+    run = session["run"]
+    rows = stuck_records(bus, run, open_only=True)
+    mine = [r for r in rows if r["state"] == "taken" and r["claimed_by"] == session["account"]]
+    waiting = [r for r in rows if r["state"] == "waiting"]
+    result["stuck"] = {"waiting": [r["pr"] for r in waiting], "taken_by_you": [r["pr"] for r in mine],
+                       "taken_by_others": [r["pr"] for r in rows if r["state"] == "taken" and r["claimed_by"] != session["account"]]}
+    if result["action"] != GO:
+        return
+    if mine:
+        result["instruction"] = "Carry on with PR #%d; resolve it with fb.py stuck-done before taking the next." % mine[0]["pr"]
+    elif waiting:
+        result["instruction"] = "%d stuck PR%s waiting. Take the oldest: fb.py stuck-take --pr %d." % (len(waiting), "" if len(waiting) == 1 else "s", waiting[0]["pr"])
+    elif not rows:
+        result["instruction"] = "Nothing is stuck. Run fb.py lane-state done --note \"queue empty\" and end the session: the lane is reopened, for this account first, when a PR gets stuck."
+    if result.get("main", {}).get("state") == "red":
+        result["instruction"] += " Main is red at %s; that is the steward lane's to fix, not yours." % result["main"]["sha"][:7]
+
+
+def stuck_status_lines(bus, run):
+    rows = stuck_records(bus, run, open_only=True)
+    if not rows:
+        return []
+    lines = ["", "Stuck PRs, handed to the fixer lane:", "", "| PR | Lane | Hit by | Kind | Since | Fixer | Reason |", "|---|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append("| #%d | %s | %s | %s | %s | %s | %s |" % (r["pr"], r["lane"], r["account"] or "-", r["kind"], r["at"], r["claimed_by"] or "**not taken**", r["reason"].replace("|", "/")[:120]))
+    return lines
 
 
 # Validation: the proof that lanes cannot overlap, and the gate publish goes through.
@@ -1705,6 +2169,10 @@ def validate(draft, files=None):
     for name in names:
         if not NAME_RE.match(name):
             errors.append("bad lane name: %r" % name)
+    if FIXER in names or any(l.get("fixer") for l in rows):
+        errors.append("lane name %s is taken: publish adds the fixer lane to every run itself" % FIXER)
+    if job.get("fixer_account") is not None and not NAME_RE.match(str(job.get("fixer_account"))):
+        errors.append("bad fixer account name")
     stewards = [l["name"] for l in rows if l.get("steward")]
     if len(stewards) != 1:
         errors.append("exactly one lane must be the steward (it owns everything no other lane does); found %d" % len(stewards))
@@ -2054,11 +2522,25 @@ def kit_files():
     return out
 
 
+FIXER_RULES = """# Lane fixer (run {run})
+
+This lane owns no paths of its own. It takes over the PRs other lanes get stuck on, so they keep building.
+
+- Read docs/fixer.md in the kit beside lane-lead.md and follow it in place of lane-lead.md's build loop. Ticking, handoffs,
+  the stop switch and lane-state work as lane-lead.md says.
+- You may edit only the files of a stuck PR on your list (`fb.py stuck-list`). They are lent to you while it is open and
+  go back to their lane when you resolve it with `fb.py stuck-done`. `fb.py stuck-widen` borrows one more of that lane's files.
+- Work on the stuck PR's own branch. Never start new features.
+- Queue empty: `fb.py lane-state done`. The lane is reopened, for this account first, when the next PR gets stuck.
+
+Done means: every PR handed to this lane is merged, closed, or handed back with a note saying what its lane must do.
+"""
+
 BOOTSTRAP = """You are the account orchestrator for lane {lane} of fast-builder run {run} on account {account}. Set up, then follow the lane brief.
 
 git fetch -q origin +refs/heads/{bus}:refs/remotes/origin/fb-bus
 mkdir -p .git/fast-builder-kit
-for f in fb.py docs/lane-lead.md docs/conductor.md; do mkdir -p ".git/fast-builder-kit/$(dirname "$f")"; git show "refs/remotes/origin/fb-bus:kit/$f" > ".git/fast-builder-kit/$f"; done
+for f in fb.py docs/lane-lead.md docs/conductor.md docs/fixer.md; do mkdir -p ".git/fast-builder-kit/$(dirname "$f")"; git show "refs/remotes/origin/fb-bus:kit/$f" > ".git/fast-builder-kit/$f"; done
 export FB="$(pwd)/.git/fast-builder-kit/fb.py"
 python3 "$FB" join --run {run} --lane {lane} --account {account}
 
@@ -2157,6 +2639,8 @@ def control_action(session, path):
         else:
             bus.sync()
             action = build_tick(bus, session)["action"]
+            if action in (GO, DRAIN, PAUSE):
+                save_lane_rules(bus, session, path)  # a loan made or ended elsewhere reaches this guard within the cache's life
         write_file(cache, json.dumps({"ts": time.time(), "sha": sha, "action": action}))
         if action in (GO, DRAIN) and time.time() - session.get("last_beat", 0) >= BEAT_SECONDS:
             # A lead waiting on a long subagent runs no tick, but that subagent's tool calls come through here.
@@ -2280,7 +2764,13 @@ def guard_lane_call(payload, cwd, session, path):
     if writes:
         rel = repo_relative(target, cwd, path)
         if rel and not may_touch(rel, session["lane"], lanes):
-            deny("fast-builder: %s belongs to lane %s, not %s. Ask for it with: fb.py send --to %s --kind request --body ..." % (rel, owner_of(rel, lanes), session["lane"], owner_of(rel, lanes)))
+            holder = holder_of(rel, lanes)
+            if holder == ON_HOLD:
+                deny("fast-builder: %s is changed by a stuck PR waiting for the fixer lane, so nobody edits it until the fixer takes the PR. Take the next work item that does not need it." % rel)
+            elif holder != owner_of(rel, lanes):
+                deny("fast-builder: %s is lent to lane %s while a stuck PR that changes it is fixed, so lane %s leaves it alone until then. Take the next work item that does not need it." % (rel, holder, session["lane"]))
+            else:
+                deny("fast-builder: %s belongs to lane %s, not %s. Ask for it with: fb.py send --to %s --kind request --body ..." % (rel, holder, session["lane"], holder))
         return
     if PUSH_BASH.search(command):
         bad = out_of_lane(cwd, session, lanes)
@@ -2988,7 +3478,8 @@ def pick_lane(bus, run, account, skip=()):
     if out_of_usage(bus, account) or too_old(bus, run):
         return None
     table = lane_table(bus, run)
-    open_lanes = [r["lane"] for r in table if r["account"] is None and r["lane"] not in skip and not cooling(bus, run, r["lane"], account)]
+    open_lanes = [r["lane"] for r in table if r["account"] is None and r["status"] not in ("done", "blocked") and r["lane"] not in skip
+                  and not cooling(bus, run, r["lane"], account) and not fixer_kept_for(bus, run, r["lane"], account)]
     if not open_lanes:
         return None
     held = [r for r in table if r["account"] == account]
@@ -3569,7 +4060,7 @@ def cmd_draft(args):
     job = {"run": run, "repo": slug, "code": code.upper(), "stamp": today.strftime("%m-%d-%y"), "kicked_off": now_iso(), "goal": args.goal,
            "accounts": args.accounts or 0, "max_accounts": max_accounts, "where": args.where or "cloud", "autopilot": args.autopilot or "full",
            "plan_file": plan_file, "deadline": args.deadline, "base": args.base or default_branch(), "created_by": bus.account, "lane_model": args.lane_model, "sizing": "",
-           "min_version": VERSION, "lane_cap": args.lane_cap or DEFAULT_LANE_CAP}
+           "min_version": VERSION, "lane_cap": args.lane_cap or DEFAULT_LANE_CAP, "fixer_account": args.fixer_account}
     write_file(os.path.join(draft, "job.json"), dumps(job))
     out({"draft": draft, "run": run, "plan_file": plan_file, "max_accounts": max_accounts, "where": job["where"], "autopilot": job["autopilot"]})
 
@@ -3632,12 +4123,18 @@ def cmd_publish(args):
         if bus.exists("runs/%s/job.json" % run):
             raise Taken("run %s already exists" % run)
         prefix = "runs/%s/" % run
-        files = {prefix + "job.json": read_text(os.path.join(args.draft, "job.json")), prefix + "lanes.json": read_text(os.path.join(args.draft, "lanes.json")),
+        lanes = read_json(os.path.join(args.draft, "lanes.json"))
+        lanes["lanes"].append({"name": FIXER, "fixer": True, "owns": [], "modules": [], "digits": []})
+        files = {prefix + "job.json": read_text(os.path.join(args.draft, "job.json")), prefix + "lanes.json": dumps(lanes),
+                 prefix + "lanes/%s.md" % FIXER: FIXER_RULES.format(run=run),
+                 prefix + "beats/%s.json" % FIXER: dumps({"at": now_iso(), "status": "done", "account": None, "note": "nothing stuck yet"}),
                  prefix + job["plan_file"]: read_text(os.path.join(args.draft, job["plan_file"])),
                  prefix + "control.json": dumps({"state": "running", "reason": "kickoff", "by": bus.account, "at": now_iso()}),
                  prefix + "desk.json": dumps({"account": bus.account, "computer": socket.gethostname(), "since": now_iso()})}
         for name in os.listdir(os.path.join(args.draft, "lanes")):
-            files[prefix + "lanes/" + name] = read_text(os.path.join(args.draft, "lanes", name))
+            files.setdefault(prefix + "lanes/" + name, read_text(os.path.join(args.draft, "lanes", name)))
+        if NAME_RE.match(str(job.get("fixer_account"))):
+            files[prefix + FIXER_FILE] = dumps({"account": job["fixer_account"], "at": now_iso(), "pinned": True})
         files.update(kit_files())
         settings = bus.doc("settings.json") or {"format": FORMAT}
         settings["max_accounts"] = job["max_accounts"]
@@ -3679,7 +4176,7 @@ def cmd_join(args):
     if not path:
         raise FbError("join from inside a clone of the repo")
     save_session(path, {"run": run, "lane": lane, "account": account, "remote": bus.remote, "autopilot": job.get("autopilot"), "base": job.get("base", "main"), "joined": now_iso(), "token": token})
-    write_file(os.path.join(os.path.dirname(path), "lanes.json"), dumps(lanes_of(bus, run)))
+    write_file(os.path.join(os.path.dirname(path), "lanes.json"), dumps(lane_rules(bus, run)))
     print("JOINED run=%s lane=%s account=%s where=%s autopilot=%s" % (run, lane, account, claim.get("where"), job.get("autopilot")))
     print("\n--- LANE RULES (binding) ---\n")
     print(bus.read("runs/%s/lanes/%s.md" % (run, lane), ""))
@@ -3744,6 +4241,8 @@ def cmd_tick(args):
     bus.sync()
     result = build_tick(bus, session)
     remember_control(path, result["action"])
+    if result["action"] in (GO, DRAIN, PAUSE):
+        save_lane_rules(bus, session, path)  # what stuck PRs lent or gave back since the last tick reaches this lane's guard
     if result["action"] == LOST:
         saved = keep_lost_work(bus, session, path)
         if saved:
@@ -3764,6 +4263,8 @@ def cmd_tick(args):
     result["main"] = main_view(bus, session["run"])  # after conducting: it may just have learned this
     if result["main"]["state"] == "red" and result["action"] == GO:
         result["instruction"] = (MAIN_RED_STEWARD if is_steward(bus, session["run"], session["lane"]) else MAIN_RED_OTHER) % result["main"]["sha"][:7]
+    if session["lane"] == fixer_lane(lanes_of(bus, session["run"])):
+        fixer_tick(bus, session, result)
     if result["inbox"]:
         session["seen"] = (session.get("seen", []) + [m["id"] for m in result["inbox"]])[-1000:]
     session["stop_blocks"] = 0
@@ -4009,6 +4510,7 @@ def cmd_status(args):
         job = bus.doc("runs/%s/job.json" % run)
         report.append({"run": run, "goal": job.get("goal"), "where": job.get("where"), "autopilot": job.get("autopilot"), "state": run_state(bus, run)["state"],
                        "main": main_view(bus, run), "main_session": main_session(bus, run), "lanes": with_prs(bus, run), "conductor": bus.doc("runs/%s/conductor.json" % run).get("holder"),
+                       "stuck": stuck_records(bus, run, open_only=True), "fixer_kept_for": bus.doc("runs/%s/%s" % (run, FIXER_FILE)).get("account"),
                        "needs_human": [m["body"] for m in messages_for(bus, run, "human") if m.get("kind") == "needs-human"]})
     dry = [{"account": n[:-5], "at": out_of_usage(bus, n[:-5])} for n in bus.listdir("accounts") if n.endswith(".json") and out_of_usage(bus, n[:-5])]
     out({"runs": report, "out_of_usage": dry, "listeners": [dict(bus.doc("listeners/" + n), stale=age_minutes(bus.doc("listeners/" + n).get("at")) > 90) for n in bus.listdir("listeners")]})
@@ -4064,7 +4566,7 @@ def cmd_prs(args):
     if not (isinstance(lane, str) and NAME_RE.match(lane)):
         raise FbError("which lane? pass --lane")
     base = args.base or default_branch()
-    out({"lane": lane, "base": base, "merge_by": merge_owner(slug, base), "prs": lane_queue(slug, lane)})
+    out({"lane": lane, "base": base, "merge_by": merge_owner(slug, base), "prs": lane_queue(slug, lane, stuck_numbers())})
 
 
 def cmd_pr_wait(args):
@@ -4495,6 +4997,7 @@ def build_parser():
     p.add_argument("--base")
     p.add_argument("--lane-model", default="opus")
     p.add_argument("--lane-cap", type=int, choices=range(1, 21), metavar="N", help="most lanes one account may hold (default %d)" % DEFAULT_LANE_CAP)
+    p.add_argument("--fixer-account", help="the account the fixer lane is kept for (default: whichever takes it first)")
     p.add_argument("--dir")
     p.add_argument("--today", help="YYYY-MM-DD")
 
@@ -4527,6 +5030,28 @@ def build_parser():
     p = add("tick", cmd_tick, help="heartbeat, read control and inbox")
     p.add_argument("--note")
     p.add_argument("--exit-code", action="store_true")
+
+    p = add("stuck", cmd_stuck, help="hand a PR this lane is stuck on to the fixer lane, and carry on")
+    p.add_argument("--pr", type=int, required=True)
+    p.add_argument("--kind", choices=STUCK_KINDS, required=True)
+    p.add_argument("--reason", required=True, help="what is wrong and what was tried")
+    p.add_argument("--attempts", type=int, default=1)
+
+    p = add("stuck-list", cmd_stuck_list, help="the PRs handed to the fixer lane, and who hit and took each")
+    p.add_argument("--run")
+    p.add_argument("--all", action="store_true", help="resolved ones too")
+
+    p = add("stuck-take", cmd_stuck_take, help="fixer lane: take a stuck PR over")
+    p.add_argument("--pr", type=int, required=True)
+
+    p = add("stuck-widen", cmd_stuck_widen, help="fixer lane: borrow more of a stuck PR's lane's files")
+    p.add_argument("--pr", type=int, required=True)
+    p.add_argument("--path", action="append", required=True)
+
+    p = add("stuck-done", cmd_stuck_done, help="resolve a stuck PR: merged, returned to its lane, or closed")
+    p.add_argument("--pr", type=int, required=True)
+    p.add_argument("--outcome", choices=STUCK_OUTCOMES, required=True)
+    p.add_argument("--note")
 
     p = add("lane-state", cmd_lane_state, help="set this lane's status")
     p.add_argument("status", choices=["working", "blocked", "done", "stopped"])
