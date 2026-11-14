@@ -1,0 +1,202 @@
+# Build Autopilot gate (v2). Installed by `/autopilot apply`; see build-autopilot docs/v2-install.md.
+#
+# On every pull request in a repo whose default branch has .github/autopilot.json:
+#   review  - Claude (Opus) reviews the change; sensitive files get a second, adversarial security review.
+#   decide  - posts the plain-English verdict and the `autopilot/gate` check run (owned by the app; only it can
+#             write it), and turns GitHub auto-merge on
+#             (level auto-merge / autopilot, reviews approve) or off. Never for changes to the settings, the gate or
+#             any workflow.
+#   mark    - first, starts a fresh "pending" check run (or "failure" when the PR is closed unmerged), so no older result
+#             for the same commit can be used while this run works.
+#   command - (first attempt only; a re-run replays the old comment, so it is refused)
+#             `/autopilot approve <full commit id>` (admins, maintainers) signs off exactly that commit;
+#             `/autopilot stop` (anyone who can push) puts the PR on hold; `/autopilot resume` (admins,
+#             maintainers) lifts the hold.
+# Every gate comment ends with "Decided without you": what automation chose on a person's behalf, why, and how
+# to undo it (or "nothing").
+#
+# Why it is safe to run on pull requests:
+#   - pull_request_target always runs this file, and checks out the code, from the DEFAULT branch. A pull request
+#     cannot change the gate or the settings it is judged by.
+#   - Nothing from the pull request is executed. gate.py fetches its commits as data and diffs them.
+#   - Secrets live in two environments that only the default branch may use, so a workflow added by a pull request
+#     (which runs on refs/pull/N/merge) can't read them, and can't write the required check run as the app.
+# Do not add steps that check out, build, install or run the pull request's code to this file.
+
+name: autopilot
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, edited, labeled, unlabeled, closed]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+# No workflow-level concurrency: comments, label changes and edits must never cancel a review, a hold or an
+# approval. Only the review and decide jobs of the same pull request replace each other (a newer push wins).
+
+jobs:
+  mark:
+    name: autopilot mark
+    # Runs for drafts on close and on push too: closing unmerged must always mark the commit, and every push's sender
+    # is recorded (a later ready_for_review gathers them).
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (contains(fromJSON('["closed", "synchronize"]'), github.event.action) || !github.event.pull_request.draft) &&
+      (github.event.action != 'edited' || github.event.changes.base) &&
+      (!contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) ||
+       github.event.label.name == 'autopilot-hold')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: autopilot
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default branch (never the pull request)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Build Autopilot app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOPILOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOPILOT_APP_PRIVATE_KEY }}
+          permission-checks: write
+      - name: Mark the commit
+        env:
+          AUTOPILOT_TOKEN: ${{ steps.app.outputs.token }}
+          AUTOPILOT_APP_ID: ${{ vars.AUTOPILOT_APP_ID }}
+          AUTOPILOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: python3 .github/autopilot/gate.py mark
+
+  review:
+    name: AI review
+    # Not for a hold being added (a person decides then). For a hold label removed by a person or by the app's
+    # `/autopilot resume`; gate.py skips the paid review when the remover can't lift a hold (the label goes back).
+    # Not for other bots toggling the label.
+    if: >-
+      github.event_name == 'pull_request_target' && !github.event.pull_request.draft &&
+      github.event.action != 'closed' && github.event.action != 'labeled' &&
+      (github.event.action != 'edited' || github.event.changes.base) &&
+      (github.event.action != 'unlabeled' ||
+       (github.event.label.name == 'autopilot-hold' &&
+        (github.event.sender.type == 'User' || contains(github.event.sender.login, 'autopilot'))))
+    concurrency:
+      group: autopilot-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    # Pinned image: requirements.txt holds wheels for its Python (3.12).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: autopilot-review
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.review.outputs.result }}
+    steps:
+      - name: Check out the default branch (never the pull request)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          # gate.py fetches the pull request's commits with this read-only token, as data.
+          persist-credentials: true
+      - name: Install the pinned Claude SDK
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --require-hashes --only-binary=:all: \
+            -r .github/autopilot/requirements.txt
+      - name: Review
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Read-only; used to skip a paid review when a hold label removal will be undone anyway.
+          GH_READ_TOKEN: ${{ github.token }}
+          AUTOPILOT_MODEL: claude-opus-5-5
+          AUTOPILOT_EFFORT: high
+        run: '"$RUNNER_TEMP/venv/bin/python" .github/autopilot/gate.py review'
+
+  decide:
+    name: autopilot gate
+    needs: [mark, review]
+    # A review cancelled by a newer run means that run decides; this one stays quiet.
+    if: >-
+      ${{ !cancelled() && needs.review.result != 'cancelled' && github.event_name == 'pull_request_target' &&
+      !github.event.pull_request.draft && github.event.action != 'closed' &&
+      (github.event.action != 'edited' || github.event.changes.base) &&
+      (!contains(fromJSON('["labeled", "unlabeled"]'), github.event.action) ||
+       github.event.label.name == 'autopilot-hold') }}
+    concurrency:
+      group: autopilot-decide-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: autopilot
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default branch (never the pull request)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Build Autopilot app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOPILOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOPILOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: write
+          permission-issues: write
+      - name: Decide
+        env:
+          AUTOPILOT_TOKEN: ${{ steps.app.outputs.token }}
+          AUTOPILOT_APP_ID: ${{ vars.AUTOPILOT_APP_ID }}
+          AUTOPILOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          AUTOPILOT_MODEL: claude-opus-5-5
+          REVIEW_RESULT: ${{ needs.review.outputs.result }}
+        run: python3 .github/autopilot/gate.py decide
+
+  command:
+    name: autopilot command
+    if: >-
+      github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      (startsWith(github.event.comment.body, '/autopilot approve') ||
+       startsWith(github.event.comment.body, '/autopilot stop') ||
+       startsWith(github.event.comment.body, '/autopilot resume'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: autopilot
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Build Autopilot app token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOPILOT_APP_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOPILOT_APP_PRIVATE_KEY }}
+          # contents + pull-requests write: turning auto-merge off (stop, approve) needs both.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: write
+          permission-issues: write
+      - name: Run the command
+        env:
+          AUTOPILOT_TOKEN: ${{ steps.app.outputs.token }}
+          AUTOPILOT_APP_ID: ${{ vars.AUTOPILOT_APP_ID }}
+          AUTOPILOT_APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          AUTOPILOT_APPROVER_ROLES: admin,maintain
+          # "false": nobody approves a pull request they opened or wrote commits in (see docs/v2-report.md).
+          AUTOPILOT_ALLOW_SELF_APPROVE: "false"
+        run: python3 .github/autopilot/gate.py approve
