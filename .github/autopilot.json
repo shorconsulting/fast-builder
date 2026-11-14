@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "repo": "shorconsulting/fast-builder",
+  "pipeline": "gate",
+  "required_checks": [],
+  "level": "autopilot",
+  "sensitive": {
+    "rule": "two-ai",
+    "paths": [
+      "**/auth/**",
+      "**/*login*",
+      "**/payments/**",
+      "**/billing/**",
+      "**/phi/**",
+      "**/migrations/**",
+      ".github/**",
+      "**/.env*",
+      "**/secrets*"
+    ]
+  },
+  "questions": "decide-reversible",
+  "tests": {
+    "lane": "wave",
+    "skip_duplicate_main": true
+  },
+  "ci_cost": {
+    "rules": "standard",
+    "off": []
+  },
+  "always_ask": [
+    "delete-data",
+    "spend-money",
+    "message-people",
+    "credentials",
+    "legal-pricing",
+    "ai-flags-it"
+  ],
+  "source": "https://claude.ai/artifact/9zUoa6vgaxo9j9ipTsKS6k",
+  "applied_at": "2026-11-14T17:46:34Z"
+}
