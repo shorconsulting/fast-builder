@@ -89,7 +89,8 @@ claims, heartbeats, messages and stop switch. It runs no CI and needs no merge. 
   check the product against the plan's Goal and every lane's Done means, reopens the lanes with gaps, and records the
   check with `fb.py final-check`. Only then does the run close.
 - **Building ahead of CI.** Each lane runs two tracks. Builders open a PR and go straight to their next slice. One
-  lander per lane waits on checks, merges what is green, rebases PRs that fall behind, and hands real failures back
+  lander per lane waits on checks, merges what is green, sends parked draft PRs into CI a few at a time (needed ones
+  first, where the repo parks drafts), rebases PRs that fall behind, and hands real failures back
   as fix slices. A lane is not done while any of its PRs are still open. The lander reads GitHub through REST
   (`fb.py prs`, `fb.py pr-wait`), so it works in cloud sessions, which refuse GraphQL. In a repo whose
   `.github/autopilot.json` says it has its own merge pipeline, the lander leaves merging to it.
