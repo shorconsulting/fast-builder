@@ -91,6 +91,19 @@ reviewed, findings fixed, pushed, and the PR opened with `lane:<lane>`. The buil
 slice that needs one not yet merged branches from that slice's branch, and its PR targets that branch and says
 `Stacked on #N` in its body. The lander moves it to the base branch once #N merges.
 
+**Parking.** A finished slice does not go into CI just because it is finished. Where the repo parks drafts
+(`tests.drafts` is `skip` in `.github/autopilot.json`) and this session can run `gh pr ready` (a cloud session
+cannot: it is GraphQL), the builder opens the PR as a draft: `gh pr create --draft`. A draft runs no CI there. Anywhere
+else, open the PR ready, as before. A parked PR goes into CI when something needs it on the base branch:
+
+- another lane, the steward or the conductor has asked for it, or a slice outside this lane depends on it;
+- it is shared machinery, a shared contract or a migration;
+- it is a fix for a red `main`, or for a failed PR;
+- the plan marks the slice as a gate.
+
+A slice inside the lane that needs a parked one does not need CI: it branches from it, as above. Tell the lander which
+parked PRs are needed, by number. Everything else waits for the lander to catch up.
+
 **Land track.** One lander per lane. Start it once, in the background, with `route --kind land` (the `lander` agent),
 and keep re-tasking that one agent. Its brief names the lane, its paths and the full path to `fb.py`. It is not one of the 3 writers: it spends most of its time blocked on
 `fb.py pr-wait`, which costs no tokens. Its queue is the lane's open PRs:
@@ -105,7 +118,13 @@ cloud sessions refuse, and a lander that cannot read its queue leaves the lead w
 the lander never merges, approves or turns on auto-merge there, and only keeps the PRs mergeable. `person` or `unknown`:
 nothing merges without a person. This holds in either autopilot mode: a second merger only races the repo's own.
 
-For each PR it waits on checks, then:
+Where drafts are parked, the lander keeps at most 2 of the lane's PRs in CI at a time: first the ones you said are
+needed, then the oldest parked one, the bottom of a stack before what is stacked on it. So CI catches up behind the
+builders and never falls far behind. To send a parked PR into CI it updates the PR's branch from the base branch first
+and only then marks it ready (`gh pr ready <n>`). The update gives the PR a new commit with no old results on it: on
+the same commit, the draft's skipped checks can still be the newest ones for a moment after it is marked ready.
+
+For each PR in CI it waits on checks, then:
 
 - **Green, and what the repo needs to merge is met:** with `merge_by` lander, merges it the way the plan's "Build, test
   and land" section says. Otherwise leaves it for the repo's automation, or for a person.
@@ -125,7 +144,8 @@ whenever a builder opens a PR.
 A PR that will not go through goes to the fixer lane rather than holding the lane up; see "When a PR is stuck".
 
 Keep the queue from growing without limit. With 6 or more of the lane's PRs open and any of them failed, the next
-free builder takes a fix before a new slice. Otherwise keep building.
+free builder takes a fix before a new slice. With 12 or more parked, tell the lander to keep 4 in CI until it is back
+under 12. Otherwise keep building.
 
 ## When a PR is stuck
 
