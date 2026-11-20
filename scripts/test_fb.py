@@ -2125,6 +2125,24 @@ class Listener(World):
         self.assertEqual(self.fb("delta", "poll").stdout.strip(), "NOTHING")
         self.assertIn("python3 \"$FB\" join --run hph-10-30-26 --lane money --account charlie", self.fb("charlie", "prompt", "--run", "hph-10-30-26", "--lane", "money", "--account", "charlie").stdout)
 
+    def test_poll_holds_building_lanes_while_ci_is_backed_up(self):
+        # 2026-11-20: ~2,000 queued runs and merges at zero; more PRs only make the queue longer.
+        self.publish(accounts=2)
+        with open(self.gh_table, "w") as handle:
+            json.dump({"routes": {"actions/runs?status=queued": {"total_count": 2000}}}, handle)
+        held = self.fb("bravo", "poll")
+        self.assertEqual(held.stdout.strip(), "NOTHING")
+        self.assertIn("workflow runs queued", held.stderr)
+        with open(self.gh_table, "w") as handle:
+            json.dump({"routes": {"actions/runs?status=queued": {"total_count": 12}}}, handle)
+        self.assertIn("lane=core", self.fb("bravo", "poll").stdout)
+
+    def test_poll_never_holds_on_an_unknown_backlog(self):
+        self.publish(accounts=2)
+        with open(self.gh_table, "w") as handle:
+            json.dump({"fail": True}, handle)
+        self.assertIn("lane=core", self.fb("bravo", "poll").stdout)
+
     def test_a_hostile_lane_name_on_the_bus_starts_nothing(self):
         self.publish(accounts=2, where="local")
         phone = os.path.join(self.root, "phone")
