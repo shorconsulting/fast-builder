@@ -181,6 +181,10 @@ DRY_MAX_DAYS = 8  # the furthest ahead a limit's own reset time is believed: a w
 RESTART_BACKOFF_SECONDS = 60  # doubled for each restart in a row after the first: a network blip outlasts a minute
 SPREAD_MINUTES = 10  # how long a freed lane waits for an account with no lane before one with a lane may take it
 DEFAULT_LANE_CAP = 2  # lanes one account may hold in a run, unless the job says otherwise
+# CI backpressure (2026-11-20: ~2,000 queued runs on 12 slots, 100+ open PRs per repo, merges at zero). While the repo
+# has more queued workflow runs than this, a listener starts no new building lane: more PRs only lengthen the queue.
+# The fixer lane still starts, since it lands what is already open. FB_CI_BACKLOG_MAX=0 turns the check off.
+CI_BACKLOG_MAX = int(os.environ.get("FB_CI_BACKLOG_MAX", "300") or 0)
 FIXER = "fixer"  # the lane publish adds to every run: it takes over the PRs other lanes get stuck on
 FIXER_FILE = "fixer.json"  # the account the fixer lane is kept for, so stuck work stays with one account
 FIXER_KEEP_MINUTES = 15  # how long the fixer lane, back on offer, waits for its own account before any account may take it
@@ -4630,6 +4634,16 @@ def cmd_listen(args):
     listen_loop(args)
 
 
+def ci_backlog(slug):
+    """Queued workflow runs in the repo now, or None when GitHub can't say (no gh, an error): unknown never holds a lane."""
+    if CI_BACKLOG_MAX <= 0 or not slug or not shutil.which("gh"):
+        return None
+    try:
+        return int(json.loads(gh_json(["repos/%s/actions/runs?status=queued&per_page=1" % slug], timeout=30)).get("total_count"))
+    except (FbError, ValueError, TypeError, AttributeError):
+        return None
+
+
 def cmd_poll(args):
     """One listener pass, for a routine that has no daemon: claims a lane and prints what to do, spending nothing else."""
     bus = get_bus(args)
@@ -4639,11 +4653,17 @@ def cmd_poll(args):
         print("NOTHING")
         return
     asked = {}
+    backlog = ci_backlog(repo_slug(bus.remote))
+    held_for_ci = backlog is not None and backlog > CI_BACKLOG_MAX
     for run in active_runs(bus):
         report = conduct(bus, run, account, asked=asked)
         if run_state(bus, run)["action"] != GO:
             continue
         lane = pick_lane(bus, run, account, skip=report["freed"])
+        if lane and held_for_ci and lane != FIXER:
+            sys.stderr.write("holding lane %s: %d workflow runs queued (over %d); new PRs would only wait\n"
+                             % (lane, backlog, CI_BACKLOG_MAX))
+            continue
         if lane and claim_picked(bus, run, lane, account):
             print("LANE run=%s lane=%s\n" % (run, lane))
             print(lane_prompt(run, lane, account))
