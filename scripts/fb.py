@@ -2832,7 +2832,7 @@ def guard_lane_call(payload, cwd, session, path):
                 deny("fast-builder: %s belongs to lane %s, not %s. Ask for it with: fb.py send --to %s --kind request --body ..." % (rel, holder, session["lane"], holder))
         return
     if PUSH_BASH.search(command):
-        bad = out_of_lane(cwd, session, lanes)
+        bad = out_of_lane(cwd, session, lanes, push_command=command)
         if bad:
             deny("fast-builder: this branch cannot be pushed from lane %s: %s" % (session["lane"], ", ".join(bad[:5])))
 
@@ -2882,7 +2882,32 @@ def repo_relative(target, cwd, session_file):
     return os.path.relpath(full, os.path.realpath(lines[0])).replace(os.sep, "/")  # lanes own paths written with /
 
 
-def out_of_lane(cwd, session, lanes):
+PUSH_PLAIN_OPTS = ("-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose")
+
+
+def plain_push_to_origin(command, cwd):
+    """True for `git push [-u|-q|-v] origin [<branch>|HEAD|HEAD:<branch>|<branch>:<branch>]` of the current branch,
+    one command with no -c, env prefix or other remote: the only push whose target the guard's proof looked at."""
+    if not is_simple(command):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if len(words) < 3 or words[0] != "git" or words[1] != "push":
+        return False
+    rest = [w for w in words[2:] if w not in PUSH_PLAIN_OPTS]
+    if not rest or rest[0] != "origin" or len(rest) > 2:
+        return False
+    branch = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=cwd, check=False, timeout=5).stdout.strip()
+    if not branch:
+        return False
+    if len(rest) == 1:
+        return True
+    return rest[1] in (branch, "HEAD", "HEAD:" + branch, "HEAD:refs/heads/" + branch, branch + ":" + branch, branch + ":refs/heads/" + branch)
+
+
+def out_of_lane(cwd, session, lanes, push_command=None):
     """Files this branch changes outside the lane. A diff that cannot run counts as a failure, not as clean; renames
     are off so that moving a file out of another lane shows up as the deletion it is."""
     base = "origin/" + session.get("base", "main")
@@ -2890,7 +2915,7 @@ def out_of_lane(cwd, session, lanes):
     if proc.returncode != 0:
         return ["cannot diff against %s (shallow clone? git fetch --unshallow origin)" % base]
     bad = [p for p in proc.stdout.splitlines() if p and not may_touch(p, session["lane"], lanes)]
-    if bad:
+    if bad and (push_command is None or plain_push_to_origin(push_command, cwd)):
         bad = still_changed(cwd, base, bad)
     return bad
 
@@ -2922,10 +2947,10 @@ def still_changed(cwd, base, paths):
 def plain_origin(cwd):
     """True when origin fetches and pushes the same URL, so ls-remote reads what a push writes. get-url applies
     insteadOf and --push applies pushInsteadOf too, so a rewrite that splits the two shows up as a difference."""
-    fetch = git(["remote", "get-url", "origin"], cwd=cwd, check=False, timeout=5)
-    push = git(["remote", "get-url", "--push", "origin"], cwd=cwd, check=False, timeout=5)
-    if fetch.returncode != 0 or push.returncode != 0 or fetch.stdout.strip() != push.stdout.strip():
-        return False
+    fetch = git(["remote", "get-url", "--all", "origin"], cwd=cwd, check=False, timeout=5)
+    push = git(["remote", "get-url", "--push", "--all", "origin"], cwd=cwd, check=False, timeout=5)
+    if fetch.returncode != 0 or push.returncode != 0 or len(fetch.stdout.split()) != 1 or fetch.stdout.split() != push.stdout.split():
+        return False  # one URL, the same both ways: a second url or pushurl would push where ls-remote never looked
     pack = git(["config", "--get-regexp", r"^remote\.origin\.(uploadpack|receivepack|pushurl|proxy)$"], cwd=cwd, check=False, timeout=5)
     return not pack.stdout.strip()
 

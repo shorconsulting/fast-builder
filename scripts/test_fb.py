@@ -924,6 +924,20 @@ class Guard(World):
         sh(["git", "config", "remote.origin.uploadpack", "sleep 30; git-upload-pack"], cwd=self.repo)
         self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
 
+    def test_the_pass_is_only_for_a_plain_push_to_origin(self):
+        self.mixed_branch_on_the_remote()
+        self.assertEqual(self.guard("Bash", {"command": "git push -u origin HEAD:fb/mixed"}), "")
+        for command in ("git push %s fb/mixed" % self.remote, "git -c remote.origin.pushurl=x push origin fb/mixed",
+                        "GIT_CONFIG_COUNT=1 git push origin fb/mixed", "git push origin HEAD:fb/other", "git push origin fb/mixed && true"):
+            self.assertIn("deny", self.guard("Bash", {"command": command}), command)
+
+    def test_a_second_origin_url_gets_no_pass(self):
+        self.mixed_branch_on_the_remote()
+        decoy = os.path.join(self.root, "decoy.git")
+        sh(["git", "clone", "-q", "--bare", self.remote, decoy])
+        sh(["git", "config", "--add", "remote.origin.url", decoy], cwd=self.repo)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/mixed"}))
+
     def test_a_rewritten_branch_gets_no_pass(self):
         self.mixed_branch_on_the_remote()
         sh(["git", "reset", "-q", "--soft", "origin/main"], cwd=self.repo)
