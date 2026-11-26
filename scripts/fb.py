@@ -2895,6 +2895,9 @@ def out_of_lane(cwd, session, lanes):
     return bad
 
 
+STILL_CHANGED_MAX = 300  # out-of-lane files the push guard will try to prove unchanged; above it, refused
+
+
 def file_patch_id(cwd, base, tip, path):
     """The stable patch id of what branch tip changes in one file against its merge base with base: '' for no
     change, None when git cannot say. Line numbers do not count, so the same edit on a newer main has the same id."""
@@ -2916,21 +2919,26 @@ def still_changed(cwd, base, paths):
     branch = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=cwd, check=False, timeout=5).stdout.strip()
     if not branch:
         return paths
-    remote = "origin/" + branch
-    if git(["rev-parse", "-q", "--verify", remote + "^{commit}"], cwd=cwd, check=False, timeout=5).returncode != 0:
+    if len(paths) > STILL_CHANGED_MAX:
+        return paths  # too many to prove inside the hook's time limit: hand it to the owning lanes instead
+    # The remote's own word for the branch tip, never a local tracking ref: a lane can set origin/<branch> to anything.
+    listed = git(["ls-remote", "origin", "refs/heads/" + branch], cwd=cwd, check=False, timeout=10)
+    remote = listed.stdout.split()[0] if listed.returncode == 0 and listed.stdout.split() else ""
+    if not re.match(r"^[0-9a-f]{40,64}$", remote):
         return paths
+    if git(["cat-file", "-e", remote + "^{commit}"], cwd=cwd, check=False, timeout=5).returncode != 0:
+        return paths  # not fetched here, so nothing can be proved about it
     if git(["merge-base", "--is-ancestor", remote, "HEAD"], cwd=cwd, check=False, timeout=20).returncode != 0:
         return paths
     merged = auto_merge_blobs(cwd, base, remote)
-    out = []
-    for path in paths:
+    for i, path in enumerate(paths):
         if merged is not None and path in merged:
             if merged[path] is not None and merged[path] == blob_of(cwd, "HEAD", path):
                 continue  # exactly what git's own merge of main into the branch makes: nobody edited it by hand
         before = file_patch_id(cwd, base, remote, path)
         if not before or before != file_patch_id(cwd, base, "HEAD", path):
-            out.append(path)
-    return out
+            return paths[i:]  # the first one that fails is enough to refuse: stop well inside the hook's time limit
+    return []
 
 
 def blob_of(cwd, rev, path):
@@ -2961,7 +2969,7 @@ def auto_merge_blobs(cwd, base, remote):
     mainline = git(["merge-base", "HEAD", base], cwd=cwd, check=False, timeout=20).stdout.strip()
     if not mainline:
         return None
-    proc = git(["merge-tree", "--write-tree", remote, mainline], cwd=cwd, check=False, timeout=120)
+    proc = git(["merge-tree", "--write-tree", remote, mainline], cwd=cwd, check=False, timeout=8)
     if proc.returncode not in (0, 1) or not proc.stdout.strip():
         return None
     lines = proc.stdout.split("\n")

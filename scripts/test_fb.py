@@ -896,6 +896,16 @@ class Guard(World):
         sh(["git", "commit", "-qam", "edit core"], cwd=self.repo)
         self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
 
+    def test_a_forged_tracking_ref_is_not_the_remote(self):
+        """A lane can point its own origin/<branch> at anything; only the remote's word counts."""
+        sh(["git", "checkout", "-qb", "fb/forged"], cwd=self.repo)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.write("core change by money\n")
+        sh(["git", "commit", "-qam", "sneak"], cwd=self.repo)
+        sh(["git", "update-ref", "refs/remotes/origin/fb/forged", "HEAD"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/forged"}))
+
     def test_a_rewritten_branch_gets_no_pass(self):
         self.mixed_branch_on_the_remote()
         sh(["git", "reset", "-q", "--soft", "origin/main"], cwd=self.repo)
