@@ -108,6 +108,12 @@ for key, value in table.get("routes", {}).items():  # first argument-string matc
             sys.exit(1)
         print(value if isinstance(value, str) else json.dumps(value))
         sys.exit(0)
+if any("/actions/runs?" in a for a in sys.argv[1:]):  # the workflow runs on a commit: none listed reads as all finished
+    print(json.dumps({"workflow_runs": table.get("workflow_runs", [])}))
+    sys.exit(0)
+if any("/commits?" in a for a in sys.argv[1:]):  # the base branch's line, newest first
+    print(json.dumps(table.get("commits", [])))
+    sys.exit(0)
 if "raw" in table:
     print(table["raw"])
     sys.exit(0)
@@ -2202,7 +2208,9 @@ class Hardening(World):
     def gh_calls(self, prs=False):
         """The calls about main, or with prs the calls counting each lane's PRs."""
         calls = [json.loads(line) for line in open(self.gh_log)] if os.path.exists(self.gh_log) else []
-        return [c for c in calls if any("/issues?" in a for a in c) == prs]
+        if prs:
+            return [c for c in calls if any("/issues?" in a for a in c)]
+        return [c for c in calls if any("/check-runs" in a for a in c)]  # one per reading of a commit: its runs and the line are asked about alongside
 
     def due(self, account="alpha"):
         """Five minutes on, as far as this account's throttle goes."""
@@ -2382,6 +2390,35 @@ class Hardening(World):
             with unittest.mock.patch.dict(os.environ, env):
                 got = fb.main_checks("owner/app", "main", only)
             self.assertEqual(got and got["state"], state, runs)
+
+    def test_a_head_whose_full_run_has_not_finished_says_nothing_however_green_its_rows(self):
+        # rr-11-19-26: a queued full run has no check rows yet, so the head showed only the quick checks and read green
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+        for runs, state in (([{"status": "queued", "conclusion": None}], None),
+                            ([{"status": "in_progress", "conclusion": None}], None),
+                            ([{"status": "completed", "conclusion": "cancelled"}], None),
+                            ([{"status": "completed", "conclusion": "success"}, {"status": "completed", "conclusion": "failure"}], "green"),
+                            ([], "green")):
+            self.checks(passed(), workflow_runs=runs)
+            with unittest.mock.patch.dict(os.environ, env):
+                got = fb.main_checks("owner/app", "main", [])
+            self.assertEqual(got and got["state"], state, runs)
+
+    def test_a_head_that_says_nothing_is_read_from_the_newest_finished_commit_on_the_line(self):
+        env = {k: v for k, v in self.env("alpha").items() if k in ("PATH", "FB_GH_LOG", "FB_GH_TABLE")}
+        head, side, older = "a" * 40, "c" * 40, "b" * 40
+        line = [{"sha": head, "parents": [{"sha": older}, {"sha": side}]}, {"sha": side, "parents": [{"sha": older}]},
+                {"sha": older, "parents": [{"sha": "d" * 40}]}]
+        failing = json.dumps({"check_runs": [dict(failed(), head_sha=older)]})
+        self.checks(passed(), commits=line, routes={"actions/runs?head_sha=%s" % head: {"workflow_runs": [{"status": "queued"}]},
+                                                    "commits/%s/check-runs" % older: failing,
+                                                    "commits/%s/check-runs" % side: json.dumps({"check_runs": [dict(passed(), head_sha=side)]})})
+        with unittest.mock.patch.dict(os.environ, env):
+            got = fb.main_checks("owner/app", "main", [])
+        self.assertEqual(got, {"state": "red", "sha": older, "failing": ["ci"]}, "first parents only: the merged branch's own commit is skipped")
+        self.checks(passed(), commits=[], routes={"actions/runs?head_sha=%s" % head: {"workflow_runs": [{"status": "queued"}]}})
+        with unittest.mock.patch.dict(os.environ, env):
+            self.assertIsNone(fb.main_checks("owner/app", "main", []), "nothing finished on the line: nothing to go on")
 
     def test_a_running_head_keeps_the_previous_state_and_main_checks_comes_from_the_job(self):
         self.checks(failed("nightly"))

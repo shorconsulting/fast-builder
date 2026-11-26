@@ -1079,8 +1079,61 @@ def standing_checks(rows):
     return [r for r, family, times in seen if not (times and times[1] is not None and newest.get(family, times[1]) > times[1])]
 
 
+MAIN_WALK = 8  # how many commits back from the base branch's head a reading may look for one whose checks have finished
+
+
 def main_checks(slug, base, only):
-    """What the checks on the base branch's head say: red, green, or None for nothing to go on. REST, because cloud
+    """What the checks say on the newest of the base branch's last MAIN_WALK commits that has a verdict. Full runs on
+    the base branch land in waves: a run on a commit that a later merge superseded is cancelled, and the head's own
+    run is nearly always still going, so a reading of the head alone said nothing for hours while main was red and
+    main.json kept its last green. A commit with no verdict is passed over; the reading names the commit it is of.
+    None when none of them says anything, or the commits cannot be listed."""
+    if not (isinstance(base, str) and SLUG_RE.match(slug) and BRANCH_RE.match(base) and shutil.which("gh")):
+        return None
+    seen = main_checks_at(slug, base, only)
+    if seen is not None:
+        return seen
+    proc = run_cmd(["gh", "api", "repos/%s/commits?sha=%s&per_page=100" % (slug, urllib.parse.quote(base, safe=""))],
+                   check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return None
+    try:
+        listed = {c["sha"]: c for c in json.loads(proc.stdout) if isinstance(c, dict) and isinstance(c.get("sha"), str)}
+        sha = next(iter(listed), None)
+    except (ValueError, KeyError, TypeError):
+        return None
+    shas = []  # the base branch's own line, first parents only: a merged branch's commits were tested as a pull request
+    while sha in listed and len(shas) < MAIN_WALK:
+        shas.append(sha)
+        parents = listed[sha].get("parents") or [{}]
+        sha = parents[0].get("sha") if isinstance(parents[0], dict) else None
+    for sha in shas[1:]:  # the first is the head, read above
+        if isinstance(sha, str) and SHA_RE.match(sha):
+            seen = main_checks_at(slug, sha, only)
+            if seen is not None:
+                return seen
+    return None
+
+
+def runs_finished(slug, sha):
+    """True when every workflow run on this commit has finished and none was cancelled. A run that has not started its
+    jobs has no check rows yet, so the rows of a commit whose full run is queued, or was cancelled before it began,
+    are only the quick checks, and read green while the full suite has said nothing (rr-11-19-26: main.json stayed
+    green for hours over a red full run). False when the runs cannot be read."""
+    proc = run_cmd(["gh", "api", "repos/%s/actions/runs?head_sha=%s&per_page=100" % (slug, sha)], check=False, timeout=MAIN_ASK_SECONDS)
+    if proc.returncode != 0:
+        return False
+    try:
+        runs = json.loads(proc.stdout).get("workflow_runs")
+    except (ValueError, AttributeError):
+        return False
+    if not isinstance(runs, list):
+        return False
+    return all(isinstance(r, dict) and r.get("status") == "completed" and r.get("conclusion") != "cancelled" for r in runs)
+
+
+def main_checks_at(slug, base, only):
+    """What the checks on one commit of the base branch (its name for the head, or a sha) say: red, green, or None for nothing to go on. REST, because cloud
     sessions refuse GraphQL. The slug comes from this clone's remote and not from the bus.
 
     Red: a check that stands ended in MAIN_RED. Green: every one that stands ended in MAIN_GREEN, at least one of them
@@ -1100,6 +1153,8 @@ def main_checks(slug, base, only):
     sha = rows[0].get("head_sha") if rows else None
     if not (isinstance(sha, str) and SHA_RE.match(sha)) or any(r.get("head_sha") != sha for r in rows):
         return None  # main moved between two pages, and a reading across commits is of neither. Before `only`, which could hide it
+    if not runs_finished(slug, sha):
+        return None
     rows = standing_checks([r for r in rows if isinstance(r.get("name"), str) and (not only or r["name"] in only)])
     failing = [r["name"] for r in rows if r.get("status") == "completed" and r.get("conclusion") in MAIN_RED]
     if failing:
