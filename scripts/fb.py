@@ -2912,6 +2912,25 @@ def file_patch_id(cwd, base, tip, path):
 
 
 def still_changed(cwd, base, paths):
+    """Fail closed: a timeout or any git error while proving means the push is refused as before."""
+    try:
+        return prove_unchanged(cwd, base, paths)
+    except (FbError, OSError, subprocess.SubprocessError, ValueError):
+        return paths
+
+
+def plain_origin(cwd):
+    """True when origin fetches and pushes the same URL, so ls-remote reads what a push writes. get-url applies
+    insteadOf and --push applies pushInsteadOf too, so a rewrite that splits the two shows up as a difference."""
+    fetch = git(["remote", "get-url", "origin"], cwd=cwd, check=False, timeout=5)
+    push = git(["remote", "get-url", "--push", "origin"], cwd=cwd, check=False, timeout=5)
+    if fetch.returncode != 0 or push.returncode != 0 or fetch.stdout.strip() != push.stdout.strip():
+        return False
+    pack = git(["config", "--get-regexp", r"^remote\.origin\.(uploadpack|receivepack|pushurl|proxy)$"], cwd=cwd, check=False, timeout=5)
+    return not pack.stdout.strip()
+
+
+def prove_unchanged(cwd, base, paths):
     """Of the out-of-lane files on this branch, the ones this push would change. A branch already on the remote
     that carries another lane's file (a PR stacked on another lane's work, or older than the lanes) may still take
     main: a fast-forward of it whose own change to that file is the same edit is not an edit of another lane's file.
@@ -2921,6 +2940,8 @@ def still_changed(cwd, base, paths):
         return paths
     if len(paths) > STILL_CHANGED_MAX:
         return paths  # too many to prove inside the hook's time limit: hand it to the owning lanes instead
+    if not plain_origin(cwd):
+        return paths
     # The remote's own word for the branch tip, never a local tracking ref: a lane can set origin/<branch> to anything.
     listed = git(["ls-remote", "origin", "refs/heads/" + branch], cwd=cwd, check=False, timeout=10)
     remote = listed.stdout.split()[0] if listed.returncode == 0 and listed.stdout.split() else ""

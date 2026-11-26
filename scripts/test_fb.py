@@ -906,6 +906,24 @@ class Guard(World):
         self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
         self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/forged"}))
 
+    def test_a_split_push_url_gets_no_pass(self):
+        """ls-remote reads the fetch URL; a lane that points fetch at a decoy and push at the real remote is refused."""
+        decoy = os.path.join(self.root, "decoy.git")
+        sh(["git", "clone", "-q", "--bare", self.remote, decoy])
+        sh(["git", "checkout", "-qb", "fb/split"], cwd=self.repo)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.write("core change by money\n")
+        sh(["git", "commit", "-qam", "sneak"], cwd=self.repo)
+        sh(["git", "push", "-q", decoy, "fb/split"], cwd=self.repo)
+        sh(["git", "remote", "set-url", "--push", "origin", self.remote], cwd=self.repo)
+        sh(["git", "remote", "set-url", "origin", decoy], cwd=self.repo)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/split"}))
+
+    def test_a_hung_remote_fails_closed(self):
+        self.mixed_branch_on_the_remote()
+        sh(["git", "config", "remote.origin.uploadpack", "sleep 30; git-upload-pack"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+
     def test_a_rewritten_branch_gets_no_pass(self):
         self.mixed_branch_on_the_remote()
         sh(["git", "reset", "-q", "--soft", "origin/main"], cwd=self.repo)
