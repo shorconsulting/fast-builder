@@ -76,7 +76,7 @@ at the top of the bus, or in a run's folder, overrides all of them. It can be ad
 |---|---|---|
 | `validate` at publish | Proves no file is in two lanes, against the real file list and by comparing globs for paths that do not exist yet | Kickoff |
 | Guard hook | Denies out-of-lane edits and pushes, and all work once stopped, for subagents too | Local, or cloud after `install-repo` |
-| `check-diff` | Proves a branch stays in lane | Any lane, before a push |
+| `check-diff` | Proves a branch stays in lane (another lane's file it already carried on the remote passes when the push leaves its change alone or it is exactly git's merge of main) | Any lane, before a push |
 | `tick` | Tells the lane what to do | Everywhere; the only layer in a cloud session without the repo install |
 
 ## Trust

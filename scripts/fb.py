@@ -2889,7 +2889,90 @@ def out_of_lane(cwd, session, lanes):
     proc = git(["diff", "--no-renames", "--name-only", base + "...HEAD"], cwd=cwd, check=False, timeout=20)
     if proc.returncode != 0:
         return ["cannot diff against %s (shallow clone? git fetch --unshallow origin)" % base]
-    return [p for p in proc.stdout.splitlines() if p and not may_touch(p, session["lane"], lanes)]
+    bad = [p for p in proc.stdout.splitlines() if p and not may_touch(p, session["lane"], lanes)]
+    if bad:
+        bad = still_changed(cwd, base, bad)
+    return bad
+
+
+def file_patch_id(cwd, base, tip, path):
+    """The stable patch id of what branch tip changes in one file against its merge base with base: '' for no
+    change, None when git cannot say. Line numbers do not count, so the same edit on a newer main has the same id."""
+    proc = git(["diff", "--no-renames", base + "..." + tip, "--", path], cwd=cwd, check=False, timeout=20)
+    if proc.returncode != 0:
+        return None
+    if not proc.stdout.strip():
+        return ""
+    pid = subprocess.run(["git", "patch-id", "--stable"], cwd=cwd, input=proc.stdout, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, universal_newlines=True, timeout=20)
+    return pid.stdout.split()[0] if pid.returncode == 0 and pid.stdout.split() else None
+
+
+def still_changed(cwd, base, paths):
+    """Of the out-of-lane files on this branch, the ones this push would change. A branch already on the remote
+    that carries another lane's file (a PR stacked on another lane's work, or older than the lanes) may still take
+    main: a fast-forward of it whose own change to that file is the same edit is not an edit of another lane's file.
+    Anything that cannot be proved the same stays refused."""
+    branch = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=cwd, check=False, timeout=5).stdout.strip()
+    if not branch:
+        return paths
+    remote = "origin/" + branch
+    if git(["rev-parse", "-q", "--verify", remote + "^{commit}"], cwd=cwd, check=False, timeout=5).returncode != 0:
+        return paths
+    if git(["merge-base", "--is-ancestor", remote, "HEAD"], cwd=cwd, check=False, timeout=20).returncode != 0:
+        return paths
+    merged = auto_merge_blobs(cwd, base, remote)
+    out = []
+    for path in paths:
+        if merged is not None and path in merged:
+            if merged[path] is not None and merged[path] == blob_of(cwd, "HEAD", path):
+                continue  # exactly what git's own merge of main into the branch makes: nobody edited it by hand
+        before = file_patch_id(cwd, base, remote, path)
+        if not before or before != file_patch_id(cwd, base, "HEAD", path):
+            out.append(path)
+    return out
+
+
+def blob_of(cwd, rev, path):
+    proc = git(["rev-parse", "-q", "--verify", "%s:%s" % (rev, path)], cwd=cwd, check=False, timeout=10)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+class AutoMerged(dict):
+    """{path: blob} of git's own merge of the main commit HEAD took into the branch as it is on the remote. A path
+    git could not merge cleanly maps to None; a path git would not touch is missing and reads as the remote's blob."""
+
+    def __init__(self, cwd, tree, conflicted):
+        super().__init__()
+        self.cwd, self.tree, self.conflicted = cwd, tree, conflicted
+
+    def __contains__(self, path):
+        return True
+
+    def __getitem__(self, path):
+        if path in self.conflicted:
+            return None
+        return blob_of(self.cwd, self.tree, path)
+
+
+def auto_merge_blobs(cwd, base, remote):
+    """What a clean `git merge` of main into the remote branch gives each file, or None when it cannot be worked out
+    (no main in HEAD, an old git without merge-tree --write-tree, unrelated histories in a shallow clone)."""
+    mainline = git(["merge-base", "HEAD", base], cwd=cwd, check=False, timeout=20).stdout.strip()
+    if not mainline:
+        return None
+    proc = git(["merge-tree", "--write-tree", remote, mainline], cwd=cwd, check=False, timeout=120)
+    if proc.returncode not in (0, 1) or not proc.stdout.strip():
+        return None
+    lines = proc.stdout.split("\n")
+    conflicted = set()
+    if proc.returncode == 1:
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            if "\t" in line:
+                conflicted.add(line.split("\t", 1)[1])
+    return AutoMerged(cwd, lines[0].strip(), conflicted)
 
 
 def hook_stop(payload):
