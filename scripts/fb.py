@@ -2832,7 +2832,7 @@ def guard_lane_call(payload, cwd, session, path):
                 deny("fast-builder: %s belongs to lane %s, not %s. Ask for it with: fb.py send --to %s --kind request --body ..." % (rel, holder, session["lane"], holder))
         return
     if PUSH_BASH.search(command):
-        bad = out_of_lane(cwd, session, lanes)
+        bad = out_of_lane(cwd, session, lanes, push_command=command)
         if bad:
             deny("fast-builder: this branch cannot be pushed from lane %s: %s" % (session["lane"], ", ".join(bad[:5])))
 
@@ -2882,14 +2882,151 @@ def repo_relative(target, cwd, session_file):
     return os.path.relpath(full, os.path.realpath(lines[0])).replace(os.sep, "/")  # lanes own paths written with /
 
 
-def out_of_lane(cwd, session, lanes):
+PUSH_PLAIN_OPTS = ("-u", "--set-upstream", "-q", "--quiet", "-v", "--verbose")
+
+
+def plain_push_to_origin(command, cwd):
+    """True for `git push [-u|-q|-v] origin [<branch>|HEAD|HEAD:<branch>|<branch>:<branch>]` of the current branch,
+    one command with no -c, env prefix or other remote: the only push whose target the guard's proof looked at."""
+    if not is_simple(command):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if len(words) < 3 or words[0] != "git" or words[1] != "push":
+        return False
+    rest = [w for w in words[2:] if w not in PUSH_PLAIN_OPTS]
+    if not rest or rest[0] != "origin" or len(rest) > 2:
+        return False
+    branch = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=cwd, check=False, timeout=5).stdout.strip()
+    if not branch:
+        return False
+    if len(rest) == 1:
+        return True
+    return rest[1] in (branch, "HEAD", "HEAD:" + branch, "HEAD:refs/heads/" + branch, branch + ":" + branch, branch + ":refs/heads/" + branch)
+
+
+def out_of_lane(cwd, session, lanes, push_command=None):
     """Files this branch changes outside the lane. A diff that cannot run counts as a failure, not as clean; renames
     are off so that moving a file out of another lane shows up as the deletion it is."""
     base = "origin/" + session.get("base", "main")
     proc = git(["diff", "--no-renames", "--name-only", base + "...HEAD"], cwd=cwd, check=False, timeout=20)
     if proc.returncode != 0:
         return ["cannot diff against %s (shallow clone? git fetch --unshallow origin)" % base]
-    return [p for p in proc.stdout.splitlines() if p and not may_touch(p, session["lane"], lanes)]
+    bad = [p for p in proc.stdout.splitlines() if p and not may_touch(p, session["lane"], lanes)]
+    if bad and (push_command is None or plain_push_to_origin(push_command, cwd)):
+        bad = still_changed(cwd, base, bad)
+    return bad
+
+
+STILL_CHANGED_MAX = 300  # out-of-lane files the push guard will try to prove unchanged; above it, refused
+
+
+def file_patch_id(cwd, base, tip, path):
+    """The stable patch id of what branch tip changes in one file against its merge base with base: '' for no
+    change, None when git cannot say. Line numbers do not count, so the same edit on a newer main has the same id."""
+    proc = git(["diff", "--no-renames", base + "..." + tip, "--", path], cwd=cwd, check=False, timeout=20)
+    if proc.returncode != 0:
+        return None
+    if not proc.stdout.strip():
+        return ""
+    pid = subprocess.run(["git", "patch-id", "--stable"], cwd=cwd, input=proc.stdout, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, universal_newlines=True, timeout=20)
+    return pid.stdout.split()[0] if pid.returncode == 0 and pid.stdout.split() else None
+
+
+def still_changed(cwd, base, paths):
+    """Fail closed: a timeout or any git error while proving means the push is refused as before."""
+    try:
+        return prove_unchanged(cwd, base, paths)
+    except (FbError, OSError, subprocess.SubprocessError, ValueError):
+        return paths
+
+
+def plain_origin(cwd):
+    """True when origin fetches and pushes the same URL, so ls-remote reads what a push writes. get-url applies
+    insteadOf and --push applies pushInsteadOf too, so a rewrite that splits the two shows up as a difference."""
+    fetch = git(["remote", "get-url", "--all", "origin"], cwd=cwd, check=False, timeout=5)
+    push = git(["remote", "get-url", "--push", "--all", "origin"], cwd=cwd, check=False, timeout=5)
+    if fetch.returncode != 0 or push.returncode != 0 or len(fetch.stdout.split()) != 1 or fetch.stdout.split() != push.stdout.split():
+        return False  # one URL, the same both ways: a second url or pushurl would push where ls-remote never looked
+    pack = git(["config", "--get-regexp", r"^remote\.origin\.(uploadpack|receivepack|pushurl|proxy)$"], cwd=cwd, check=False, timeout=5)
+    return not pack.stdout.strip()
+
+
+def prove_unchanged(cwd, base, paths):
+    """Of the out-of-lane files on this branch, the ones this push would change. A branch already on the remote
+    that carries another lane's file (a PR stacked on another lane's work, or older than the lanes) may still take
+    main: a fast-forward of it whose own change to that file is the same edit is not an edit of another lane's file.
+    Anything that cannot be proved the same stays refused."""
+    branch = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd=cwd, check=False, timeout=5).stdout.strip()
+    if not branch:
+        return paths
+    if len(paths) > STILL_CHANGED_MAX:
+        return paths  # too many to prove inside the hook's time limit: hand it to the owning lanes instead
+    if not plain_origin(cwd):
+        return paths
+    # The remote's own word for the branch tip, never a local tracking ref: a lane can set origin/<branch> to anything.
+    listed = git(["ls-remote", "origin", "refs/heads/" + branch], cwd=cwd, check=False, timeout=10)
+    remote = listed.stdout.split()[0] if listed.returncode == 0 and listed.stdout.split() else ""
+    if not re.match(r"^[0-9a-f]{40,64}$", remote):
+        return paths
+    if git(["cat-file", "-e", remote + "^{commit}"], cwd=cwd, check=False, timeout=5).returncode != 0:
+        return paths  # not fetched here, so nothing can be proved about it
+    if git(["merge-base", "--is-ancestor", remote, "HEAD"], cwd=cwd, check=False, timeout=20).returncode != 0:
+        return paths
+    merged = auto_merge_blobs(cwd, base, remote)
+    for i, path in enumerate(paths):
+        if merged is not None and path in merged:
+            if merged[path] is not None and merged[path] == blob_of(cwd, "HEAD", path):
+                continue  # exactly what git's own merge of main into the branch makes: nobody edited it by hand
+        before = file_patch_id(cwd, base, remote, path)
+        if not before or before != file_patch_id(cwd, base, "HEAD", path):
+            return paths[i:]  # the first one that fails is enough to refuse: stop well inside the hook's time limit
+    return []
+
+
+def blob_of(cwd, rev, path):
+    proc = git(["rev-parse", "-q", "--verify", "%s:%s" % (rev, path)], cwd=cwd, check=False, timeout=10)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+class AutoMerged(dict):
+    """{path: blob} of git's own merge of the main commit HEAD took into the branch as it is on the remote. A path
+    git could not merge cleanly maps to None; a path git would not touch is missing and reads as the remote's blob."""
+
+    def __init__(self, cwd, tree, conflicted):
+        super().__init__()
+        self.cwd, self.tree, self.conflicted = cwd, tree, conflicted
+
+    def __contains__(self, path):
+        return True
+
+    def __getitem__(self, path):
+        if path in self.conflicted:
+            return None
+        return blob_of(self.cwd, self.tree, path)
+
+
+def auto_merge_blobs(cwd, base, remote):
+    """What a clean `git merge` of main into the remote branch gives each file, or None when it cannot be worked out
+    (no main in HEAD, an old git without merge-tree --write-tree, unrelated histories in a shallow clone)."""
+    mainline = git(["merge-base", "HEAD", base], cwd=cwd, check=False, timeout=20).stdout.strip()
+    if not mainline:
+        return None
+    proc = git(["merge-tree", "--write-tree", remote, mainline], cwd=cwd, check=False, timeout=8)
+    if proc.returncode not in (0, 1) or not proc.stdout.strip():
+        return None
+    lines = proc.stdout.split("\n")
+    conflicted = set()
+    if proc.returncode == 1:
+        for line in lines[1:]:
+            if not line.strip():
+                break
+            if "\t" in line:
+                conflicted.add(line.split("\t", 1)[1])
+    return AutoMerged(cwd, lines[0].strip(), conflicted)
 
 
 def hook_stop(payload):

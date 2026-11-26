@@ -837,6 +837,113 @@ class Guard(World):
         self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/x"}))
         self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
 
+    def mixed_branch_on_the_remote(self):
+        """A branch that already carries core's file (stacked on core's work, or older than the lanes), as pushed."""
+        sh(["git", "checkout", "-qb", "fb/mixed"], cwd=self.repo)
+        for rel, text in (("src/pay/charge.ts", "pay change\n"), ("src/auth/login.ts", "core change\n")):
+            with open(os.path.join(self.repo, rel), "w") as handle:
+                handle.write(text)
+        sh(["git", "commit", "-qam", "mixed"], cwd=self.repo)
+        sh(["git", "push", "-q", "origin", "fb/mixed"], cwd=self.repo)
+        other = os.path.join(self.root, "mainline")
+        sh(["git", "clone", "-q", self.remote, other])
+        with open(os.path.join(other, "src/ui/home.ts"), "w") as handle:
+            handle.write("main moved\n")
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "main moves"], cwd=other)
+        sh(["git", "push", "-q", "origin", "HEAD:main"], cwd=other)
+        sh(["git", "fetch", "-q", "origin"], cwd=self.repo)
+        sh(["git", "merge", "-q", "--no-edit", "origin/main"], cwd=self.repo)
+
+    def test_a_main_merge_of_a_branch_that_already_held_another_lanes_file_may_be_pushed(self):
+        self.mixed_branch_on_the_remote()
+        self.assertEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+        self.assertEqual(self.guard("Bash", {"command": "git push origin fb/mixed"}), "")
+
+    def test_changing_the_other_lanes_file_on_that_branch_is_still_refused(self):
+        self.mixed_branch_on_the_remote()
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.write("core change, edited again\n")
+        sh(["git", "commit", "-qam", "edit core"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/mixed"}))
+
+    def test_a_clean_merge_where_main_also_changed_that_file_may_be_pushed(self):
+        """Main edits the other lane's file near the branch's edit, so the branch's own patch reads differently;
+        the file is still exactly git's merge, so the push carries no hand edit of it."""
+        lines = ["line %d\n" % n for n in range(1, 7)]
+        other = os.path.join(self.root, "mainline")
+        sh(["git", "clone", "-q", self.remote, other])
+        commit = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam"]
+        with open(os.path.join(other, "src/auth/login.ts"), "w") as handle:
+            handle.writelines(lines)
+        sh(commit + ["six lines"], cwd=other)
+        sh(["git", "push", "-q", "origin", "HEAD:main"], cwd=other)
+        sh(["git", "fetch", "-q", "origin"], cwd=self.repo)
+        sh(["git", "checkout", "-qb", "fb/near", "origin/main"], cwd=self.repo)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.writelines(["line 1 by the branch\n"] + lines[1:])
+        sh(["git", "commit", "-qam", "branch"], cwd=self.repo)
+        sh(["git", "push", "-q", "origin", "fb/near"], cwd=self.repo)
+        with open(os.path.join(other, "src/auth/login.ts"), "w") as handle:
+            handle.writelines(lines[:3] + ["line 4 by main\n"] + lines[4:])
+        sh(commit + ["main edits nearby"], cwd=other)
+        sh(["git", "push", "-q", "origin", "HEAD:main"], cwd=other)
+        sh(["git", "fetch", "-q", "origin"], cwd=self.repo)
+        sh(["git", "merge", "-q", "--no-edit", "origin/main"], cwd=self.repo)
+        self.assertEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "a") as handle:
+            handle.write("slipped in\n")
+        sh(["git", "commit", "-qam", "edit core"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+
+    def test_a_forged_tracking_ref_is_not_the_remote(self):
+        """A lane can point its own origin/<branch> at anything; only the remote's word counts."""
+        sh(["git", "checkout", "-qb", "fb/forged"], cwd=self.repo)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.write("core change by money\n")
+        sh(["git", "commit", "-qam", "sneak"], cwd=self.repo)
+        sh(["git", "update-ref", "refs/remotes/origin/fb/forged", "HEAD"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/forged"}))
+
+    def test_a_split_push_url_gets_no_pass(self):
+        """ls-remote reads the fetch URL; a lane that points fetch at a decoy and push at the real remote is refused."""
+        decoy = os.path.join(self.root, "decoy.git")
+        sh(["git", "clone", "-q", "--bare", self.remote, decoy])
+        sh(["git", "checkout", "-qb", "fb/split"], cwd=self.repo)
+        with open(os.path.join(self.repo, "src/auth/login.ts"), "w") as handle:
+            handle.write("core change by money\n")
+        sh(["git", "commit", "-qam", "sneak"], cwd=self.repo)
+        sh(["git", "push", "-q", decoy, "fb/split"], cwd=self.repo)
+        sh(["git", "remote", "set-url", "--push", "origin", self.remote], cwd=self.repo)
+        sh(["git", "remote", "set-url", "origin", decoy], cwd=self.repo)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/split"}))
+
+    def test_a_hung_remote_fails_closed(self):
+        self.mixed_branch_on_the_remote()
+        sh(["git", "config", "remote.origin.uploadpack", "sleep 30; git-upload-pack"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+
+    def test_the_pass_is_only_for_a_plain_push_to_origin(self):
+        self.mixed_branch_on_the_remote()
+        self.assertEqual(self.guard("Bash", {"command": "git push -u origin HEAD:fb/mixed"}), "")
+        for command in ("git push %s fb/mixed" % self.remote, "git -c remote.origin.pushurl=x push origin fb/mixed",
+                        "GIT_CONFIG_COUNT=1 git push origin fb/mixed", "git push origin HEAD:fb/other", "git push origin fb/mixed && true"):
+            self.assertIn("deny", self.guard("Bash", {"command": command}), command)
+
+    def test_a_second_origin_url_gets_no_pass(self):
+        self.mixed_branch_on_the_remote()
+        decoy = os.path.join(self.root, "decoy.git")
+        sh(["git", "clone", "-q", "--bare", self.remote, decoy])
+        sh(["git", "config", "--add", "remote.origin.url", decoy], cwd=self.repo)
+        self.assertIn("deny", self.guard("Bash", {"command": "git push origin fb/mixed"}))
+
+    def test_a_rewritten_branch_gets_no_pass(self):
+        self.mixed_branch_on_the_remote()
+        sh(["git", "reset", "-q", "--soft", "origin/main"], cwd=self.repo)
+        sh(["git", "commit", "-qm", "squashed"], cwd=self.repo)
+        self.assertNotEqual(self.fb("alpha", "check-diff", check=False).returncode, 0)
+
     def test_a_finished_run_leaves_the_clone_usable(self):
         self.fb("alpha", "lane-state", "done")
         self.fb("bravo", "join", "--run", "hph-10-30-26", "--lane", "core", "--remote", self.remote)
